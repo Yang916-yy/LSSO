@@ -104,20 +104,9 @@ mixer = LSSO(dim=256, num_heads=8, rank=32, use_triton=True).cuda().eval()
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-## WSL Setup
-
-From Windows:
-
-```powershell
-wsl.exe -e bash -lc "cd /mnt/d/LSSO && bash scripts/setup_wsl.sh"
-```
-
-The setup script uses the CUDA 12.8 PyTorch wheel index by default. The official PyTorch local install page currently lists CUDA 12.8 as a supported Linux pip compute platform for stable builds.
-
 ## Smoke Test
 
 ```bash
-source .venv/bin/activate
 python -m tests.smoke_test
 ```
 
@@ -128,41 +117,14 @@ small:
 
 ```bash
 git init
-git add .gitignore LICENSE NOTICE MANIFEST.in README.md pyproject.toml lsso tests examples scripts requirements*.txt
+git add .gitignore LICENSE NOTICE MANIFEST.in README.md pyproject.toml lsso tests examples requirements.txt
 git commit -m "Release LSSO operator package"
 git branch -M main
 git remote add origin <your-github-repo-url>
 git push -u origin main
 ```
 
-Large local experiment folders such as `data/`, `runs/`, `runs_archive/`,
-`build/`, and wheel outputs are ignored by default.
-
-## CIFAR Experiments
-
-Single run:
-
-```bash
-source .venv/bin/activate
-python train_cifar.py --dataset cifar10 --mixer lsso --rank 16 --epochs 20
-```
-
-Baseline:
-
-```bash
-python train_cifar.py --dataset cifar10 --mixer mha --epochs 20
-```
-
-No-global ablation:
-
-```bash
-python train_cifar.py --dataset cifar10 --mixer lsso-no-global --rank 16 --epochs 20
-```
-
-Minimal matrix:
-
-```bash
-bash scripts/run_cifar_matrix.sh cifar10
-```
-
-Metrics are written as JSONL under `runs/`.
+Large local experiment folders and scripts such as `data/`, `runs/`,
+`runs_archive/`, `scripts/`, and `train_*.py` are ignored by default. They can
+live in a research workspace without becoming part of the installable operator
+package.

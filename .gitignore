@@ -27,6 +27,13 @@ data/
 runs/
 runs_archive/
 notebooks/
+scripts/
+train_*.py
+cache_tiny_latents.py
+eval_retrieval_rank_pruning.py
+sample_latent_dit_tiny.py
+COLAB_HEAVY_EXPERIMENTS.md
+requirements-hf.txt
 *.pt
 *.pth
 *.ckpt
