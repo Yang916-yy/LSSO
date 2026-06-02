@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+dist_slim/
+*.whl
+*.tar.gz
+
+# Experiment outputs and local data
+data/
+runs/
+runs_archive/
+notebooks/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.jsonl
+*.log
+*.pid
+*.done
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local scratch files
+=*

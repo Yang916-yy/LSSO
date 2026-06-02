@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lsso-operator"
+version = "0.1.0"
+description = "Learnable Sylvester Solve Operator token mixer for encoder models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "LSSO contributors" },
+]
+keywords = [
+    "pytorch",
+    "token-mixer",
+    "sylvester",
+    "efficient-transformer",
+    "retrieval",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+triton = [
+    "triton>=3.0; platform_system == 'Linux'",
+]
+hf = [
+    "transformers",
+    "datasets",
+    "accelerate",
+    "evaluate",
+    "scikit-learn",
+]
+mamba = [
+    "mamba-ssm",
+]
+experiments = [
+    "numpy",
+    "tqdm",
+    "torchinfo",
+    "transformers",
+    "datasets",
+    "accelerate",
+    "evaluate",
+    "scikit-learn",
+]
+all = [
+    "numpy",
+    "tqdm",
+    "torchinfo",
+    "transformers",
+    "datasets",
+    "accelerate",
+    "evaluate",
+    "scikit-learn",
+    "triton>=3.0; platform_system == 'Linux'",
+]
+
+[tool.setuptools.packages.find]
+include = ["lsso*"]
+exclude = ["data*", "runs*", "runs_archive*", "scripts*", "tests*", "notebooks*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+lsso = ["py.typed"]

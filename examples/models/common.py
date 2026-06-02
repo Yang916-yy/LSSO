@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from lsso import LSSO
+
+
+class MLP(nn.Module):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0) -> None:
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class EncoderBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mixer: str = "mha",
+        rank: int = 16,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        gamma_max: float = 0.1,
+        theta_gamma_init: float = -6.0,
+        normalize_u: bool = True,
+        use_custom_backward: bool = True,
+        use_triton_backward: bool = False,
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        if mixer == "mha":
+            self.mixer = nn.MultiheadAttention(
+                embed_dim=dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self._uses_mha = True
+        elif mixer in {"lsso", "lsso-no-global"}:
+            self.mixer = LSSO(
+                dim=dim,
+                num_heads=num_heads,
+                rank=rank,
+                dropout=dropout,
+                gamma_max=gamma_max,
+                theta_gamma_init=theta_gamma_init,
+                no_global=mixer == "lsso-no-global",
+                normalize_u=normalize_u,
+                use_custom_backward=use_custom_backward,
+                use_triton_backward=use_triton_backward,
+            )
+            self._uses_mha = False
+        else:
+            raise ValueError(f"unknown mixer: {mixer}")
+
+        self.mlp = MLP(dim=dim, mlp_ratio=mlp_ratio, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        z = self.norm1(x)
+        if self._uses_mha:
+            mixed, _ = self.mixer(
+                z,
+                z,
+                z,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+        else:
+            valid_mask = None if key_padding_mask is None else ~key_padding_mask
+            mixed = self.mixer(z, valid_mask=valid_mask)
+
+        x = x + self.dropout(mixed)
+        x = x + self.dropout(self.mlp(self.norm2(x)))
+        if key_padding_mask is not None:
+            x = x.masked_fill(key_padding_mask[:, :, None], 0.0)
+        return x

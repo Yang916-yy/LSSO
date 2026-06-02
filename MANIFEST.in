@@ -1,0 +1,16 @@
+include LICENSE
+include NOTICE
+include README.md
+include pyproject.toml
+include lsso/py.typed
+recursive-include lsso *.py
+prune data
+prune runs
+prune runs_archive
+prune notebooks
+prune build
+prune dist
+prune dist_slim
+prune __pycache__
+global-exclude *.py[cod]
+global-exclude __pycache__
