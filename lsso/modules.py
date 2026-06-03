@@ -57,12 +57,16 @@ def _lsso_woodbury_forward(
     if eye is None:
         eye = torch.eye(r, device=U.device, dtype=calc_dtype).view(1, 1, r, r)
     G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
+
     K = _cholesky_spd_solve(
         G.view(B * H, r, r),
         UtC.to(solve_dtype).view(B * H, r, dh),
     ).to(calc_dtype)
     UK = torch.bmm(U_bh, K).view(B, H, N, dh)
-    return (inv_mu * C_calc - gamma_over_mu2 * UK).to(output_dtype)
+    UK.mul_(gamma_over_mu2)
+    Y = C_calc.mul(inv_mu)
+    Y.sub_(UK)
+    return Y.to(output_dtype)
 
 
 class _LSSOAutograd(torch.autograd.Function):
@@ -74,11 +78,9 @@ class _LSSOAutograd(torch.autograd.Function):
         mu: torch.Tensor,
         gamma: torch.Tensor,
         eye: torch.Tensor | None,
-        use_triton_backward: bool,
     ) -> torch.Tensor:
         Y = _lsso_woodbury_forward(U, C, mu, gamma, eye)
         ctx.save_for_backward(U, Y, mu, gamma)
-        ctx.use_triton_backward = use_triton_backward
         return Y
 
     @staticmethod
@@ -96,29 +98,12 @@ class _LSSOAutograd(torch.autograd.Function):
         Y_m = Y.to(matmul_dtype).flatten(0, 1)
         P_m = P.to(matmul_dtype).flatten(0, 1)
 
-        triton_grads = None
-        if ctx.use_triton_backward and U.is_cuda and U.dtype in (torch.float16, torch.bfloat16, torch.float32):
-            try:
-                from .triton_kernels import backward_lowrank_grads_triton
-
-                triton_grads = backward_lowrank_grads_triton(
-                    U.to(matmul_dtype),
-                    Y.to(matmul_dtype),
-                    P.to(matmul_dtype),
-                    gamma,
-                )
-            except Exception:
-                triton_grads = None
-
-        if triton_grads is None:
-            YtU = torch.bmm(Y_m.transpose(1, 2), U_m)
-            PtU = torch.bmm(P_m.transpose(1, 2), U_m)
-            grad_U = -gamma.expand(B, H, 1, 1).to(matmul_dtype).reshape(B * H, 1, 1) * (
-                torch.bmm(P_m, YtU) + torch.bmm(Y_m, PtU)
-            )
-            grad_U = grad_U.view(B, H, N, r).to(U.dtype)
-        else:
-            grad_U, YtU, PtU = triton_grads
+        YtU = torch.bmm(Y_m.transpose(1, 2), U_m)
+        PtU = torch.bmm(P_m.transpose(1, 2), U_m)
+        grad_U_m = torch.bmm(P_m, YtU)
+        grad_U_m.add_(torch.bmm(Y_m, PtU))
+        grad_U_m.mul_(gamma.expand(B, H, 1, 1).to(matmul_dtype).reshape(B * H, 1, 1))
+        grad_U = grad_U_m.neg_().view(B, H, N, r).to(U.dtype)
 
         grad_C = P.to(grad_output.dtype)
 
@@ -140,7 +125,7 @@ class _LSSOAutograd(torch.autograd.Function):
         else:
             grad_gamma = grad_gamma_bh
 
-        return grad_U, grad_C, grad_mu.to(mu.dtype), grad_gamma.to(gamma.dtype), None, None
+        return grad_U, grad_C, grad_mu.to(mu.dtype), grad_gamma.to(gamma.dtype), None
 
 
 def lsso(
@@ -152,9 +137,6 @@ def lsso(
     eye: torch.Tensor | None = None,
     no_global: bool = False,
     return_aux: bool = False,
-    use_triton: bool = False,
-    use_custom_backward: bool = True,
-    use_triton_backward: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, LSSOAux]:
     """
     Functional LSSO core, analogous to an attention kernel.
@@ -167,13 +149,6 @@ def lsso(
         eye: optional identity buffer shaped [1, 1, r, r].
         no_global: if true, returns only mu^-1 C.
         return_aux: if true, also returns tensors used for diagnostics.
-        use_triton: if true, uses experimental inference-only Triton kernels
-            when CUDA/no-grad/shape constraints allow it; otherwise falls back
-            to the PyTorch implementation.
-        use_custom_backward: if true, training uses an implicit custom backward
-            for the solve instead of autograd through every Woodbury operation.
-        use_triton_backward: if true, custom backward uses experimental Triton
-            kernels for low-rank gradient products when supported.
 
     Returns:
         Y: solved token states, [B, H, N, dh].
@@ -191,87 +166,48 @@ def lsso(
     gamma_over_mu2 = gamma_over_mu * inv_mu
 
     if (
-        use_custom_backward
-        and torch.is_grad_enabled()
+        torch.is_grad_enabled()
         and not no_global
         and not return_aux
-        and not use_triton
         and (U.requires_grad or C.requires_grad or mu.requires_grad or gamma.requires_grad)
     ):
-        return _LSSOAutograd.apply(U, C, mu, gamma, eye, use_triton_backward)
+        return _LSSOAutograd.apply(U, C, mu, gamma, eye)
 
     local = None
-    triton_ok = (
-        use_triton
-        and not torch.is_grad_enabled()
-        and not U.requires_grad
-        and not C.requires_grad
-        and not mu.requires_grad
-        and not gamma.requires_grad
-    )
-
     U_bh = U.flatten(0, 1)
     C_bh = C.flatten(0, 1)
     Ut_bh = U_bh.transpose(1, 2)
 
     if no_global:
-        local = inv_mu * C
-        correction = torch.zeros_like(local)
-        UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r) if return_aux else None
-        Y = local
-    else:
-        UtU = None
-        UtC = None
-        G = None
-        if triton_ok:
-            try:
-                from .triton_kernels import fused_gram_system_utc_triton, fused_gram_utc_triton
-
-                if return_aux:
-                    fused = fused_gram_utc_triton(U, C)
-                    if fused is not None:
-                        UtU, UtC = fused
-                else:
-                    fused_system = fused_gram_system_utc_triton(U, C, gamma_over_mu)
-                    if fused_system is not None:
-                        G, UtC = fused_system
-            except Exception:
-                UtU = None
-                UtC = None
-                G = None
-
-        if (G is None and UtU is None) or UtC is None:
+        Y = C.mul(inv_mu)
+        if return_aux:
+            local = Y
+            correction = torch.zeros_like(Y)
             UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
-            UtC = torch.bmm(Ut_bh, C_bh).view(B, H, r, dh)
+        else:
+            UtU = None
+    else:
+        UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
+        UtC = torch.bmm(Ut_bh, C_bh).view(B, H, r, dh)
 
-        if G is None:
-            if eye is None:
-                eye = torch.eye(r, device=U.device, dtype=U.dtype).view(1, 1, r, r)
-            solve_dtype = torch.float64 if U.dtype == torch.float64 or C.dtype == torch.float64 else torch.float32
-            G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
+        if eye is None:
+            eye = torch.eye(r, device=U.device, dtype=U.dtype).view(1, 1, r, r)
+        solve_dtype = torch.float64 if U.dtype == torch.float64 or C.dtype == torch.float64 else torch.float32
+        G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
         K = _cholesky_spd_solve(
             G.view(B * H, r, r),
             UtC.to(G.dtype).view(B * H, r, dh),
         ).to(U.dtype)
 
-        Y = None
-        if triton_ok:
-            try:
-                from .triton_kernels import correction_apply_triton
-
-                Y = correction_apply_triton(U, C, K.view(B, H, r, dh), mu, gamma)
-            except Exception:
-                Y = None
-
-        if Y is None:
+        UK = torch.bmm(U_bh, K).view(B, H, N, dh)
+        if return_aux:
             local = inv_mu * C
-            UK = torch.bmm(U_bh, K).view(B, H, N, dh)
             correction = gamma_over_mu2 * UK
             Y = local - correction
         else:
-            if return_aux:
-                local = inv_mu * C
-                correction = local - Y
+            UK.mul_(gamma_over_mu2)
+            Y = C.mul(inv_mu)
+            Y.sub_(UK)
 
     if return_aux:
         assert local is not None
@@ -302,9 +238,6 @@ class LSSO(nn.Module):
         theta_gamma_init: float = -6.0,
         no_global: bool = False,
         normalize_u: bool = True,
-        use_triton: bool = False,
-        use_custom_backward: bool = True,
-        use_triton_backward: bool = False,
     ) -> None:
         super().__init__()
 
@@ -319,9 +252,6 @@ class LSSO(nn.Module):
         self.gamma_max = gamma_max
         self.no_global = no_global
         self.normalize_u = normalize_u
-        self.use_triton = use_triton
-        self.use_custom_backward = use_custom_backward
-        self.use_triton_backward = use_triton_backward
 
         self.uc_dim = num_heads * rank + dim
         self.w_uc = nn.Linear(dim, self.uc_dim, bias=False)
@@ -388,9 +318,6 @@ class LSSO(nn.Module):
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
                 return_aux=True,
-                use_triton=self.use_triton,
-                use_custom_backward=self.use_custom_backward,
-                use_triton_backward=self.use_triton_backward,
             )
         else:
             Y = lsso(
@@ -400,9 +327,6 @@ class LSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
-                use_triton=self.use_triton,
-                use_custom_backward=self.use_custom_backward,
-                use_triton_backward=self.use_triton_backward,
             )
             aux = None
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch.autograd import gradcheck
 
-from lsso.modules import lsso
+from lsso.modules import _lsso_woodbury_forward, lsso
 
 
 def test_lsso_custom_backward_matches_autograd() -> None:
@@ -15,18 +15,28 @@ def test_lsso_custom_backward_matches_autograd() -> None:
     gamma0 = torch.full((1, H, 1, 1), 0.03, dtype=torch.float64)
     probe = torch.randn(B, H, N, dh, dtype=torch.float64)
 
-    def run(use_custom_backward: bool):
+    def run_custom():
         U = U0.clone().requires_grad_(True)
         C = C0.clone().requires_grad_(True)
         mu = mu0.clone().requires_grad_(True)
         gamma = gamma0.clone().requires_grad_(True)
-        Y = lsso(U, C, mu, gamma, use_custom_backward=use_custom_backward)
+        Y = lsso(U, C, mu, gamma)
         loss = (Y * probe).sum()
         loss.backward()
         return Y.detach(), (U.grad, C.grad, mu.grad, gamma.grad)
 
-    Y_ref, grads_ref = run(False)
-    Y_custom, grads_custom = run(True)
+    def run_reference():
+        U = U0.clone().requires_grad_(True)
+        C = C0.clone().requires_grad_(True)
+        mu = mu0.clone().requires_grad_(True)
+        gamma = gamma0.clone().requires_grad_(True)
+        Y = _lsso_woodbury_forward(U, C, mu, gamma)
+        loss = (Y * probe).sum()
+        loss.backward()
+        return Y.detach(), (U.grad, C.grad, mu.grad, gamma.grad)
+
+    Y_ref, grads_ref = run_reference()
+    Y_custom, grads_custom = run_custom()
     torch.testing.assert_close(Y_custom, Y_ref, atol=1e-10, rtol=1e-10)
     for actual, expected in zip(grads_custom, grads_ref):
         torch.testing.assert_close(actual, expected, atol=1e-8, rtol=1e-6)
@@ -41,7 +51,7 @@ def test_lsso_custom_backward_gradcheck() -> None:
     gamma = torch.full((1, H, 1, 1), 0.02, dtype=torch.float64, requires_grad=True)
 
     assert gradcheck(
-        lambda U, C, mu, gamma: lsso(U, C, mu, gamma, use_custom_backward=True),
+        lambda U, C, mu, gamma: lsso(U, C, mu, gamma),
         (U, C, mu, gamma),
         eps=1e-6,
         atol=1e-5,
@@ -50,7 +60,7 @@ def test_lsso_custom_backward_gradcheck() -> None:
     )
 
 
-def test_lsso_custom_backward_cuda_triton_matches_autograd() -> None:
+def test_lsso_custom_backward_cuda_matches_autograd() -> None:
     if not torch.cuda.is_available():
         return
 
@@ -64,17 +74,26 @@ def test_lsso_custom_backward_cuda_triton_matches_autograd() -> None:
     gamma0 = torch.full((1, H, 1, 1), 0.03, device=device, dtype=dtype)
     probe = torch.randn(B, H, N, dh, device=device, dtype=dtype)
 
-    def run(use_custom_backward: bool):
+    def run_custom():
         U = U0.clone().requires_grad_(True)
         C = C0.clone().requires_grad_(True)
         mu = mu0.clone().requires_grad_(True)
         gamma = gamma0.clone().requires_grad_(True)
-        Y = lsso(U, C, mu, gamma, use_custom_backward=use_custom_backward)
+        Y = lsso(U, C, mu, gamma)
         (Y * probe).sum().backward()
         return Y.detach(), (U.grad, C.grad, mu.grad, gamma.grad)
 
-    Y_ref, grads_ref = run(False)
-    Y_custom, grads_custom = run(True)
+    def run_reference():
+        U = U0.clone().requires_grad_(True)
+        C = C0.clone().requires_grad_(True)
+        mu = mu0.clone().requires_grad_(True)
+        gamma = gamma0.clone().requires_grad_(True)
+        Y = _lsso_woodbury_forward(U, C, mu, gamma)
+        (Y * probe).sum().backward()
+        return Y.detach(), (U.grad, C.grad, mu.grad, gamma.grad)
+
+    Y_ref, grads_ref = run_reference()
+    Y_custom, grads_custom = run_custom()
     torch.testing.assert_close(Y_custom.float(), Y_ref.float(), atol=5e-3, rtol=5e-3)
     for actual, expected in zip(grads_custom, grads_ref):
         torch.testing.assert_close(actual.float(), expected.float(), atol=8e-2, rtol=8e-2)
@@ -83,5 +102,5 @@ def test_lsso_custom_backward_cuda_triton_matches_autograd() -> None:
 if __name__ == "__main__":
     test_lsso_custom_backward_matches_autograd()
     test_lsso_custom_backward_gradcheck()
-    test_lsso_custom_backward_cuda_triton_matches_autograd()
+    test_lsso_custom_backward_cuda_matches_autograd()
     print("lsso custom backward test passed")

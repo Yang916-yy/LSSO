@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from lsso import LSSO
+from .baselines import BiMambaMixer, OfficialNystromAttention, PerformerAttention
 
 
 class MLP(nn.Module):
@@ -34,8 +35,6 @@ class EncoderBlock(nn.Module):
         gamma_max: float = 0.1,
         theta_gamma_init: float = -6.0,
         normalize_u: bool = True,
-        use_custom_backward: bool = True,
-        use_triton_backward: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -49,6 +48,24 @@ class EncoderBlock(nn.Module):
                 batch_first=True,
             )
             self._uses_mha = True
+        elif mixer == "performer":
+            self.mixer = PerformerAttention(
+                dim=dim,
+                num_heads=num_heads,
+                nb_features=rank,
+            )
+            self._uses_mha = False
+        elif mixer == "nystrom":
+            self.mixer = OfficialNystromAttention(
+                dim=dim,
+                num_heads=num_heads,
+                num_landmarks=rank,
+                dropout=dropout,
+            )
+            self._uses_mha = False
+        elif mixer == "bimamba":
+            self.mixer = BiMambaMixer(dim=dim)
+            self._uses_mha = False
         elif mixer in {"lsso", "lsso-no-global"}:
             self.mixer = LSSO(
                 dim=dim,
@@ -59,8 +76,6 @@ class EncoderBlock(nn.Module):
                 theta_gamma_init=theta_gamma_init,
                 no_global=mixer == "lsso-no-global",
                 normalize_u=normalize_u,
-                use_custom_backward=use_custom_backward,
-                use_triton_backward=use_triton_backward,
             )
             self._uses_mha = False
         else:

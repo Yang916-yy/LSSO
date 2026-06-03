@@ -25,8 +25,6 @@ class VisionEncoder(nn.Module):
         gamma_max: float = 0.1,
         theta_gamma_init: float = -6.0,
         normalize_u: bool = True,
-        use_custom_backward: bool = True,
-        use_triton_backward: bool = False,
     ) -> None:
         super().__init__()
         self.image_size = image_size
@@ -57,8 +55,6 @@ class VisionEncoder(nn.Module):
                     gamma_max=gamma_max,
                     theta_gamma_init=theta_gamma_init,
                     normalize_u=normalize_u,
-                    use_custom_backward=use_custom_backward,
-                    use_triton_backward=use_triton_backward,
                 )
                 for _ in range(depth)
             ]

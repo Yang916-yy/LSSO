@@ -36,9 +36,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-triton = [
-    "triton>=3.0; platform_system == 'Linux'",
-]
 hf = [
     "transformers",
     "datasets",
@@ -68,7 +65,6 @@ all = [
     "accelerate",
     "evaluate",
     "scikit-learn",
-    "triton>=3.0; platform_system == 'Linux'",
 ]
 
 [tool.setuptools.packages.find]

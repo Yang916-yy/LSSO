@@ -29,11 +29,7 @@ offline, reuse the current environment's build tools:
 python -m pip install -e . --no-build-isolation
 ```
 
-Core install only depends on PyTorch. Triton kernels are optional:
-
-```bash
-python -m pip install -e ".[triton]"
-```
+The core package only depends on PyTorch.
 
 ## Use As A Token Mixer
 
@@ -90,14 +86,6 @@ gamma_max: maximum global correction strength
 theta_gamma_init: gamma initialization, default -6.0
 normalize_u: RMS-normalize U for stability
 no_global: ablation path with gamma = 0
-use_triton: optional inference/profiling kernels
-```
-
-Triton acceleration is opt-in and currently intended for CUDA inference and
-profiling:
-
-```python
-mixer = LSSO(dim=256, num_heads=8, rank=32, use_triton=True).cuda().eval()
 ```
 
 ## License
