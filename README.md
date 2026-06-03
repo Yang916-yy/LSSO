@@ -1,4 +1,4 @@
-# LSSO Operator
+# LSSO
 
 LSSO = Learnable Sylvester Solve Operator.
 
