@@ -82,11 +82,34 @@ Useful module arguments:
 
 ```text
 rank: low-rank solve size, usually 16 or 32
-gamma_max: maximum global correction strength
-theta_gamma_init: gamma initialization, default -6.0
+gamma_max: maximum global correction strength, default 0.3
+theta_gamma_init: gamma initialization, default -4.0
 normalize_u: RMS-normalize U for stability
 no_global: ablation path with gamma = 0
 ```
+
+## Solve Scale Defaults
+
+The recommended LSSO initialization is:
+
+```python
+LSSO(dim=dim, num_heads=heads, rank=rank, gamma_max=0.3, theta_gamma_init=-4.0)
+```
+
+These two values control how much global solve correction is available at the
+start of training. With `theta_mu = 0`, this gives roughly:
+
+```text
+mu ~= softplus(0) ~= 0.693
+gamma ~= 0.3 * sigmoid(-4) ~= 0.0054
+gamma / mu ~= 0.0078
+```
+
+This is intentionally not tiny. If `gamma_max` is too small or
+`theta_gamma_init` is too negative, LSSO can behave almost like the local
+`mu^-1 C(X)` projection early in training, which weakens the global solve term.
+For example, `gamma_max=0.1, theta_gamma_init=-6.0` starts around
+`gamma / mu ~= 3.6e-4`, which is usually too conservative for main experiments.
 
 ## License
 

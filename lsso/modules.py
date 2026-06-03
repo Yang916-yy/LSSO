@@ -234,8 +234,8 @@ class LSSO(nn.Module):
         rank: int = 16,
         dropout: float = 0.0,
         eps: float = 1e-5,
-        gamma_max: float = 0.1,
-        theta_gamma_init: float = -6.0,
+        gamma_max: float = 0.3,
+        theta_gamma_init: float = -4.0,
         no_global: bool = False,
         normalize_u: bool = True,
     ) -> None:
