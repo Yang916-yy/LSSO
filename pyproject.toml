@@ -43,9 +43,6 @@ hf = [
     "evaluate",
     "scikit-learn",
 ]
-mamba = [
-    "mamba-ssm",
-]
 experiments = [
     "numpy",
     "tqdm",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .baselines import BiMambaMixer, OfficialNystromAttention, PerformerAttention
+from .baselines import OfficialNystromAttention, PerformerAttention
 from lsso import LSSO
 
 from .common import MLP
@@ -45,9 +45,6 @@ class BertStyleBlock(nn.Module):
                 num_heads=num_heads,
                 dropout=dropout,
             )
-            self._mixer_type = "dense"
-        elif mixer == "bimamba":
-            self.mixer = BiMambaMixer(dim=dim)
             self._mixer_type = "dense"
         elif mixer in {"lsso", "lsso-no-global"}:
             self.mixer = LSSO(

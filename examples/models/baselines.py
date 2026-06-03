@@ -279,16 +279,28 @@ class OfficialNystromAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
 
     @staticmethod
-    def _landmarks_for_length(seq_len: int, max_landmarks: int) -> int:
-        landmarks = min(seq_len, max_landmarks)
-        while landmarks > 1 and seq_len % landmarks != 0:
-            landmarks -= 1
-        return landmarks
+    def _pad_to_landmarks(
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+        num_landmarks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+        seq_len = x.shape[1]
+        pad = (num_landmarks - seq_len % num_landmarks) % num_landmarks
+        if pad == 0:
+            return x, valid_mask, seq_len
+
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad))
+        if valid_mask is None:
+            valid_mask = torch.ones(seq_len, device=x.device, dtype=torch.bool).expand(x.shape[0], seq_len)
+        valid_mask = torch.nn.functional.pad(valid_mask, (0, pad), value=False)
+        return x, valid_mask, seq_len
 
     def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        num_landmarks = min(x.shape[1], self.max_landmarks)
+        x, valid_mask, original_len = self._pad_to_landmarks(x, valid_mask, num_landmarks)
         seq_len = x.shape[1]
         self.attn.seq_len = seq_len
-        self.attn.num_landmarks = self._landmarks_for_length(seq_len, self.max_landmarks)
+        self.attn.num_landmarks = num_landmarks
 
         attention_mask = None
         if valid_mask is not None:
@@ -296,40 +308,8 @@ class OfficialNystromAttention(nn.Module):
 
         y = self.attn(x, attention_mask=attention_mask, output_attentions=False)[0]
         y = self.out_proj(y)
+        y = y[:, :original_len]
         if valid_mask is not None:
-            y = y * valid_mask[:, :, None].to(dtype=y.dtype)
-        return y
-
-
-class BiMambaMixer(nn.Module):
-    """Bidirectional Mamba mixer using the official mamba-ssm Mamba module."""
-
-    def __init__(
-        self,
-        dim: int,
-        d_state: int = 16,
-        d_conv: int = 4,
-        expand: int = 2,
-    ) -> None:
-        super().__init__()
-        try:
-            from mamba_ssm import Mamba
-        except ImportError as exc:
-            raise ImportError(
-                "BiMambaMixer requires the official mamba-ssm package. "
-                "Install it with: pip install mamba-ssm causal-conv1d"
-            ) from exc
-
-        self.forward_mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.backward_mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.out_norm = nn.LayerNorm(dim)
-
-    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
-        if valid_mask is not None:
-            x = x * valid_mask[:, :, None].to(dtype=x.dtype)
-        y_fwd = self.forward_mamba(x)
-        y_bwd = torch.flip(self.backward_mamba(torch.flip(x, dims=[1])), dims=[1])
-        y = self.out_norm(0.5 * (y_fwd + y_bwd))
-        if valid_mask is not None:
+            valid_mask = valid_mask[:, :original_len]
             y = y * valid_mask[:, :, None].to(dtype=y.dtype)
         return y

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from lsso import LSSO
-from .baselines import BiMambaMixer, OfficialNystromAttention, PerformerAttention
+from .baselines import OfficialNystromAttention, PerformerAttention
 
 
 class MLP(nn.Module):
@@ -62,9 +62,6 @@ class EncoderBlock(nn.Module):
                 num_landmarks=rank,
                 dropout=dropout,
             )
-            self._uses_mha = False
-        elif mixer == "bimamba":
-            self.mixer = BiMambaMixer(dim=dim)
             self._uses_mha = False
         elif mixer in {"lsso", "lsso-no-global"}:
             self.mixer = LSSO(
