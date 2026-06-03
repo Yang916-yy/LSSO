@@ -39,7 +39,8 @@ class VisionEncoder(nn.Module):
         )
         num_patches = (image_size // patch_size) ** 2
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
         self.pos_drop = nn.Dropout(dropout)
 
         self.blocks = nn.ModuleList(
@@ -65,18 +66,21 @@ class VisionEncoder(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.head.weight, std=0.02)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        cls = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat([cls, x], dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
         for block in self.blocks:
             x = block(x)
 
         x = self.norm(x)
-        return self.head(x.mean(dim=1))
+        return self.head(x[:, 0])
 
     def lsso_layers(self) -> list[LSSO]:
         layers = []

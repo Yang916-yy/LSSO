@@ -278,29 +278,10 @@ class OfficialNystromAttention(nn.Module):
         self.attn = NystromformerSelfAttention(self.config)
         self.out_proj = nn.Linear(dim, dim)
 
-    @staticmethod
-    def _pad_to_landmarks(
-        x: torch.Tensor,
-        valid_mask: torch.Tensor | None,
-        num_landmarks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
-        seq_len = x.shape[1]
-        pad = (num_landmarks - seq_len % num_landmarks) % num_landmarks
-        if pad == 0:
-            return x, valid_mask, seq_len
-
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad))
-        if valid_mask is None:
-            valid_mask = torch.ones(seq_len, device=x.device, dtype=torch.bool).expand(x.shape[0], seq_len)
-        valid_mask = torch.nn.functional.pad(valid_mask, (0, pad), value=False)
-        return x, valid_mask, seq_len
-
     def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
-        num_landmarks = min(x.shape[1], self.max_landmarks)
-        x, valid_mask, original_len = self._pad_to_landmarks(x, valid_mask, num_landmarks)
         seq_len = x.shape[1]
         self.attn.seq_len = seq_len
-        self.attn.num_landmarks = num_landmarks
+        self.attn.num_landmarks = min(seq_len, self.max_landmarks)
 
         attention_mask = None
         if valid_mask is not None:
@@ -308,8 +289,6 @@ class OfficialNystromAttention(nn.Module):
 
         y = self.attn(x, attention_mask=attention_mask, output_attentions=False)[0]
         y = self.out_proj(y)
-        y = y[:, :original_len]
         if valid_mask is not None:
-            valid_mask = valid_mask[:, :original_len]
             y = y * valid_mask[:, :, None].to(dtype=y.dtype)
         return y
