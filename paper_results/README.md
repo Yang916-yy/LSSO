@@ -1,6 +1,10 @@
 # LSSO Experiment Results
 
-This directory contains tables, run manifests, source scripts, logs, and checkpoints for completed LSSO experiments. MAC columns are mixer-only MACs unless otherwise noted.
+This directory contains tables, run manifests, source scripts, and logs for completed LSSO experiments. MAC columns are mixer-only MACs unless otherwise noted.
+
+Checkpoints are distributed as GitHub Release assets instead of being tracked in
+the git repository, so a default clone stays focused on the core LSSO package.
+See `release_assets.tsv` for asset names, sizes, SHA256 checksums, and contents.
 
 ## Experiment Groups
 
@@ -14,4 +18,4 @@ This directory contains tables, run manifests, source scripts, logs, and checkpo
 - Retrieval models use `max_doc_len=512`, mean pooling, dim=256, depth=8, heads=8.
 - CIFAR-100 uses image size 32, patch size 2, dim=96, depth=3, heads=6, RandAugment(2,9), Mixup=0.2, CutMix=0.5.
 - LSSO runs use `gamma_max=0.3` and `theta_gamma_init=-4.0`.
-- Checkpoints are included under each experiment group when available.
+- Checkpoints are packaged in release `paper-results-v0`.

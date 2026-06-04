@@ -26,6 +26,7 @@ dist_slim/
 data/
 runs/
 runs_archive/
+release_assets/
 notebooks/
 scripts/
 train_*.py

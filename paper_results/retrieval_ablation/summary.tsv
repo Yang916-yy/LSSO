@@ -1,0 +1,11 @@
+dataset	variant	seeds	R@10_mean	R@10_std	MRR@10_mean	MRR@10_std	gamma_over_mu_mean	correction_ratio_mean
+fiqa	no-global r32	1,2,3	0.2052	0.0137	0.0911	0.0019	0.0000	0.0000
+fiqa	fixed mu/gamma r32	1,2,3	0.2428	0.0126	0.1136	0.0028	0.0078	0.2130
+fiqa	no U RMS norm r32	1,2,3	0.2160	0.0101	0.1007	0.0008	0.0085	0.2050
+fiqa	full r8	1,2,3	0.2088	0.0208	0.0923	0.0139	0.0100	0.1059
+fiqa	full r4	1,2,3	0.2042	0.0045	0.0979	0.0036	0.0109	0.0742
+scifact	no-global r32	1,2,3	0.6767	0.0120	0.5811	0.0058	0.0000	0.0000
+scifact	fixed mu/gamma r32	1,2,3	0.7089	0.0102	0.6088	0.0066	0.0078	0.2631
+scifact	no U RMS norm r32	1,2,3	0.6933	0.0133	0.5972	0.0150	0.0078	0.0471
+scifact	full r8	1,2,3	0.7067	0.0173	0.6118	0.0064	0.0078	0.1149
+scifact	full r4	1,2,3	0.7022	0.0069	0.6146	0.0107	0.0078	0.0766
