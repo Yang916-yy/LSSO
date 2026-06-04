@@ -1,0 +1,7 @@
+file	description
+beir_zero_shot_summary_s0.csv	raw BEIR zero-shot CSV for seed s0
+beir_zero_shot_summary_s1.csv	raw BEIR zero-shot CSV for seed s1
+beir_zero_shot_summary_s2.csv	raw BEIR zero-shot CSV for seed s2
+summary.tsv	3-seed mean/std BEIR transfer summary; mixer MACs are analytic document-side mixer MACs at doc_len=512
+logs/	training JSONL logs for MS MARCO pretraining runs
+notebooks/	Colab notebook used for the experiment

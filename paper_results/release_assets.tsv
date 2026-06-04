@@ -5,3 +5,5 @@ paper-results-v0	retrieval_ablation_scifact_checkpoints.tar	780.58	6d0c87de2b0eb
 paper-results-v0	retrieval_main_fiqa_checkpoints.tar	641.54	3169de477070a2a5e8a91a9a28196e7976ddf0d324a425846433e9010d37ae74	FIQA retrieval main checkpoints
 paper-results-v0	retrieval_main_nfcorpus_checkpoints.tar	641.55	47999f92af0cd6832d274c296535d3215459982f08e17eb83abd5596635f39d7	NFCorpus retrieval main checkpoints
 paper-results-v0	retrieval_main_scifact_checkpoints.tar	641.55	7c9e8b990f5e8e80d7980f020a8fb233541b259e4af3c0d6215cc886cdc23fd2	SciFact retrieval main checkpoints
+paper-results-v1	imagenet100_cv_main_checkpoints.tar	70.54	b16673c6d67bdb5044126d43668bc98bfd2295db377a3d892cfd1ed0e2e2fa3d	ImageNet-100 one-seed CV main-table checkpoints
+paper-results-v1	msmarco_beir_transfer_checkpoints.tar	641.12	fbb74a35276d98953b623e53969f2a5736501814e23c0070b2eacfea05792217	MS MARCO pretraining checkpoints used for 3-seed BEIR zero-shot transfer evaluation

@@ -116,10 +116,11 @@ For example, `gamma_max=0.1, theta_gamma_init=-6.0` starts around
 Completed paper experiments are organized under [`paper_results/`](paper_results/).
 The repository tracks lightweight artifacts only: summary tables, manifests,
 source scripts, and JSONL logs. Model checkpoints are not tracked in git; they
-are available from the GitHub Release:
+are available from GitHub Releases:
 
 ```text
 https://github.com/Yang916-yy/LSSO/releases/tag/paper-results-v0
+https://github.com/Yang916-yy/LSSO/releases/tag/paper-results-v1
 ```
 
 See [`paper_results/release_assets.tsv`](paper_results/release_assets.tsv) for
@@ -147,6 +148,22 @@ document-side MACs.
 | SciFact | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.7089±0.0117 | 0.6247±0.0080 | 586.6 |
 
 Full table: [`paper_results/retrieval_main/summary.tsv`](paper_results/retrieval_main/summary.tsv).
+
+### MS MARCO -> BEIR Transfer
+
+Random-initialized BERT-style retrieval encoders are pretrained on MS MARCO and
+evaluated zero-shot on BEIR-style datasets across 3 seeds. The evaluated BEIR
+sets are FIQA, NFCorpus, SciFact, ArguAna, and TREC-COVID. MACs are analytic
+document-side mixer MACs at `doc_len=512`.
+
+| Dataset | Model | Params (M) | Mixer MACs (G) | Save vs MHA | nDCG@10 | Recall@100 | MRR@10 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| macro avg | MHA | 14.33 | 2.147 | 0.0% | 0.22945 | 0.36061 | 0.30225 |
+| macro avg | Nystromformer | 14.32 | 1.270 | 40.9% | 0.20523 | 0.33456 | 0.27115 |
+| macro avg | LSSO-r16 | 13.53 | 0.713 | 66.8% | 0.22973 | 0.35889 | 0.29382 |
+| macro avg | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.22940 | 0.36367 | 0.29858 |
+
+Full table: [`paper_results/msmarco_beir_transfer/summary.tsv`](paper_results/msmarco_beir_transfer/summary.tsv).
 
 ### Retrieval Ablations
 
@@ -183,6 +200,20 @@ mixer-only MACs.
 
 Full table: [`paper_results/cifar100_cv_main/summary.tsv`](paper_results/cifar100_cv_main/summary.tsv).
 
+### ImageNet-100 CV Main Table
+
+One-seed ImageNet-100 run with ViT-style encoders, image size 224, patch size
+8, `dim=256`, `depth=8`, `heads=8`, RandAugment, Mixup=0.8, CutMix=1.0, label
+smoothing 0.1, and bf16 AMP.
+
+| Model | Params (M) | Mixer MACs (G) | Best epoch | Top-1 | Top-5 | Max mem (GB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MHA | 6.59 | 0.520 | 119 | 82.26 | 95.54 | 16.06 |
+| LSSO-r16 | 5.80 | 0.137 | 118 | 80.54 | 94.88 | 17.42 |
+| LSSO-r32 | 6.06 | 0.174 | 119 | 78.30 | 92.86 | 19.64 |
+
+Full table: [`paper_results/imagenet100_cv_main/summary.tsv`](paper_results/imagenet100_cv_main/summary.tsv).
+
 ### Rank Pruning
 
 Inference-time rank pruning is evaluated on trained LSSO-r32 retrieval
@@ -206,12 +237,17 @@ sha256sum -c SHA256SUMS
 Release assets are split by experiment group and dataset:
 
 ```text
+paper-results-v0:
 retrieval_main_fiqa_checkpoints.tar
 retrieval_main_nfcorpus_checkpoints.tar
 retrieval_main_scifact_checkpoints.tar
 retrieval_ablation_fiqa_checkpoints.tar
 retrieval_ablation_scifact_checkpoints.tar
 cifar100_cv_main_checkpoints.tar
+
+paper-results-v1:
+msmarco_beir_transfer_checkpoints.tar
+imagenet100_cv_main_checkpoints.tar
 ```
 
 ## License
