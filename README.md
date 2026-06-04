@@ -111,6 +111,107 @@ This is intentionally not tiny. If `gamma_max` is too small or
 For example, `gamma_max=0.1, theta_gamma_init=-6.0` starts around
 `gamma / mu ~= 3.6e-4`, which is usually too conservative for main experiments.
 
+## Paper Experiment Results
+
+Completed paper experiments are organized under [`paper_results/`](paper_results/).
+The repository tracks lightweight artifacts only: summary tables, manifests,
+source scripts, and JSONL logs. Model checkpoints are not tracked in git; they
+are available from the GitHub Release:
+
+```text
+https://github.com/Yang916-yy/LSSO/releases/tag/paper-results-v0
+```
+
+See [`paper_results/release_assets.tsv`](paper_results/release_assets.tsv) for
+release asset names, sizes, SHA256 checksums, and contents.
+
+### Retrieval Main Table
+
+Random-initialized BERT-style retrieval encoders, 3 seeds, `dim=256`,
+`depth=8`, `heads=8`, `max_doc_len=512`, mean pooling. MACs are mixer-only
+document-side MACs.
+
+| Dataset | Model | Params (M) | Mixer MACs (G) | Save vs MHA | R@10 | MRR@10 | Samples/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FIQA | MHA | 14.33 | 2.147 | 0.0% | 0.2145±0.0135 | 0.0987±0.0032 | 597.1 |
+| FIQA | Nystromformer | 14.33 | 1.301 | 39.4% | 0.2428±0.0039 | 0.1190±0.0071 | 375.2 |
+| FIQA | LSSO-r16 | 13.54 | 0.713 | 66.8% | 0.2258±0.0125 | 0.1126±0.0061 | 676.0 |
+| FIQA | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.2387±0.0183 | 0.1150±0.0035 | 605.7 |
+| NFCorpus | MHA | 14.33 | 2.147 | 0.0% | 0.5439±0.0187 | 0.3809±0.0145 | 599.3 |
+| NFCorpus | Nystromformer | 14.33 | 1.301 | 39.4% | 0.5841±0.0125 | 0.4323±0.0132 | 376.1 |
+| NFCorpus | LSSO-r16 | 13.54 | 0.713 | 66.8% | 0.5686±0.0125 | 0.4121±0.0036 | 673.2 |
+| NFCorpus | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.5841±0.0036 | 0.4333±0.0220 | 599.9 |
+| SciFact | MHA | 14.33 | 2.147 | 0.0% | 0.6789±0.0190 | 0.5994±0.0138 | 581.7 |
+| SciFact | Nystromformer | 14.33 | 1.301 | 39.4% | 0.7267±0.0133 | 0.6313±0.0033 | 366.3 |
+| SciFact | LSSO-r16 | 13.54 | 0.713 | 66.8% | 0.7022±0.0107 | 0.6214±0.0119 | 654.3 |
+| SciFact | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.7089±0.0117 | 0.6247±0.0080 | 586.6 |
+
+Full table: [`paper_results/retrieval_main/summary.tsv`](paper_results/retrieval_main/summary.tsv).
+
+### Retrieval Ablations
+
+The main ablations use FIQA and SciFact with the same retrieval setup. The
+`no-global` variant fixes `gamma=0`, removing the global solve correction.
+
+| Dataset | Variant | R@10 | MRR@10 | gamma/mu | Correction ratio |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FIQA | no-global r32 | 0.2052±0.0137 | 0.0911±0.0019 | 0.0000 | 0.0000 |
+| FIQA | fixed mu/gamma r32 | 0.2428±0.0126 | 0.1136±0.0028 | 0.0078 | 0.2130 |
+| FIQA | no U RMS norm r32 | 0.2160±0.0101 | 0.1007±0.0008 | 0.0085 | 0.2050 |
+| FIQA | full r8 | 0.2088±0.0208 | 0.0923±0.0139 | 0.0100 | 0.1059 |
+| FIQA | full r4 | 0.2042±0.0045 | 0.0979±0.0036 | 0.0109 | 0.0742 |
+| SciFact | no-global r32 | 0.6767±0.0120 | 0.5811±0.0058 | 0.0000 | 0.0000 |
+| SciFact | fixed mu/gamma r32 | 0.7089±0.0102 | 0.6088±0.0066 | 0.0078 | 0.2631 |
+| SciFact | no U RMS norm r32 | 0.6933±0.0133 | 0.5972±0.0150 | 0.0078 | 0.0471 |
+| SciFact | full r8 | 0.7067±0.0173 | 0.6118±0.0064 | 0.0078 | 0.1149 |
+| SciFact | full r4 | 0.7022±0.0069 | 0.6146±0.0107 | 0.0078 | 0.0766 |
+
+Full table: [`paper_results/retrieval_ablation/summary.tsv`](paper_results/retrieval_ablation/summary.tsv).
+
+### CIFAR-100 CV Main Table
+
+Patch-2 ViT-style encoder on CIFAR-100, 3 seeds, `dim=96`, `depth=3`,
+`heads=6`, CLS pooling, RandAugment(2,9), Mixup=0.2, CutMix=0.5. MACs are
+mixer-only MACs.
+
+| Model | Params (M) | Mixer MACs (G) | Save vs MHA | Top-1 | Epoch sec |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MHA | 0.3714 | 0.0665 | 0.0% | 0.5540±0.0027 | 3.85 |
+| Nystromformer | 0.3726 | 0.0389 | 41.5% | 0.5998±0.0058 | 6.80 |
+| LSSO-r16 | 0.3427 | 0.0249 | 62.5% | 0.5479±0.0014 | 4.03 |
+| LSSO-r32 | 0.3703 | 0.0385 | 42.1% | 0.5538±0.0018 | 4.99 |
+
+Full table: [`paper_results/cifar100_cv_main/summary.tsv`](paper_results/cifar100_cv_main/summary.tsv).
+
+### Rank Pruning
+
+Inference-time rank pruning is evaluated on trained LSSO-r32 retrieval
+checkpoints. Keeping rank 16 is close to lossless in the current retrieval
+setting while reducing compact mixer MAC ratio to about 0.79; keeping rank 8 is
+mostly usable but begins to trade accuracy for compression.
+
+Full table: [`paper_results/rank_pruning/summary.tsv`](paper_results/rank_pruning/summary.tsv).
+
+### Checkpoints
+
+Download checkpoints from the release and extract the needed archive:
+
+```bash
+tar -xf retrieval_main_fiqa_checkpoints.tar
+sha256sum -c SHA256SUMS
+```
+
+Release assets are split by experiment group and dataset:
+
+```text
+retrieval_main_fiqa_checkpoints.tar
+retrieval_main_nfcorpus_checkpoints.tar
+retrieval_main_scifact_checkpoints.tar
+retrieval_ablation_fiqa_checkpoints.tar
+retrieval_ablation_scifact_checkpoints.tar
+cifar100_cv_main_checkpoints.tar
+```
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
