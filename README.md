@@ -152,10 +152,9 @@ visible without being diluted by FFN cost.
 Completed experiments are organized under [`paper_results/`](paper_results/).
 The repository tracks lightweight artifacts only: summary tables, manifests,
 source notebooks/scripts, and JSONL logs. Model checkpoints are not tracked in
-git; they are available from GitHub Releases:
+git; they are available from one GitHub Release:
 
 ```text
-https://github.com/Yang916-yy/LSSO/releases/tag/paper-results-v0
 https://github.com/Yang916-yy/LSSO/releases/tag/paper-results-v1
 ```
 
@@ -267,18 +266,15 @@ sha256sum -c SHA256SUMS
 tar -xf retrieval_main_fiqa_checkpoints.tar
 ```
 
-Release assets are split by experiment group and dataset:
+Release assets are grouped by experiment and dataset in the same release:
 
 ```text
-paper-results-v0:
 retrieval_main_fiqa_checkpoints.tar
 retrieval_main_nfcorpus_checkpoints.tar
 retrieval_main_scifact_checkpoints.tar
 retrieval_ablation_fiqa_checkpoints.tar
 retrieval_ablation_scifact_checkpoints.tar
 cifar100_cv_main_checkpoints.tar
-
-paper-results-v1:
 msmarco_beir_transfer_checkpoints.tar
 imagenet100_cv_main_checkpoints.tar
 ```

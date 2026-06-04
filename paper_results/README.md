@@ -21,4 +21,4 @@ See `release_assets.tsv` for asset names, sizes, SHA256 checksums, and contents.
 - CIFAR-100 uses image size 32, patch size 2, dim=96, depth=3, heads=6, RandAugment(2,9), Mixup=0.2, CutMix=0.5.
 - ImageNet-100 uses image size 224, patch size 8, dim=256, depth=8, heads=8, DeiT-style augmentation, and bf16 AMP.
 - LSSO runs use `gamma_max=0.3` and `theta_gamma_init=-4.0`.
-- Checkpoints are packaged in releases `paper-results-v0` and `paper-results-v1`.
+- Checkpoints are packaged together in release `paper-results-v1`.
