@@ -186,9 +186,11 @@ Full table: [`paper_results/cifar100_cv_main/summary.tsv`](paper_results/cifar10
 ### Rank Pruning
 
 Inference-time rank pruning is evaluated on trained LSSO-r32 retrieval
-checkpoints. Keeping rank 16 is close to lossless in the current retrieval
-setting while reducing compact mixer MAC ratio to about 0.79; keeping rank 8 is
-mostly usable but begins to trade accuracy for compression.
+checkpoints. The table reports theoretical mixer MACs for a compact exported
+rank after pruning, not the temporary dynamic-mask implementation used to score
+the checkpoints. Keeping rank 16 is close to lossless in the current retrieval
+setting while reducing theoretical mixer MAC ratio to about 0.79; keeping rank
+8 is mostly usable but begins to trade accuracy for compression.
 
 Full table: [`paper_results/rank_pruning/summary.tsv`](paper_results/rank_pruning/summary.tsv).
 
