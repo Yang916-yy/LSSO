@@ -10,29 +10,37 @@ tables.
 
 ## Checkpoint Assets
 
-- `retrieval_main_fiqa_checkpoints.tar`  
+- `retrieval_main_fiqa_checkpoints.tar`
   FIQA retrieval main-table checkpoints for MHA, Nystromformer, LSSO-r16, and
   LSSO-r32 across 3 seeds.
-- `retrieval_main_nfcorpus_checkpoints.tar`  
+- `retrieval_main_nfcorpus_checkpoints.tar`
   NFCorpus retrieval main-table checkpoints for the same four mixers across 3
   seeds.
-- `retrieval_main_scifact_checkpoints.tar`  
+- `retrieval_main_scifact_checkpoints.tar`
   SciFact retrieval main-table checkpoints for the same four mixers across 3
   seeds.
-- `retrieval_ablation_fiqa_checkpoints.tar`  
+- `retrieval_ablation_fiqa_checkpoints.tar`
   FIQA LSSO ablation checkpoints: no-global, fixed mu/gamma, no U RMS norm,
   r8, and r4 across 3 seeds.
-- `retrieval_ablation_scifact_checkpoints.tar`  
+- `retrieval_ablation_scifact_checkpoints.tar`
   SciFact LSSO ablation checkpoints for the same ablation set across 3 seeds.
-- `cifar100_cv_main_checkpoints.tar`  
+- `cifar100_cv_main_checkpoints.tar`
   CIFAR-100 CV main-table checkpoints for MHA, Nystromformer, LSSO-r16, and
   LSSO-r32 across 3 seeds.
-- `msmarco_beir_transfer_checkpoints.tar`  
+- `msmarco_beir_transfer_checkpoints.tar`
   MS MARCO pretraining checkpoints used for 3-seed BEIR zero-shot transfer
   evaluation.
-- `imagenet100_cv_main_checkpoints.tar`  
-  ImageNet-100 one-seed CV main-table checkpoints.
-- `SHA256SUMS`  
+- `imagenet100_cv_main_checkpoints.tar`
+  ImageNet-100 one-seed CV main-table checkpoints. The LSSO-r32 checkpoint was
+  replaced on June 7, 2026 with the controlled run using the same Mixup=0.8 and
+  CutMix=1.0 settings as MHA and LSSO-r16. The superseded r32 run accidentally
+  disabled both augmentations.
+- `diffusion_imagenet100_checkpoints.tar`
+  Final checkpoints for the one-seed ImageNet-100 latent diffusion boundary
+  experiment: MHA, Nystromformer, LSSO-r16, and LSSO-r32. The corresponding
+  repository table reports validation noise-prediction MSE and theoretical
+  mixer MACs. FID/KID and controlled sample grids are not included.
+- `SHA256SUMS`
   Checksum file for release asset verification.
 
 ## Tracked Metadata
@@ -46,6 +54,7 @@ the experiments:
 - `paper_results/rank_pruning/summary.tsv`
 - `paper_results/cifar100_cv_main/summary.tsv`
 - `paper_results/imagenet100_cv_main/summary.tsv`
+- `paper_results/diffusion_imagenet100/summary.tsv`
 - `paper_results/*/manifest.tsv`
 - source notebooks/scripts and JSONL logs
 - `paper_results/release_assets.tsv`

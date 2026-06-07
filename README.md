@@ -240,11 +240,37 @@ ImageNet-100 uses one seed with image size 224, patch size 8, `dim=256`,
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | ImageNet-100 | MHA | 6.59 | 0.520 | 119 | 82.26 | 95.54 |
 | ImageNet-100 | LSSO-r16 | 5.80 | 0.137 | 118 | 80.54 | 94.88 |
-| ImageNet-100 | LSSO-r32 | 6.06 | 0.174 | 119 | 78.30 | 92.86 |
+| ImageNet-100 | LSSO-r32 | 6.06 | 0.174 | 120 | 80.58 | 94.76 |
 
 Full tables:
 [`paper_results/cifar100_cv_main/summary.tsv`](paper_results/cifar100_cv_main/summary.tsv) and
 [`paper_results/imagenet100_cv_main/summary.tsv`](paper_results/imagenet100_cv_main/summary.tsv).
+
+The LSSO-r32 ImageNet-100 result above is the corrected controlled run. The
+superseded run accidentally used Mixup=0 and CutMix=0 while MHA and LSSO-r16
+used Mixup=0.8 and CutMix=1.0.
+
+### Latent Diffusion Boundary Experiment
+
+The one-seed ImageNet-100 latent diffusion experiment uses cached VAE latent
+means, 784 tokens, `dim=384`, `depth=8`, `heads=8`, and 50 training epochs.
+The table reports noise-prediction validation MSE, not FID or perceptual sample
+quality.
+
+| Model | Params (M) | Mixer MACs (G) | Save vs MHA | Best epoch | Best val MSE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MHA | 22.16 | 7.476 | 0.0% | 23 | 0.148047 |
+| Nystromformer | 22.17 | 3.997 | 46.5% | 23 | 0.144175 |
+| LSSO-r16 | 20.19 | 2.248 | 69.9% | 23 | 0.159607 |
+| LSSO-r32 | 20.58 | 2.674 | 64.2% | 23 | 0.158541 |
+
+Nystromformer has the lowest validation MSE here, but takes about twice the
+wall time per epoch of MHA. LSSO retains most of the MHA optimization quality
+with substantially lower theoretical mixer MACs. This is treated as a boundary
+result until FID/KID and controlled sample grids are available.
+
+Full table:
+[`paper_results/diffusion_imagenet100/summary.tsv`](paper_results/diffusion_imagenet100/summary.tsv).
 
 ### Rank Pruning
 
@@ -277,6 +303,7 @@ retrieval_ablation_scifact_checkpoints.tar
 cifar100_cv_main_checkpoints.tar
 msmarco_beir_transfer_checkpoints.tar
 imagenet100_cv_main_checkpoints.tar
+diffusion_imagenet100_checkpoints.tar
 ```
 
 ## Development

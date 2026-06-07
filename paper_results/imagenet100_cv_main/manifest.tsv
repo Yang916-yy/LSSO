@@ -2,3 +2,4 @@ file	description
 summary.tsv	ImageNet-100 one-seed CV result summary; best epoch selected by val_top1
 logs/	training JSONL logs
 notebooks/	Colab notebook used for the experiment
+correction	LSSO-r32 rerun on June 6, 2026 with Mixup=0.8 and CutMix=1.0 to match MHA and LSSO-r16

@@ -14,11 +14,14 @@ See `release_assets.tsv` for asset names, sizes, SHA256 checksums, and contents.
 - `rank_pruning/`: inference-time rank pruning for trained LSSO-r32 retrieval checkpoints.
 - `cifar100_cv_main/`: CIFAR-100 CV main table, patch=2, CLS pooling, medium augmentation, 3 seeds.
 - `imagenet100_cv_main/`: ImageNet-100 CV main table, image size 224, patch=8, 1 seed.
+- `diffusion_imagenet100/`: one-seed ImageNet-100 latent diffusion boundary experiment with MHA, Nystromformer, LSSO-r16, and LSSO-r32.
 
 ## Notes
 
 - Retrieval models use `max_doc_len=512`, mean pooling, dim=256, depth=8, heads=8.
 - CIFAR-100 uses image size 32, patch size 2, dim=96, depth=3, heads=6, RandAugment(2,9), Mixup=0.2, CutMix=0.5.
 - ImageNet-100 uses image size 224, patch size 8, dim=256, depth=8, heads=8, DeiT-style augmentation, and bf16 AMP.
+- The ImageNet-100 LSSO-r32 CV entry was corrected on June 6, 2026: the earlier run accidentally disabled Mixup and CutMix while the other models used Mixup=0.8 and CutMix=1.0.
+- The diffusion experiment reports noise-prediction validation loss and mixer cost only; FID/KID and controlled samples remain future work.
 - LSSO runs use `gamma_max=0.3` and `theta_gamma_init=-4.0`.
 - Checkpoints are packaged together in release `paper-results-v1`.

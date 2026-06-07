@@ -1,0 +1,5 @@
+dataset	model	n	params_M	mixer_MACs_G	save_vs_MHA	best_epoch	best_eval_loss	final_eval_loss	seconds_per_epoch
+ImageNet-100 latent diffusion	MHA	1	22.16	7.476	0.0%	23	0.148047	0.149718	231.51
+ImageNet-100 latent diffusion	Nystromformer	1	22.17	3.997	46.5%	23	0.144175	0.146556	460.75
+ImageNet-100 latent diffusion	LSSO-r16	1	20.19	2.248	69.9%	23	0.159607	0.162213	249.43
+ImageNet-100 latent diffusion	LSSO-r32	1	20.58	2.674	64.2%	23	0.158541	0.161179	269.26
