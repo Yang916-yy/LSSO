@@ -29,7 +29,7 @@ one sample and one mixer layer; timing and memory use batch 8.
 | MHA | 0.637 | 2.614 | 121.0 | 2.684 |
 | Nystromformer | 2.683 | 7.417 | 263.8 | 0.641 |
 | LSSO-r16 | 0.570 | 1.877 | 124.8 | 0.357 |
-| LSSO-r32 | 0.636 | 1.946 | 136.9 | 0.453 |
+| LSSO-r32 | 0.636 | 1.946 | 136.9 | 0.454 |
 
 At `N=2048`, LSSO-r16 uses 86.7% fewer theoretical mixer MACs than MHA and is
 1.39x faster for forward+backward in this operator benchmark. LSSO-r32 uses

@@ -56,7 +56,7 @@ def dynamic_pruned_mixer_macs(base_args: argparse.Namespace, seq_len: int, keep_
     r = keep_rank
     depth = base_args.depth
     linear_macs = seq_len * D * (H * r_full + D) + seq_len * D * D
-    solve_macs = H * seq_len * r * r + 2 * seq_len * r * D + H * r * r * r
+    solve_macs = H * seq_len * r * r + 2 * seq_len * r * D + D * r * r + H * r * r * r
     return int(depth * (linear_macs + solve_macs))
 
 

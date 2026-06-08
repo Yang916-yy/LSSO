@@ -221,13 +221,16 @@ the same Woodbury solve on the adjoint, avoiding a dense $N\times N$ inverse in
 both directions.
 The core solve terms cost
 \[
-  O(Nr^2 + Nrd_h + r^3)
+  O(Nr^2 + Nrd_h + r^2d_h + r^3)
 \]
-per head.  Including projections, the mixer-only MAC formula used in our
-tables is
+per head, where $r^2d_h$ accounts for applying the Cholesky factors to the
+$d_h$ right-hand sides.  Including projections, the mixer-only MAC estimate
+used in our tables is
 \[
-  ND(Hr + D) + ND^2 + HNr^2 + 2NrD + Hr^3.
+  ND(Hr + D) + ND^2 + HNr^2 + 2NrD + Dr^2 + Hr^3.
 \]
+Here the final term conservatively counts each small factorization as
+$r^3$ MAC-equivalents.
 For MHA we count QKV projections, attention scores, attention-value product,
 and output projection:
 \[
@@ -277,18 +280,25 @@ of the distinction from row-normalized attention.
 \label{prop:norm-bound}
 For fixed $U$,
 \[
-  \|\Lsso(C,U)\|_F \leq \mu^{-1}\|C\|_F .
+  \|Y\|_F \leq \mu^{-1}\|C\|_F .
 \]
-With an output projection,
+For a multi-head layer, let $Y_{\mathrm{cat}}$ and $C_{\mathrm{cat}}$ denote
+the concatenated head outputs and inputs, and let
+$\mu_{\min}=\min_h\mu_h$.  With the output projection applied on the right,
 \[
-  \|W_o\Lsso(C,U)\|_F \leq \|W_o\|_2\mu^{-1}\|C\|_F .
+  \|Y_{\mathrm{cat}}W_o\|_F
+  \leq \mu_{\min}^{-1}\|C_{\mathrm{cat}}\|_F\|W_o\|_2 .
 \]
 \end{proposition}
 
 \begin{proof}
 Since $A\succeq\mu I$, $\lambda_{\min}(A)\geq\mu$ and
 $\|A^{-1}\|_2\leq\mu^{-1}$.  The Frobenius bound follows from
-$Y=A^{-1}C$.
+$Y=A^{-1}C$.  Summing the squared per-head bounds gives
+$\|Y_{\mathrm{cat}}\|_F\leq
+\mu_{\min}^{-1}\|C_{\mathrm{cat}}\|_F$, and
+$\|Y_{\mathrm{cat}}W_o\|_F\leq
+\|Y_{\mathrm{cat}}\|_F\|W_o\|_2$ completes the result.
 \end{proof}
 
 \begin{proposition}[Conditioning control]
@@ -340,7 +350,7 @@ term adjusts that state using sequence-wide information.
 \label{prop:no-global}
 If $\gamma=0$, then
 \[
-  \Lsso(C,U)=\mu^{-1}C.
+  Y=\mu^{-1}C.
 \]
 No token mixing occurs except for pointwise projections.
 \end{proposition}
@@ -395,18 +405,18 @@ Dataset & Model & Params (M) & Mixer MACs (G) & R@10 & MRR@10 \\
 \midrule
 FIQA & MHA & 14.33 & 2.147 & $0.2145\pm0.0135$ & $0.0987\pm0.0032$ \\
 FIQA & Nystr\"omformer & 14.33 & 1.301 & $0.2428\pm0.0039$ & $0.1190\pm0.0071$ \\
-FIQA & LSSO-r16 & 13.54 & 0.713 & $0.2258\pm0.0125$ & $0.1126\pm0.0061$ \\
-FIQA & LSSO-r32 & 13.80 & 0.908 & $0.2387\pm0.0183$ & $0.1150\pm0.0035$ \\
+FIQA & LSSO-r16 & 13.54 & 0.714 & $0.2258\pm0.0125$ & $0.1126\pm0.0061$ \\
+FIQA & LSSO-r32 & 13.80 & 0.910 & $0.2387\pm0.0183$ & $0.1150\pm0.0035$ \\
 \midrule
 NFCorpus & MHA & 14.33 & 2.147 & $0.5439\pm0.0187$ & $0.3809\pm0.0145$ \\
 NFCorpus & Nystr\"omformer & 14.33 & 1.301 & $0.5841\pm0.0125$ & $0.4323\pm0.0132$ \\
-NFCorpus & LSSO-r16 & 13.54 & 0.713 & $0.5686\pm0.0125$ & $0.4121\pm0.0036$ \\
-NFCorpus & LSSO-r32 & 13.80 & 0.908 & $0.5841\pm0.0036$ & $0.4333\pm0.0220$ \\
+NFCorpus & LSSO-r16 & 13.54 & 0.714 & $0.5686\pm0.0125$ & $0.4121\pm0.0036$ \\
+NFCorpus & LSSO-r32 & 13.80 & 0.910 & $0.5841\pm0.0036$ & $0.4333\pm0.0220$ \\
 \midrule
 SciFact & MHA & 14.33 & 2.147 & $0.6789\pm0.0190$ & $0.5994\pm0.0138$ \\
 SciFact & Nystr\"omformer & 14.33 & 1.301 & $0.7267\pm0.0133$ & $0.6313\pm0.0033$ \\
-SciFact & LSSO-r16 & 13.54 & 0.713 & $0.7022\pm0.0107$ & $0.6214\pm0.0119$ \\
-SciFact & LSSO-r32 & 13.80 & 0.908 & $0.7089\pm0.0117$ & $0.6247\pm0.0080$ \\
+SciFact & LSSO-r16 & 13.54 & 0.714 & $0.7022\pm0.0107$ & $0.6214\pm0.0119$ \\
+SciFact & LSSO-r32 & 13.80 & 0.910 & $0.7089\pm0.0117$ & $0.6247\pm0.0080$ \\
 \bottomrule
 \end{tabular}
 }
@@ -414,7 +424,7 @@ SciFact & LSSO-r32 & 13.80 & 0.908 & $0.7089\pm0.0117$ & $0.6247\pm0.0080$ \\
 \end{center}
 
 Relative to MHA, LSSO-r16 removes 66.8\% of mixer MACs and LSSO-r32 removes
-57.7\%.  Both improve the mean MHA result on every dataset in the table.
+57.6\%.  Both improve the mean MHA result on every dataset in the table.
 Nystr\"omformer remains the strongest baseline on several metrics, although in
 our implementation its lower theoretical MAC count did not translate into
 higher measured throughput.
@@ -467,12 +477,12 @@ Nystr\"omformer
 & $0.33456{\pm}0.00837$
 & $0.27115{\pm}0.01046$ \\
 LSSO-r16
-& \textbf{0.713} {\scriptsize($-66.8\%$)}
+& \textbf{0.714} {\scriptsize($-66.8\%$)}
 & $\mathbf{0.22973{\pm}0.00232}$
 & $0.35889{\pm}0.00226$
 & $0.29382{\pm}0.01446$ \\
 LSSO-r32
-& 0.908 {\scriptsize($-57.7\%$)}
+& 0.910 {\scriptsize($-57.6\%$)}
 & $0.22940{\pm}0.00337$
 & $\mathbf{0.36367{\pm}0.00830}$
 & $0.29858{\pm}0.00624$ \\
@@ -485,7 +495,7 @@ LSSO-r32
 Both LSSO variants preserve MHA-level transfer at a much lower mixer cost.
 LSSO-r16 slightly exceeds the MHA macro nDCG@10
 ($0.22973$ vs. $0.22945$) while using 66.8\% fewer mixer MACs.  LSSO-r32 has
-the strongest macro Recall@100 ($0.36367$) while using 57.7\% fewer mixer
+the strongest macro Recall@100 ($0.36367$) while using 57.6\% fewer mixer
 MACs.  Nystr\"omformer is also cheaper than MHA, but trails both MHA and LSSO
 on all three macro metrics.
 
@@ -575,9 +585,9 @@ quality.}
 Keep rank & Save & FIQA R@10 & NFCorpus R@10 & SciFact R@10 \\
 \midrule
 32 & 0.0\% & $0.2387\pm0.0183$ & $0.5841\pm0.0036$ & $0.7089\pm0.0117$ \\
-16 & 21.4\% & $0.2377\pm0.0107$ & $0.5831\pm0.0047$ & $0.7056\pm0.0135$ \\
-8  & 31.4\% & $0.2361\pm0.0149$ & $0.5810\pm0.0078$ & $0.6922\pm0.0139$ \\
-4  & 36.2\% & $0.2269\pm0.0157$ & $0.5759\pm0.0054$ & $0.6856\pm0.0139$ \\
+16 & 21.6\% & $0.2377\pm0.0107$ & $0.5831\pm0.0047$ & $0.7056\pm0.0135$ \\
+8  & 31.5\% & $0.2361\pm0.0149$ & $0.5810\pm0.0078$ & $0.6922\pm0.0139$ \\
+4  & 36.3\% & $0.2269\pm0.0157$ & $0.5759\pm0.0054$ & $0.6856\pm0.0139$ \\
 \bottomrule
 \end{tabular}
 }
@@ -585,7 +595,7 @@ Keep rank & Save & FIQA R@10 & NFCorpus R@10 & SciFact R@10 \\
 \end{center}
 
 Keeping 16 of 32 coordinates changes R@10 by less than 0.004 on every dataset
-while reducing the theoretical compact mixer cost by 21.4\%.  More aggressive
+while reducing the theoretical compact mixer cost by 21.6\%.  More aggressive
 pruning remains mild on FIQA and NFCorpus but degrades SciFact more clearly,
 consistent with its higher measured effective rank.  These savings require
 exporting or executing the reduced-rank operator; merely masking coordinates
@@ -611,7 +621,7 @@ theoretical per-sample single-layer mixer MACs; latency and memory use batch
 
 At $N=2048$, LSSO-r16 uses 0.357G mixer MACs compared with 2.684G for MHA,
 an 86.7\% reduction, and reduces forward+backward latency from 2.61 ms to
-1.88 ms.  LSSO-r32 uses 0.453G MACs and takes 1.95 ms.  Peak memory is closer
+1.88 ms.  LSSO-r32 uses 0.454G MACs and takes 1.95 ms.  Peak memory is closer
 to optimized MHA than the dense $O(N^2)$ formula would suggest because the
 benchmark uses an optimized SDPA path related to memory-efficient exact
 attention kernels~\citep{dao2022flashattention}.  The practical advantage is
@@ -644,8 +654,8 @@ efficiency gain is not free.
 \begin{center}
 \begin{minipage}{\columnwidth}
 \centering
-\captionof{table}{Vision encoder results.  CIFAR-100 is 3 seeds; ImageNet-100 is one
-seed.}
+\captionof{table}{Vision encoder results.  MACs cover all mixer layers in the
+encoder.  CIFAR-100 is 3 seeds; ImageNet-100 is one seed.}
 \label{tab:cv}
 \resizebox{\columnwidth}{!}{%
 \begin{tabular}{llrrr}
@@ -654,12 +664,12 @@ Dataset & Model & MACs (G) & Top-1 & Top-5 \\
 \midrule
 CIFAR-100 & MHA & 0.0665 & $55.40\pm0.27$ & -- \\
 CIFAR-100 & Nystr\"omformer & 0.0389 & $59.98\pm0.58$ & -- \\
-CIFAR-100 & LSSO-r16 & 0.0249 & $54.79\pm0.14$ & -- \\
-CIFAR-100 & LSSO-r32 & 0.0385 & $55.38\pm0.18$ & -- \\
+CIFAR-100 & LSSO-r16 & 0.0250 & $54.79\pm0.14$ & -- \\
+CIFAR-100 & LSSO-r32 & 0.0388 & $55.38\pm0.18$ & -- \\
 \midrule
-ImageNet-100 & MHA & 0.520 & 82.26 & 95.54 \\
-ImageNet-100 & LSSO-r16 & 0.137 & 80.54 & 94.88 \\
-ImageNet-100 & LSSO-r32 & 0.174 & 80.58 & 94.76 \\
+ImageNet-100 & MHA & 4.162 & 82.26 & 95.54 \\
+ImageNet-100 & LSSO-r16 & 1.093 & 80.54 & 94.88 \\
+ImageNet-100 & LSSO-r32 & 1.391 & 80.58 & 94.76 \\
 \bottomrule
 \end{tabular}
 }
@@ -724,8 +734,9 @@ bidirectional encoders, rather than a general replacement for attention.
 \section{Full Woodbury Derivation}
 \label{app:woodbury}
 
-Using the Woodbury identity with $A=\mu I_N$, $C=\gamma I_r$, and
-$V=U^\top$ gives
+For $\gamma>0$, using the Woodbury identity with base matrix
+$A_0=\mu I_N$, low-rank factors $P=U$ and $Q=U^\top$, and middle matrix
+$M=\gamma I_r$ gives
 {\small
 \[
 (\mu I+\gamma UU^\top)^{-1}

@@ -140,8 +140,12 @@ rank `r`, the LSSO mixer uses:
 ```text
 U/C projection:  N * D * (H*r + D)
 output projection: N * D * D
-low-rank solve/correction: H*N*r^2 + 2*N*r*D + H*r^3
+low-rank solve/correction: H*N*r^2 + 2*N*r*D + D*r^2 + H*r^3
 ```
+
+The `D*r^2` term accounts for applying the small Cholesky factors to all
+per-head right-hand sides; `H*r^3` is a conservative MAC-equivalent estimate
+for the factorizations.
 
 This is most attractive when `r << N`. In the current paper tables, MACs are
 reported as **mixer-only MACs** so the effect of replacing the token mixer is
@@ -174,16 +178,16 @@ document-side MACs.
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | FIQA | MHA | 14.33 | 2.147 | 0.0% | 0.2145+/-0.0135 | 0.0987+/-0.0032 | 597.1 |
 | FIQA | Nystromformer | 14.33 | 1.301 | 39.4% | 0.2428+/-0.0039 | 0.1190+/-0.0071 | 375.2 |
-| FIQA | LSSO-r16 | 13.54 | 0.713 | 66.8% | 0.2258+/-0.0125 | 0.1126+/-0.0061 | 676.0 |
-| FIQA | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.2387+/-0.0183 | 0.1150+/-0.0035 | 605.7 |
+| FIQA | LSSO-r16 | 13.54 | 0.714 | 66.8% | 0.2258+/-0.0125 | 0.1126+/-0.0061 | 676.0 |
+| FIQA | LSSO-r32 | 13.80 | 0.910 | 57.6% | 0.2387+/-0.0183 | 0.1150+/-0.0035 | 605.7 |
 | NFCorpus | MHA | 14.33 | 2.147 | 0.0% | 0.5439+/-0.0187 | 0.3809+/-0.0145 | 599.3 |
 | NFCorpus | Nystromformer | 14.33 | 1.301 | 39.4% | 0.5841+/-0.0125 | 0.4323+/-0.0132 | 376.1 |
-| NFCorpus | LSSO-r16 | 13.54 | 0.713 | 66.8% | 0.5686+/-0.0125 | 0.4121+/-0.0036 | 673.2 |
-| NFCorpus | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.5841+/-0.0036 | 0.4333+/-0.0220 | 599.9 |
+| NFCorpus | LSSO-r16 | 13.54 | 0.714 | 66.8% | 0.5686+/-0.0125 | 0.4121+/-0.0036 | 673.2 |
+| NFCorpus | LSSO-r32 | 13.80 | 0.910 | 57.6% | 0.5841+/-0.0036 | 0.4333+/-0.0220 | 599.9 |
 | SciFact | MHA | 14.33 | 2.147 | 0.0% | 0.6789+/-0.0190 | 0.5994+/-0.0138 | 581.7 |
 | SciFact | Nystromformer | 14.33 | 1.301 | 39.4% | 0.7267+/-0.0133 | 0.6313+/-0.0033 | 366.3 |
-| SciFact | LSSO-r16 | 13.54 | 0.713 | 66.8% | 0.7022+/-0.0107 | 0.6214+/-0.0119 | 654.3 |
-| SciFact | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.7089+/-0.0117 | 0.6247+/-0.0080 | 586.6 |
+| SciFact | LSSO-r16 | 13.54 | 0.714 | 66.8% | 0.7022+/-0.0107 | 0.6214+/-0.0119 | 654.3 |
+| SciFact | LSSO-r32 | 13.80 | 0.910 | 57.6% | 0.7089+/-0.0117 | 0.6247+/-0.0080 | 586.6 |
 
 Full table: [`paper_results/retrieval_main/summary.tsv`](paper_results/retrieval_main/summary.tsv).
 
@@ -198,8 +202,8 @@ document-side mixer MACs at `doc_len=512`.
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | macro avg | MHA | 14.33 | 2.147 | 0.0% | 0.22945 | 0.36061 | 0.30225 |
 | macro avg | Nystromformer | 14.32 | 1.270 | 40.9% | 0.20523 | 0.33456 | 0.27115 |
-| macro avg | LSSO-r16 | 13.53 | 0.713 | 66.8% | 0.22973 | 0.35889 | 0.29382 |
-| macro avg | LSSO-r32 | 13.80 | 0.908 | 57.7% | 0.22940 | 0.36367 | 0.29858 |
+| macro avg | LSSO-r16 | 13.53 | 0.714 | 66.8% | 0.22973 | 0.35889 | 0.29382 |
+| macro avg | LSSO-r32 | 13.80 | 0.910 | 57.6% | 0.22940 | 0.36367 | 0.29858 |
 
 Full table: [`paper_results/msmarco_beir_transfer/summary.tsv`](paper_results/msmarco_beir_transfer/summary.tsv).
 
@@ -232,18 +236,19 @@ CIFAR-100 uses a patch-2 ViT-style encoder, 3 seeds, `dim=96`, `depth=3`,
 | --- | --- | ---: | ---: | ---: | ---: |
 | CIFAR-100 | MHA | 0.3714 | 0.0665 | 0.0% | 0.5540+/-0.0027 |
 | CIFAR-100 | Nystromformer | 0.3726 | 0.0389 | 41.5% | 0.5998+/-0.0058 |
-| CIFAR-100 | LSSO-r16 | 0.3427 | 0.0249 | 62.5% | 0.5479+/-0.0014 |
-| CIFAR-100 | LSSO-r32 | 0.3703 | 0.0385 | 42.1% | 0.5538+/-0.0018 |
+| CIFAR-100 | LSSO-r16 | 0.3427 | 0.0250 | 62.4% | 0.5479+/-0.0014 |
+| CIFAR-100 | LSSO-r32 | 0.3703 | 0.0388 | 41.7% | 0.5538+/-0.0018 |
 
 ImageNet-100 uses one seed with image size 224, patch size 8, `dim=256`,
 `depth=8`, `heads=8`, RandAugment, Mixup=0.8, CutMix=1.0, label smoothing
-0.1, and bf16 AMP.
+0.1, and bf16 AMP. As in the retrieval and CIFAR-100 tables, mixer MACs sum
+over every encoder layer rather than reporting a single block.
 
 | Dataset | Model | Params (M) | Mixer MACs (G) | Best epoch | Top-1 | Top-5 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| ImageNet-100 | MHA | 6.59 | 0.520 | 119 | 82.26 | 95.54 |
-| ImageNet-100 | LSSO-r16 | 5.80 | 0.137 | 118 | 80.54 | 94.88 |
-| ImageNet-100 | LSSO-r32 | 6.06 | 0.174 | 120 | 80.58 | 94.76 |
+| ImageNet-100 | MHA | 6.59 | 4.162 | 119 | 82.26 | 95.54 |
+| ImageNet-100 | LSSO-r16 | 5.80 | 1.093 | 118 | 80.54 | 94.88 |
+| ImageNet-100 | LSSO-r32 | 6.06 | 1.391 | 120 | 80.58 | 94.76 |
 
 Full tables:
 [`paper_results/cifar100_cv_main/summary.tsv`](paper_results/cifar100_cv_main/summary.tsv) and
@@ -264,8 +269,8 @@ quality.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | MHA | 22.16 | 7.476 | 0.0% | 23 | 0.148047 |
 | Nystromformer | 22.17 | 3.997 | 46.5% | 23 | 0.144175 |
-| LSSO-r16 | 20.19 | 2.248 | 69.9% | 23 | 0.159607 |
-| LSSO-r32 | 20.58 | 2.674 | 64.2% | 23 | 0.158541 |
+| LSSO-r16 | 20.19 | 2.249 | 69.9% | 23 | 0.159607 |
+| LSSO-r32 | 20.58 | 2.677 | 64.2% | 23 | 0.158541 |
 
 Nystromformer has the lowest validation MSE here, but takes about twice the
 wall time per epoch of MHA. LSSO retains most of the MHA optimization quality

@@ -110,6 +110,7 @@ def estimate_encoder_macs(args: argparse.Namespace, seq_len: int) -> dict[str, i
         if args.mixer != "lsso-no-global":
             mixer_macs += H * seq_len * r * r
             mixer_macs += 2 * seq_len * r * D
+            mixer_macs += D * r * r
             mixer_macs += H * r * r * r
     else:
         raise ValueError(f"unknown mixer: {args.mixer}")

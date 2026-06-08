@@ -91,6 +91,7 @@ def mixer_macs(name: str, n: int, dim: int, heads: int, landmarks: int) -> int:
         + n * dim * dim
         + heads * n * rank * rank
         + 2 * n * rank * dim
+        + dim * rank * rank
         + heads * rank * rank * rank
     )
 
