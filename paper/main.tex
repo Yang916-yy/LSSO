@@ -133,15 +133,19 @@ positive-definite matrix.
 
 \subsection{Encoder Block}
 
-We use LSSO in the token-mixer position of a pre-normalized encoder block:
+LSSO is used in the token-mixer slot of an encoder block.  In a pre-normalized
+Transformer-style block this is simply
 \[
   X' = X + \operatorname{LSSO}(\operatorname{LN}(X)),
   \qquad
   X_{\mathrm{out}} = X' + \operatorname{MLP}(\operatorname{LN}(X')).
 \]
-In controlled comparisons we change only this sublayer; normalization,
-residual paths, feed-forward layers, positional embeddings, and task heads are
-shared across models.
+The replacement is local: the input and output shapes match MHA, so the same
+residual path, normalization, positional encoding, feed-forward block, and task
+head can be kept.  In the BERT-style retrieval experiments we preserve the
+post-LN BERT block used by the baseline; in the ViT-style vision experiments we
+use the pre-LN form above.  Thus the comparison changes the mixer, not the
+surrounding block convention.
 
 \subsection{LSSO Definition}
 
@@ -150,7 +154,12 @@ For each head, let
   U = XW_u\in\R^{B\times N\times r},\qquad
   C = XW_c\in\R^{B\times N\times d_h}.
 \]
-We optionally RMS-normalize $U$ along its rank dimension and solve
+There is one pair of scalar solve parameters per head.  We RMS-normalize $U$
+along its rank dimension by default,
+\[
+  U \leftarrow U\big/\sqrt{\operatorname{mean}_r(U^2)+\epsilon},
+\]
+and solve
 \begin{equation}
   (\mu I_N+\gamma UU^\top)Y = C,
   \label{eq:lsso-system}
@@ -172,6 +181,10 @@ The head outputs are concatenated and projected:
 \[
   \operatorname{LSSO}(X)=YW_o.
 \]
+For padded sequences, invalid tokens are masked by zeroing the corresponding
+rows of both $U$ and $C$ before the solve and by zeroing the output at masked
+positions.  This mirrors key-padding behavior in bidirectional attention while
+preserving the low-rank Woodbury structure over the valid tokens.
 
 \subsection{Woodbury Implementation}
 
@@ -187,6 +200,13 @@ Y
 \end{equation}
 This expression remains valid at $\gamma=0$ and requires only an $r\times r$
 solve.
+The released implementation fuses the $U$ and $C$ projections into one linear
+map for efficiency, but this is algebraically identical to using separate
+$W_u$ and $W_c$.  The small positive-definite system is solved by Cholesky in
+float32 under fp16/bf16 autocast, then cast back to the activation dtype.  The
+current package also provides a custom autograd path whose backward pass reuses
+the same Woodbury solve on the adjoint, avoiding a dense $N\times N$ inverse in
+both directions.
 The core solve terms cost
 \[
   O(Nr^2 + Nrd_h + r^3)
@@ -318,6 +338,17 @@ LSSO uses $\gamma_{\max}=0.3$ and $\theta_\gamma=-4$ unless stated otherwise.
 Because the feed-forward network is identical across models, tables report
 mixer-only MACs and isolate the cost of the component being replaced.
 
+\paragraph{Retrieval protocol.}
+The dual encoder has $D=256$, depth 8, 8 heads, and dropout 0.1.  Queries and
+documents are truncated to 64 and 512 tokens, respectively, and representations
+are obtained by masked mean pooling.  We train with in-batch contrastive
+cross-entropy at temperature 0.05, using batch size 64, AdamW with learning
+rate $3\times10^{-4}$ and weight decay 0.01, 5\% linear warmup followed by
+cosine decay, and gradient clipping at 1.0.  Each target-dataset run uses at
+most 50,000 training pairs for 20 epochs; the checkpoint with the highest
+validation R@10 is evaluated.  All models see the same sampled pairs and use
+the same tokenizer, pooling rule, and three random seeds.
+
 \subsection{Retrieval Main Results}
 
 Table~\ref{tab:retrieval} reports 3-seed retrieval results on
@@ -383,14 +414,23 @@ average a metric across the five target datasets and then report the mean and
 standard deviation of those macro averages.  Since total parameter counts are
 similar (13.53--14.33M), Table~\ref{tab:transfer} emphasizes mixer MACs.  The
 released artifacts contain the corresponding per-dataset and per-seed values.
+Specifically, each model is trained for two epochs on 500,000 MS MARCO pairs
+with batch size 192, bf16 autocast, learning rate $3\times10^{-4}$, 5\%
+warmup, and the same temperature and clipping settings as the target-dataset
+runs.  Corpus embeddings are computed once per checkpoint and searched by
+inner product; no labels or optimizer steps from the five BEIR targets are
+used.
 
-\begin{table*}[!t]
+\begin{center}
+\begin{minipage}{\columnwidth}
 \centering
-\caption{Zero-shot BEIR transfer after MS MARCO pretraining.  Retrieval metrics
+\captionof{table}{Zero-shot BEIR transfer after MS MARCO pretraining.  Retrieval metrics
 are five-dataset macro averages, reported as mean $\pm$ standard deviation over
 three seeds.  MACs are mixer-only at document length 512.  Best values are
 bold.}
 \label{tab:transfer}
+\scriptsize
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{lrrrr}
 \toprule
 Model & Mixer MACs (G) & nDCG@10 & Recall@100 & MRR@10 \\
@@ -417,7 +457,9 @@ LSSO-r32
 & $0.29858{\pm}0.00624$ \\
 \bottomrule
 \end{tabular}
-\end{table*}
+}
+\end{minipage}
+\end{center}
 
 Both LSSO variants preserve MHA-level transfer at a much lower mixer cost.
 LSSO-r16 slightly exceeds the MHA macro nDCG@10
@@ -435,9 +477,13 @@ frontier as MHA while requiring considerably less mixer computation.
 
 Table~\ref{tab:ablation} aligns the empirical ablations with the theory.  The
 no-global variant sets $\gamma=0$, reducing the operator to $\mu^{-1}C$ and
-removing token mixing.  Removing RMS normalization weakens the global
-correction, especially on SciFact.  Smaller ranks expose the capacity of the
-learned relation subspace.
+removing token mixing.  The fixed-scale variant freezes both
+$\theta_\mu$ and $\theta_\gamma$ at initialization, while the no-normalization
+variant removes the row-wise RMS normalization of $U$.  The r8 and r4 rows are
+independently trained full LSSO models at smaller rank, rather than pruned
+r32 checkpoints.  Removing RMS normalization weakens the global correction,
+especially on SciFact, while the smaller-rank runs expose the capacity needed
+by the learned relation subspace.
 
 \begin{center}
 \begin{minipage}{\columnwidth}
@@ -483,6 +529,46 @@ CIFAR-100.
 \end{minipage}
 \end{center}
 
+\subsection{Inference-Time Rank Pruning}
+
+The low effective ranks in Figure~\ref{fig:diagnostics} suggest that a trained
+rank-32 model may not need every coordinate at inference.  For each input and
+head, we rank coordinates by their mean squared activation in $U$ and retain
+the top $k$ before the Woodbury solve.  Table~\ref{tab:rank-pruning} evaluates
+this procedure directly on the three-seed LSSO-r32 retrieval checkpoints,
+without finetuning after pruning.
+
+\begin{center}
+\begin{minipage}{\columnwidth}
+\centering
+\captionof{table}{Inference-time pruning of trained LSSO-r32 models.  ``Save''
+is the theoretical mixer-MAC reduction of a compact rank-$k$ implementation
+relative to rank 32; the current dynamic evaluator is used only to measure
+quality.}
+\label{tab:rank-pruning}
+\scriptsize
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{rrrrr}
+\toprule
+Keep rank & Save & FIQA R@10 & NFCorpus R@10 & SciFact R@10 \\
+\midrule
+32 & 0.0\% & $0.2387\pm0.0183$ & $0.5841\pm0.0036$ & $0.7089\pm0.0117$ \\
+16 & 21.4\% & $0.2377\pm0.0107$ & $0.5831\pm0.0047$ & $0.7056\pm0.0135$ \\
+8  & 31.4\% & $0.2361\pm0.0149$ & $0.5810\pm0.0078$ & $0.6922\pm0.0139$ \\
+4  & 36.2\% & $0.2269\pm0.0157$ & $0.5759\pm0.0054$ & $0.6856\pm0.0139$ \\
+\bottomrule
+\end{tabular}
+}
+\end{minipage}
+\end{center}
+
+Keeping 16 of 32 coordinates changes R@10 by less than 0.004 on every dataset
+while reducing the theoretical compact mixer cost by 21.4\%.  More aggressive
+pruning remains mild on FIQA and NFCorpus but degrades SciFact more clearly,
+consistent with its higher measured effective rank.  These savings require
+exporting or executing the reduced-rank operator; merely masking coordinates
+inside the original rank-32 tensors does not reduce projection cost.
+
 \subsection{Sequence Scaling}
 
 We benchmark a single mixer layer at sequence lengths from 128 to 2048, using
@@ -517,7 +603,16 @@ encoder results on CIFAR-100~\citep{krizhevsky2009cifar} and an ImageNet
 subset~\citep{deng2009imagenet}.  The controlled vision runs use
 RandAugment~\citep{cubuk2020randaugment}, Mixup~\citep{zhang2018mixup}, and
 CutMix~\citep{yun2019cutmix}, following data-efficient vision-transformer
-training practice~\citep{touvron2021deit}.  On CIFAR-100, the LSSO models
+training practice~\citep{touvron2021deit}.  CIFAR-100 uses $32\times32$
+images, patch size 2, $D=96$, depth 3, 6 heads, batch size 256, and 100
+epochs.  Its augmentation consists of random crop and horizontal flip,
+RandAugment, Mixup 0.2, CutMix 0.5, and label smoothing 0.1.  ImageNet-100
+uses $224\times224$ images, patch size 8, $D=256$, depth 8, 8 heads, batch
+size 256, and 120 epochs, with Mixup 0.8, CutMix 1.0, RandAugment, and label
+smoothing 0.1.  Both use AdamW, cosine decay, and identical settings across
+mixers within a dataset.
+
+On CIFAR-100, the LSSO models
 trade accuracy for cost and do not match Nystr\"omformer.  On ImageNet-100,
 MHA is about 1.7 points stronger in the single-seed run, whereas LSSO cuts
 mixer MACs by roughly three to four times.  Vision therefore gives a more
