@@ -204,8 +204,8 @@ and output projection:
 
 \section{Theoretical Properties}
 
-We first study the linear map induced by a fixed $U$.  These results describe
-the operator itself; they do not establish convergence of end-to-end training.
+We first study the linear map induced by a fixed $U$; the input-dependent
+operator is evaluated empirically in Section~5.
 
 \begin{proposition}[Well-posedness]
 Let $A=\mu I_N+\gamma UU^\top$ with $\mu>0$ and $\gamma\geq0$.  Then $A$ is
@@ -573,13 +573,12 @@ may not recover the fine-grained routing that generation demands.
 
 \section{Limitations}
 
-The theory treats $U$ as fixed and therefore does not establish the stability
-of full end-to-end optimization.  Rank is also a genuine capacity choice:
-some tasks occupy only a compact subspace, whereas SciFact uses much more of
-rank 32.  Finally, the vision and diffusion results are narrower than the
-retrieval evidence.  ImageNet-100 has only one seed, and the diffusion study
-lacks sample-quality metrics.  These experiments establish useful operating
-points, not universal superiority over attention or other efficient mixers.
+Rank is a genuine capacity choice: some tasks occupy only a compact subspace,
+whereas SciFact uses much more of rank 32.  The vision and diffusion results
+are also narrower than the retrieval evidence.  ImageNet-100 has only one
+seed, and the diffusion study lacks sample-quality metrics.  These experiments
+establish useful operating points, not universal superiority over attention or
+other efficient mixers.
 
 \section{Conclusion}
 
