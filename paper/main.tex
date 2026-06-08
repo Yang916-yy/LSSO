@@ -139,7 +139,6 @@ positive-definite matrix.
 \label{sec:method}
 
 \subsection{Encoder Block}
-\label{sec:encoder-block}
 
 LSSO is used in the token-mixer slot of an encoder block.  In a pre-normalized
 Transformer-style block this is simply
@@ -156,7 +155,6 @@ use the pre-LN form above.  Thus the comparison changes the mixer, not the
 surrounding block convention.
 
 \subsection{LSSO Definition}
-\label{sec:lsso-definition}
 
 For each head, let
 \[
@@ -196,7 +194,6 @@ positions.  This mirrors key-padding behavior in bidirectional attention while
 preserving the low-rank Woodbury structure over the valid tokens.
 
 \subsection{Woodbury Implementation}
-\label{sec:woodbury}
 
 The $N\times N$ matrix in Eq.~\eqref{eq:lsso-system} never needs to be formed or
 inverted.  Applying the Woodbury identity~\citep{woodbury1950} gives
@@ -347,7 +344,6 @@ No token mixing occurs except for pointwise projections.
 \label{sec:experiments}
 
 \subsection{Setup}
-\label{sec:setup}
 
 All main retrieval and vision comparisons use randomly initialized encoders.
 The retrieval backbone follows a BERT-style bidirectional encoder
@@ -370,7 +366,6 @@ validation R@10 is evaluated.  All models see the same sampled pairs and use
 the same tokenizer, pooling rule, and three random seeds.
 
 \subsection{Retrieval Main Results}
-\label{sec:retrieval-main}
 
 Table~\ref{tab:retrieval} reports 3-seed retrieval results on
 FIQA~\citep{maia2018fiqa}, NFCorpus~\citep{boteva2016nfcorpus}, and
@@ -420,7 +415,6 @@ our implementation its lower theoretical MAC count did not translate into
 higher measured throughput.
 
 \subsection{MS MARCO to BEIR Transfer}
-\label{sec:transfer}
 
 We next ask whether the retrieval result survives a change of domain.  Each
 model is pretrained once on MS MARCO~\citep{nguyen2016msmarco} and evaluated
@@ -496,7 +490,6 @@ MRR@10.  Taken together, the two LSSO settings lie on the same transfer
 frontier as MHA while requiring considerably less mixer computation.
 
 \subsection{Ablations and Diagnostics}
-\label{sec:ablations}
 
 Table~\ref{tab:ablation} aligns the empirical ablations with the theory.  The
 no-global variant sets $\gamma=0$, reducing the operator to $\mu^{-1}C$ and
@@ -554,7 +547,6 @@ CIFAR-100.
 \end{center}
 
 \subsection{Inference-Time Rank Pruning}
-\label{sec:rank-pruning}
 
 The low effective ranks in Figure~\ref{fig:diagnostics} suggest that a trained
 rank-32 model may not need every coordinate at inference.  For each input and
@@ -595,7 +587,6 @@ exporting or executing the reduced-rank operator; merely masking coordinates
 inside the original rank-32 tensors does not reduce projection cost.
 
 \subsection{Sequence Scaling}
-\label{sec:sequence-scaling}
 
 We benchmark a single mixer layer at sequence lengths from 128 to 2048, using
 batch size 8, $D=256$, 8 heads, bf16 autocast, and no optimizer update.
@@ -623,7 +614,6 @@ therefore clearest in arithmetic cost and long-sequence latency, rather than
 peak memory at every sequence length.
 
 \subsection{Vision and Diffusion Boundary Results}
-\label{sec:vision-boundary}
 
 Table~\ref{tab:cv} reports ViT-style~\citep{dosovitskiy2021image} vision
 encoder results on CIFAR-100~\citep{krizhevsky2009cifar} and an ImageNet
@@ -694,9 +684,8 @@ Figure~\ref{fig:diagnostics}.
 The same construction is less natural for causal decoding.  Applying a causal
 mask breaks the simple low-rank Woodbury form, and an autoregressive extension
 would require prefix-restricted solves or a different cached state.  The
-diffusion experiment in Section~\ref{sec:vision-boundary} points to a second
-boundary: global semantic mixing alone may not recover the fine-grained routing
-that generation demands.
+diffusion experiment points to a second boundary: global semantic mixing alone
+may not recover the fine-grained routing that generation demands.
 
 \section{Limitations}
 \label{sec:limitations}
@@ -704,23 +693,22 @@ that generation demands.
 Rank is a genuine capacity choice: some tasks occupy only a compact subspace,
 whereas SciFact uses much more of rank 32
 (Figure~\ref{fig:diagnostics} and Table~\ref{tab:rank-pruning}).  The vision and
-diffusion results in Section~\ref{sec:vision-boundary} are also narrower than
-the retrieval evidence.  ImageNet-100 has only one seed, and the diffusion
-study lacks sample-quality metrics.  These experiments establish useful
-operating points, not universal superiority over attention or other efficient
-mixers.
+diffusion results are also narrower than the retrieval evidence.  ImageNet-100
+has only one seed, and the diffusion study lacks sample-quality metrics.  These
+experiments establish useful operating points, not universal superiority over
+attention or other efficient mixers.
 
 \section{Conclusion}
 \label{sec:conclusion}
 
 LSSO replaces pairwise value routing with a learned low-rank global solve.
 The positive shift makes the operator well posed, and Woodbury makes the solve
-practical when $r\ll N$ (Section~\ref{sec:woodbury}).  In our experiments this
-inductive bias is particularly effective for retrieval: LSSO preserves
-MHA-level transfer while substantially reducing mixer computation
-(Tables~\ref{tab:retrieval} and~\ref{tab:transfer}).  Vision and diffusion
-results are less decisive (Section~\ref{sec:vision-boundary}), which helps
-delimit the present claim: LSSO is a promising efficient mixer for
+practical when $r\ll N$ (Eq.~\eqref{eq:woodbury} and
+Appendix~\ref{app:woodbury}).  In our experiments this inductive bias is
+particularly effective for retrieval: LSSO preserves MHA-level transfer while
+substantially reducing mixer computation (Tables~\ref{tab:retrieval}
+and~\ref{tab:transfer}).  Vision and diffusion results are less decisive,
+which helps delimit the present claim: LSSO is a promising efficient mixer for
 bidirectional encoders, rather than a general replacement for attention.
 
 \bibliographystyle{plainnat}
