@@ -8,3 +8,4 @@ paper-results-v1	retrieval_main_scifact_checkpoints.tar	641.55	7c9e8b990f5e8e80d
 paper-results-v1	imagenet100_cv_main_checkpoints.tar	70.53	e35b386fc441ab40317bb21de4005c48bb92e5af31214f57c78d10049a9c825a	ImageNet-100 one-seed CV main-table checkpoints; LSSO-r32 replaced with the controlled Mixup=0.8 CutMix=1.0 run
 paper-results-v1	msmarco_beir_transfer_checkpoints.tar	641.12	fbb74a35276d98953b623e53969f2a5736501814e23c0070b2eacfea05792217	MS MARCO pretraining checkpoints used for 3-seed BEIR zero-shot transfer evaluation
 paper-results-v1	diffusion_imagenet100_checkpoints.tar	324.80	72b20a33d8b709e96496fc8897db92a02a6aa3a8c3bc825f7190504a3e92a57e	ImageNet-100 latent diffusion final checkpoints for MHA, Nystromformer, LSSO-r16, and LSSO-r32
+paper-results-v1	SHA256SUMS	0.00	94b04f406c145028c74000ce9038b8e4db9c7a3377aae13d9669fdff94760760	Checksum file for all release checkpoint archives
