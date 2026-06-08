@@ -7,7 +7,13 @@
 \usepackage{microtype}
 \usepackage{caption}
 \usepackage[numbers,sort&compress]{natbib}
-\usepackage[hidelinks]{hyperref}
+\usepackage[
+  colorlinks=false,
+  pdfborder={0 0 0.7},
+  linkbordercolor={0.20 0.42 0.68},
+  citebordercolor={0.18 0.52 0.32},
+  urlbordercolor={0.68 0.28 0.24}
+]{hyperref}
 
 \setlength{\textfloatsep}{7pt plus 2pt minus 2pt}
 \setlength{\floatsep}{6pt plus 2pt minus 2pt}
@@ -130,8 +136,10 @@ one input-conditioned linear solve with a deliberately constrained
 positive-definite matrix.
 
 \section{Method}
+\label{sec:method}
 
 \subsection{Encoder Block}
+\label{sec:encoder-block}
 
 LSSO is used in the token-mixer slot of an encoder block.  In a pre-normalized
 Transformer-style block this is simply
@@ -148,6 +156,7 @@ use the pre-LN form above.  Thus the comparison changes the mixer, not the
 surrounding block convention.
 
 \subsection{LSSO Definition}
+\label{sec:lsso-definition}
 
 For each head, let
 \[
@@ -187,8 +196,9 @@ positions.  This mirrors key-padding behavior in bidirectional attention while
 preserving the low-rank Woodbury structure over the valid tokens.
 
 \subsection{Woodbury Implementation}
+\label{sec:woodbury}
 
-The $N\times N$ matrix in Eq.~\ref{eq:lsso-system} never needs to be formed or
+The $N\times N$ matrix in Eq.~\eqref{eq:lsso-system} never needs to be formed or
 inverted.  Applying the Woodbury identity~\citep{woodbury1950} gives
 \begin{equation}
 Y
@@ -199,7 +209,7 @@ Y
 \label{eq:woodbury}
 \end{equation}
 This expression remains valid at $\gamma=0$ and requires only an $r\times r$
-solve.
+solve; Appendix~\ref{app:woodbury} gives the full derivation.
 The released implementation fuses the $U$ and $C$ projections into one linear
 map for efficiency, but this is algebraically identical to using separate
 $W_u$ and $W_c$.  The small positive-definite system is solved by Cholesky in
@@ -223,11 +233,13 @@ and output projection:
 \]
 
 \section{Theoretical Properties}
+\label{sec:theory}
 
 We first study the linear map induced by a fixed $U$; the input-dependent
-operator is evaluated empirically in Section~5.
+operator is evaluated empirically in Section~\ref{sec:experiments}.
 
 \begin{proposition}[Well-posedness]
+\label{prop:well-posedness}
 Let $A=\mu I_N+\gamma UU^\top$ with $\mu>0$ and $\gamma\geq0$.  Then $A$ is
 symmetric positive definite.  Therefore, for any $C$, the system $AY=C$ has a
 unique solution.
@@ -243,6 +255,7 @@ For any nonzero $z$,
 \end{proof}
 
 \begin{proposition}[Spectral shrinkage]
+\label{prop:spectral-shrinkage}
 Let $UU^\top=Q\Lambda Q^\top$ be an eigendecomposition over the nonzero
 eigen-directions of $UU^\top$, with
 $\Lambda=\diag(\lambda_1,\ldots,\lambda_k)$ and $\lambda_i>0$.  Let
@@ -259,6 +272,7 @@ isotropic scale on its orthogonal complement.  This gives a more precise view
 of the distinction from row-normalized attention.
 
 \begin{proposition}[Bounded fixed-$U$ operator norm]
+\label{prop:norm-bound}
 For fixed $U$,
 \[
   \|\Lsso(C,U)\|_F \leq \mu^{-1}\|C\|_F .
@@ -276,6 +290,7 @@ $Y=A^{-1}C$.
 \end{proof}
 
 \begin{proposition}[Conditioning control]
+\label{prop:conditioning}
 For $A=\mu I+\gamma UU^\top$,
 \[
   \kappa_2(A)
@@ -283,14 +298,16 @@ For $A=\mu I+\gamma UU^\top$,
 \]
 \end{proposition}
 
-These bounds motivate the diagnostics used in our experiments.  The ratio
-$\gamma/\mu$ directly scales the possible condition-number increase; effective
-rank measures how much of the rank subspace is used; and correction ratio
-measures how strongly the low-rank correction participates in the output.
+Propositions~\ref{prop:norm-bound} and~\ref{prop:conditioning} motivate the
+diagnostics used in our experiments.  The ratio $\gamma/\mu$ directly scales
+the possible condition-number increase; effective rank measures how much of
+the rank subspace is used; and correction ratio measures how strongly the
+low-rank correction participates in the output.
 RMS normalization of $U$ helps control the scale of $U$, although it is not by
 itself a dimension-free spectral-norm guarantee.
 
 \begin{theorem}[Energy minimization equivalence]
+\label{thm:energy}
 For $\mu>0$ and $\gamma\geq0$, the LSSO output is the unique minimizer of
 \[
   \mathcal{E}(Y)
@@ -303,7 +320,7 @@ For $\mu>0$ and $\gamma\geq0$, the LSSO output is the unique minimizer of
 
 \begin{proof}
 The Hessian of $\mathcal{E}$ is $\mu I+\gamma UU^\top$, which is positive
-definite by the well-posedness proposition.  Setting the gradient to zero gives
+definite by Proposition~\ref{prop:well-posedness}.  Setting the gradient to zero gives
 $(\mu I+\gamma UU^\top)Y=C$.
 \end{proof}
 
@@ -318,6 +335,7 @@ The content projection supplies the local state $\mu^{-1}C$, and the second
 term adjusts that state using sequence-wide information.
 
 \begin{proposition}[No-global degeneration]
+\label{prop:no-global}
 If $\gamma=0$, then
 \[
   \Lsso(C,U)=\mu^{-1}C.
@@ -326,8 +344,10 @@ No token mixing occurs except for pointwise projections.
 \end{proposition}
 
 \section{Experiments}
+\label{sec:experiments}
 
 \subsection{Setup}
+\label{sec:setup}
 
 All main retrieval and vision comparisons use randomly initialized encoders.
 The retrieval backbone follows a BERT-style bidirectional encoder
@@ -350,6 +370,7 @@ validation R@10 is evaluated.  All models see the same sampled pairs and use
 the same tokenizer, pooling rule, and three random seeds.
 
 \subsection{Retrieval Main Results}
+\label{sec:retrieval-main}
 
 Table~\ref{tab:retrieval} reports 3-seed retrieval results on
 FIQA~\citep{maia2018fiqa}, NFCorpus~\citep{boteva2016nfcorpus}, and
@@ -399,6 +420,7 @@ our implementation its lower theoretical MAC count did not translate into
 higher measured throughput.
 
 \subsection{MS MARCO to BEIR Transfer}
+\label{sec:transfer}
 
 We next ask whether the retrieval result survives a change of domain.  Each
 model is pretrained once on MS MARCO~\citep{nguyen2016msmarco} and evaluated
@@ -474,10 +496,12 @@ MRR@10.  Taken together, the two LSSO settings lie on the same transfer
 frontier as MHA while requiring considerably less mixer computation.
 
 \subsection{Ablations and Diagnostics}
+\label{sec:ablations}
 
 Table~\ref{tab:ablation} aligns the empirical ablations with the theory.  The
 no-global variant sets $\gamma=0$, reducing the operator to $\mu^{-1}C$ and
-removing token mixing.  The fixed-scale variant freezes both
+removing token mixing as stated in Proposition~\ref{prop:no-global}.  The
+fixed-scale variant freezes both
 $\theta_\mu$ and $\theta_\gamma$ at initialization, while the no-normalization
 variant removes the row-wise RMS normalization of $U$.  The r8 and r4 rows are
 independently trained full LSSO models at smaller rank, rather than pruned
@@ -530,6 +554,7 @@ CIFAR-100.
 \end{center}
 
 \subsection{Inference-Time Rank Pruning}
+\label{sec:rank-pruning}
 
 The low effective ranks in Figure~\ref{fig:diagnostics} suggest that a trained
 rank-32 model may not need every coordinate at inference.  For each input and
@@ -570,6 +595,7 @@ exporting or executing the reduced-rank operator; merely masking coordinates
 inside the original rank-32 tensors does not reduce projection cost.
 
 \subsection{Sequence Scaling}
+\label{sec:sequence-scaling}
 
 We benchmark a single mixer layer at sequence lengths from 128 to 2048, using
 batch size 8, $D=256$, 8 heads, bf16 autocast, and no optimizer update.
@@ -597,6 +623,7 @@ therefore clearest in arithmetic cost and long-sequence latency, rather than
 peak memory at every sequence length.
 
 \subsection{Vision and Diffusion Boundary Results}
+\label{sec:vision-boundary}
 
 Table~\ref{tab:cv} reports ViT-style~\citep{dosovitskiy2021image} vision
 encoder results on CIFAR-100~\citep{krizhevsky2009cifar} and an ImageNet
@@ -651,6 +678,7 @@ theoretical mixer cost, but this evidence is not sufficient to claim that it
 can replace attention in a generative model.
 
 \section{Discussion}
+\label{sec:discussion}
 
 The experiments suggest that LSSO is best viewed as a bidirectional global
 correction operator, not as a cheaper approximation to softmax attention.
@@ -658,31 +686,41 @@ This distinction appears especially useful in retrieval, where an encoder
 must compress evidence from the whole sequence into a representation but does
 not need causal next-token routing.  A small learned subspace can influence
 all tokens through the solve without constructing an all-pairs value-routing
-matrix.
+matrix.  This interpretation is supported by the retrieval results in
+Table~\ref{tab:retrieval}, the zero-shot transfer results in
+Table~\ref{tab:transfer}, and the nonzero correction ratios in
+Figure~\ref{fig:diagnostics}.
 
 The same construction is less natural for causal decoding.  Applying a causal
 mask breaks the simple low-rank Woodbury form, and an autoregressive extension
 would require prefix-restricted solves or a different cached state.  The
-diffusion experiment points to a second boundary: global semantic mixing alone
-may not recover the fine-grained routing that generation demands.
+diffusion experiment in Section~\ref{sec:vision-boundary} points to a second
+boundary: global semantic mixing alone may not recover the fine-grained routing
+that generation demands.
 
 \section{Limitations}
+\label{sec:limitations}
 
 Rank is a genuine capacity choice: some tasks occupy only a compact subspace,
-whereas SciFact uses much more of rank 32.  The vision and diffusion results
-are also narrower than the retrieval evidence.  ImageNet-100 has only one
-seed, and the diffusion study lacks sample-quality metrics.  These experiments
-establish useful operating points, not universal superiority over attention or
-other efficient mixers.
+whereas SciFact uses much more of rank 32
+(Figure~\ref{fig:diagnostics} and Table~\ref{tab:rank-pruning}).  The vision and
+diffusion results in Section~\ref{sec:vision-boundary} are also narrower than
+the retrieval evidence.  ImageNet-100 has only one seed, and the diffusion
+study lacks sample-quality metrics.  These experiments establish useful
+operating points, not universal superiority over attention or other efficient
+mixers.
 
 \section{Conclusion}
+\label{sec:conclusion}
 
 LSSO replaces pairwise value routing with a learned low-rank global solve.
 The positive shift makes the operator well posed, and Woodbury makes the solve
-practical when $r\ll N$.  In our experiments this inductive bias is particularly
-effective for retrieval: LSSO preserves MHA-level transfer while substantially
-reducing mixer computation.  Vision and diffusion results are less decisive,
-which helps delimit the present claim: LSSO is a promising efficient mixer for
+practical when $r\ll N$ (Section~\ref{sec:woodbury}).  In our experiments this
+inductive bias is particularly effective for retrieval: LSSO preserves
+MHA-level transfer while substantially reducing mixer computation
+(Tables~\ref{tab:retrieval} and~\ref{tab:transfer}).  Vision and diffusion
+results are less decisive (Section~\ref{sec:vision-boundary}), which helps
+delimit the present claim: LSSO is a promising efficient mixer for
 bidirectional encoders, rather than a general replacement for attention.
 
 \bibliographystyle{plainnat}
@@ -691,6 +729,7 @@ bidirectional encoders, rather than a general replacement for attention.
 \appendix
 
 \section{Full Woodbury Derivation}
+\label{app:woodbury}
 
 Using the Woodbury identity with $A=\mu I_N$, $C=\gamma I_r$, and
 $V=U^\top$ gives
