@@ -1,0 +1,564 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.72in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Lsso}{\operatorname{LSSO}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\rank}{\operatorname{rank}}
+\newcommand{\tr}{\operatorname{tr}}
+
+\title{LSSO: Learnable Low-Rank Sylvester Solves for Efficient Bidirectional Encoders}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We introduce LSSO, a learnable low-rank global-solve token mixer for
+bidirectional encoders.  Instead of explicit pairwise value routing, LSSO
+constructs an input-dependent positive-shifted low-rank relation field and
+solves
+\[
+  (\mu I + \gamma U(X)U(X)^\top)Y = C(X).
+\]
+The current operator is a Sylvester-style solve, corresponding to the
+left-sided special case of the more general equation $AY+YB=C$.  We show that
+the operator is well posed under positive parameterization, admits an efficient
+Woodbury implementation, has a bounded fixed-$U$ spectral response, and is
+equivalent to minimizing a strongly convex low-rank correction energy.
+Experiments on retrieval, MS MARCO to BEIR transfer, vision encoders,
+ablations, rank pruning, and sequence scaling show that LSSO can provide
+competitive bidirectional encoder performance with substantially lower
+mixer-only MACs.  Boundary studies further clarify that LSSO is not an
+attention approximation and is not yet a universal replacement for attention in
+all generative settings.
+\end{abstract}
+
+\section{Introduction}
+
+Self-attention has become the default token mixer for bidirectional encoders.
+Given query, key, and value projections, it produces
+\[
+  Y_{\mathrm{attn}}=\operatorname{softmax}(QK^\top/\sqrt{d})V,
+\]
+which can be interpreted as input-dependent pairwise routing.  This routing
+view is expressive, but the score and value-routing terms scale quadratically
+with sequence length.  Many efficient attention methods reduce this cost by
+approximating or sparsifying the attention matrix.  LSSO takes a different
+route: it replaces pairwise value routing with an input-dependent global
+linear solve.
+
+For an input sequence $X\in\R^{B\times N\times D}$, LSSO learns a low-rank
+relation feature $U(X)$ and a content state $C(X)$.  For each head it solves
+\[
+  (\mu I_N+\gamma U U^\top)Y=C,
+  \qquad \mu>0,\quad \gamma\geq 0,
+\]
+and projects the result back to the model dimension.  The matrix
+$UU^\top$ is positive semidefinite, while individual similarities
+$u_i^\top u_j$ may be positive or negative.  Thus the system defines a stable
+global relation field without requiring an explicit dense routing matrix.
+
+The guiding interpretation is:
+\begin{align*}
+  \text{LSSO}
+  &= \text{isotropic content pass-through}\\
+  &\quad - \text{low-rank global correction}.
+\end{align*}
+This differs from attention: attention learns a row-stochastic routing matrix,
+whereas LSSO learns a positive-definite inverse filter.
+
+Our contributions are:
+\begin{enumerate}
+  \item We propose LSSO, a learnable Sylvester-style low-rank global solve
+  operator for bidirectional encoder token mixing.
+  \item We derive a Woodbury implementation that reduces the solve to an
+  $r\times r$ system, where $r$ is the rank.
+  \item We prove fixed-$U$ well-posedness, spectral boundedness, conditioning
+  control, and an energy minimization equivalence.
+  \item We validate LSSO on retrieval, transfer, vision encoders, ablations,
+  rank pruning, and long-sequence scaling.
+  \item We state the limitations explicitly: LSSO is a bidirectional encoder
+  mixer, not an attention approximation, a causal decoder drop-in, or a
+  universal diffusion backbone.
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{Efficient attention.}
+Linformer~\citep{wang2020linformer}, Performer~\citep{choromanski2021rethinking},
+Nystr\"omformer~\citep{xiong2021nystromformer}, Longformer~\citep{beltagy2020longformer},
+and BigBird~\citep{zaheer2020bigbird} reduce the cost of self-attention
+through low-rank projections, kernel approximations, landmark approximations,
+or sparse attention patterns.  These methods are best understood as efficient
+attention or attention-approximation mechanisms.  LSSO does not attempt to
+approximate the softmax attention matrix; it defines a different
+input-dependent inverse-filter token mixer.
+
+\paragraph{Token mixers beyond attention.}
+MLP-Mixer~\citep{tolstikhin2021mlp}, gMLP~\citep{liu2021pay}, FNet~\citep{lee2021fnet},
+Hyena~\citep{poli2023hyena}, and state-space models such as
+Mamba~\citep{gu2023mamba} show that token mixing need not be implemented as
+dense attention.  LSSO adds another point in this design space: an implicit
+low-rank global solve specialized for non-causal encoders.
+
+\paragraph{Implicit layers and learned solves.}
+Deep equilibrium models~\citep{bai2019deep}, implicit layers, graph smoothing,
+and regularized least-squares methods use linear or nonlinear solves as model
+components.  LSSO is much simpler than a general equilibrium layer: it performs
+one closed-form, positive-shifted low-rank correction whose matrix is generated
+from the input.
+
+\section{Method}
+
+\subsection{Encoder Block}
+
+We use LSSO in the token-mixer position of a pre-normalized encoder block:
+\[
+  X' = X + \operatorname{LSSO}(\operatorname{LN}(X)),
+  \qquad
+  X_{\mathrm{out}} = X' + \operatorname{MLP}(\operatorname{LN}(X')).
+\]
+All other components are kept unchanged in controlled comparisons: layer
+normalization, residual paths, feed-forward layers, positional embeddings, and
+task heads.
+
+\subsection{LSSO Definition}
+
+For each head, let
+\[
+  U = XW_u\in\R^{B\times N\times r},\qquad
+  C = XW_c\in\R^{B\times N\times d_h}.
+\]
+We optionally RMS-normalize $U$ along its rank dimension and solve
+\begin{equation}
+  (\mu I_N+\gamma UU^\top)Y = C,
+  \label{eq:lsso-system}
+\end{equation}
+where
+\[
+  \mu=\operatorname{softplus}(\theta_\mu)+\epsilon,
+  \qquad
+  \gamma=\gamma_{\max}\sigma(\theta_\gamma).
+\]
+The default experiments use $\gamma_{\max}=0.3$ and
+$\theta_\gamma=-4$, which gives an initial $\gamma/\mu$ of roughly
+$7.8\times 10^{-3}$ when $\theta_\mu=0$.  Smaller settings such as
+$\gamma_{\max}=0.1,\theta_\gamma=-6$ make the global correction nearly vanish
+at initialization and were empirically too conservative for the main runs.
+
+The head outputs are concatenated and projected:
+\[
+  \operatorname{LSSO}(X)=YW_o.
+\]
+
+\subsection{Woodbury Implementation}
+
+Directly inverting the $N\times N$ matrix in Eq.~\ref{eq:lsso-system} is
+unnecessary.  By the Woodbury identity,
+\begin{equation}
+Y
+= \mu^{-1}C
+- \mu^{-1}U
+\left(I_r+\gamma\mu^{-1}U^\top U\right)^{-1}
+\left(\gamma\mu^{-1}U^\top C\right).
+\label{eq:woodbury}
+\end{equation}
+This form is continuous at $\gamma=0$ and only solves an $r\times r$ system.
+The core solve terms cost
+\[
+  O(Nr^2 + Nrd_h + r^3)
+\]
+per head.  Including projections, the mixer-only MAC formula used in our
+tables is
+\[
+  ND(Hr + D) + ND^2 + HNr^2 + 2NrD + Hr^3.
+\]
+For MHA we count QKV projections, attention scores, attention-value product,
+and output projection:
+\[
+  4ND^2 + 2N^2D.
+\]
+
+\section{Theoretical Properties}
+
+The following results analyze the operator for fixed $U$.  They do not claim
+global convergence or stability of an entire trained deep network; those are
+empirical questions beyond the scope of this operator analysis.
+
+\begin{proposition}[Well-posedness]
+Let $A=\mu I_N+\gamma UU^\top$ with $\mu>0$ and $\gamma\geq0$.  Then $A$ is
+symmetric positive definite.  Therefore, for any $C$, the system $AY=C$ has a
+unique solution.
+\end{proposition}
+
+\begin{proof}
+For any nonzero $z$,
+\[
+  z^\top A z
+  = \mu\|z\|_2^2+\gamma\|U^\top z\|_2^2
+  \geq \mu\|z\|_2^2 > 0.
+\]
+\end{proof}
+
+\begin{proposition}[Spectral shrinkage]
+Let $UU^\top=Q\Lambda Q^\top$ be an eigendecomposition over the nonzero
+eigen-directions of $UU^\top$, with
+$\Lambda=\diag(\lambda_1,\ldots,\lambda_k)$ and $\lambda_i>0$.  Let
+$P_\perp=I-QQ^\top$.  Then
+\[
+  A^{-1}
+  = Q\diag\!\left(\frac{1}{\mu+\gamma\lambda_i}\right)Q^\top
+    + \mu^{-1}P_\perp .
+\]
+\end{proposition}
+
+Thus LSSO applies a learnable inverse spectral filter along the span of $U$
+and isotropic scaling on the orthogonal complement.  In this sense it is a
+data-dependent inverse filter rather than a row-stochastic routing matrix.
+
+\begin{proposition}[Bounded fixed-$U$ operator norm]
+For fixed $U$,
+\[
+  \|\Lsso(C,U)\|_F \leq \mu^{-1}\|C\|_F .
+\]
+With an output projection,
+\[
+  \|W_o\Lsso(C,U)\|_F \leq \|W_o\|_2\mu^{-1}\|C\|_F .
+\]
+\end{proposition}
+
+\begin{proof}
+Since $A\succeq\mu I$, $\lambda_{\min}(A)\geq\mu$ and
+$\|A^{-1}\|_2\leq\mu^{-1}$.  The Frobenius bound follows from
+$Y=A^{-1}C$.
+\end{proof}
+
+\begin{proposition}[Conditioning control]
+For $A=\mu I+\gamma UU^\top$,
+\[
+  \kappa_2(A)
+  \leq 1+\frac{\gamma}{\mu}\|U\|_2^2 .
+\]
+\end{proposition}
+
+This explains the diagnostics used in our experiments.  The ratio
+$\gamma/\mu$ directly scales the possible condition-number increase; effective
+rank measures how much of the rank subspace is used; and correction ratio
+measures how strongly the low-rank correction participates in the output.
+RMS normalization of $U$ helps control the scale of $U$, although it is not by
+itself a dimension-free spectral-norm guarantee.
+
+\begin{theorem}[Energy minimization equivalence]
+For $\mu>0$ and $\gamma\geq0$, the LSSO output is the unique minimizer of
+\[
+  \mathcal{E}(Y)
+  =
+  \frac{\mu}{2}\|Y\|_F^2
+  + \frac{\gamma}{2}\|U^\top Y\|_F^2
+  - \langle C,Y\rangle .
+\]
+\end{theorem}
+
+\begin{proof}
+The Hessian of $\mathcal{E}$ is $\mu I+\gamma UU^\top$, which is positive
+definite by the well-posedness proposition.  Setting the gradient to zero gives
+$(\mu I+\gamma UU^\top)Y=C$.
+\end{proof}
+
+Equivalently, up to an additive constant,
+\[
+  \mathcal{E}(Y)
+  =
+  \frac{\mu}{2}\left\|Y-\mu^{-1}C\right\|_F^2
+  + \frac{\gamma}{2}\|U^\top Y\|_F^2.
+\]
+The content projection proposes the local state $\mu^{-1}C$; the learned
+low-rank term applies a global correction.
+
+\begin{proposition}[No-global degeneration]
+If $\gamma=0$, then
+\[
+  \Lsso(C,U)=\mu^{-1}C.
+\]
+No token mixing occurs except for pointwise projections.
+\end{proposition}
+
+\section{Experiments}
+
+\subsection{Setup}
+
+All main retrieval and vision comparisons use randomly initialized encoders.
+Tokenizers may be reused, but encoder weights are trained from scratch.  LSSO
+uses $\gamma_{\max}=0.3$ and $\theta_\gamma=-4$ unless stated otherwise.
+Tables report mixer-only MACs to isolate the cost of replacing the token
+mixer; FFN cost is intentionally not folded into the main MAC column.
+
+\subsection{Retrieval Main Results}
+
+Table~\ref{tab:retrieval} reports 3-seed retrieval results on FIQA, NFCorpus,
+and SciFact.  The baseline is a BERT-style encoder with MHA.  Nystr\"omformer
+uses the official attention module.  LSSO-r16 and LSSO-r32 keep the same model
+dimension, depth, heads, optimizer, and training schedule.
+
+\begin{table*}[t]
+\centering
+\caption{Retrieval main results.  Models are randomly initialized BERT-style
+encoders with $D=256$, depth 8, heads 8, and document length 512.  MACs are
+mixer-only document-side MACs.}
+\label{tab:retrieval}
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Model & Params (M) & Mixer MACs (G) & R@10 & MRR@10 \\
+\midrule
+FIQA & MHA & 14.33 & 2.147 & $0.2145\pm0.0135$ & $0.0987\pm0.0032$ \\
+FIQA & Nystr\"omformer & 14.33 & 1.301 & $0.2428\pm0.0039$ & $0.1190\pm0.0071$ \\
+FIQA & LSSO-r16 & 13.54 & 0.713 & $0.2258\pm0.0125$ & $0.1126\pm0.0061$ \\
+FIQA & LSSO-r32 & 13.80 & 0.908 & $0.2387\pm0.0183$ & $0.1150\pm0.0035$ \\
+\midrule
+NFCorpus & MHA & 14.33 & 2.147 & $0.5439\pm0.0187$ & $0.3809\pm0.0145$ \\
+NFCorpus & Nystr\"omformer & 14.33 & 1.301 & $0.5841\pm0.0125$ & $0.4323\pm0.0132$ \\
+NFCorpus & LSSO-r16 & 13.54 & 0.713 & $0.5686\pm0.0125$ & $0.4121\pm0.0036$ \\
+NFCorpus & LSSO-r32 & 13.80 & 0.908 & $0.5841\pm0.0036$ & $0.4333\pm0.0220$ \\
+\midrule
+SciFact & MHA & 14.33 & 2.147 & $0.6789\pm0.0190$ & $0.5994\pm0.0138$ \\
+SciFact & Nystr\"omformer & 14.33 & 1.301 & $0.7267\pm0.0133$ & $0.6313\pm0.0033$ \\
+SciFact & LSSO-r16 & 13.54 & 0.713 & $0.7022\pm0.0107$ & $0.6214\pm0.0119$ \\
+SciFact & LSSO-r32 & 13.80 & 0.908 & $0.7089\pm0.0117$ & $0.6247\pm0.0080$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+LSSO-r16 reduces mixer MACs by 66.8\% relative to MHA, while LSSO-r32 reduces
+them by 57.7\%.  Both retain or improve MHA-level retrieval quality across the
+three datasets.  Nystr\"omformer is a strong retrieval baseline in this setup,
+but its observed throughput is lower than both MHA and LSSO in our runs.
+
+\subsection{MS MARCO to BEIR Transfer}
+
+To test whether the result is limited to small supervised retrieval datasets,
+we pretrain on MS MARCO and evaluate zero-shot on BEIR-style tasks.  Macro
+averages over FIQA, NFCorpus, SciFact, ArguAna, and TREC-COVID are shown in
+Table~\ref{tab:transfer}.
+
+\begin{table}[t]
+\centering
+\caption{MS MARCO to BEIR transfer macro average over five datasets.}
+\label{tab:transfer}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrr}
+\toprule
+Model & MACs (G) & nDCG@10 & Recall@100 \\
+\midrule
+MHA & 2.147 & 0.22945 & 0.36061 \\
+Nystr\"omformer & 1.270 & 0.20523 & 0.33456 \\
+LSSO-r16 & 0.713 & 0.22973 & 0.35889 \\
+LSSO-r32 & 0.908 & 0.22940 & 0.36367 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The LSSO models preserve MHA-level transfer under substantially lower mixer
+cost.  In this setting the official Nystr\"omformer baseline is cheaper than
+MHA but trails the MHA and LSSO macro averages.
+
+\subsection{Ablations and Diagnostics}
+
+Table~\ref{tab:ablation} aligns the empirical ablations with the theory.  The
+no-global variant sets $\gamma=0$, reducing the operator to $\mu^{-1}C$ and
+removing token mixing.  Removing RMS normalization weakens the global
+correction, especially on SciFact.  Smaller ranks expose the capacity of the
+learned relation subspace.
+
+\begin{table*}[t]
+\centering
+\caption{Retrieval ablations.  Values are mean $\pm$ standard deviation over
+three seeds.}
+\label{tab:ablation}
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Variant & R@10 & MRR@10 & $\gamma/\mu$ & Correction ratio \\
+\midrule
+FIQA & no-global r32 & $0.2052\pm0.0137$ & $0.0911\pm0.0019$ & 0.0000 & 0.0000 \\
+FIQA & fixed $\mu/\gamma$ r32 & $0.2428\pm0.0126$ & $0.1136\pm0.0028$ & 0.0078 & 0.2130 \\
+FIQA & no U RMS norm r32 & $0.2160\pm0.0101$ & $0.1007\pm0.0008$ & 0.0085 & 0.2050 \\
+FIQA & full r8 & $0.2088\pm0.0208$ & $0.0923\pm0.0139$ & 0.0100 & 0.1059 \\
+FIQA & full r4 & $0.2042\pm0.0045$ & $0.0979\pm0.0036$ & 0.0109 & 0.0742 \\
+\midrule
+SciFact & no-global r32 & $0.6767\pm0.0120$ & $0.5811\pm0.0058$ & 0.0000 & 0.0000 \\
+SciFact & fixed $\mu/\gamma$ r32 & $0.7089\pm0.0102$ & $0.6088\pm0.0066$ & 0.0078 & 0.2631 \\
+SciFact & no U RMS norm r32 & $0.6933\pm0.0133$ & $0.5972\pm0.0150$ & 0.0078 & 0.0471 \\
+SciFact & full r8 & $0.7067\pm0.0173$ & $0.6118\pm0.0064$ & 0.0078 & 0.1149 \\
+SciFact & full r4 & $0.7022\pm0.0069$ & $0.6146\pm0.0107$ & 0.0078 & 0.0766 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Figure~\ref{fig:diagnostics} plots trained layer-wise diagnostics.  All tasks
+show nonzero correction ratios, confirming that the trained operator does not
+collapse to the local projection.  Effective rank is task dependent: SciFact
+uses much more of the available rank-32 subspace than FIQA, NFCorpus, or
+CIFAR-100.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.96\linewidth]{../paper_results/operator_diagnostics/operator_diagnostics_summary.png}
+\caption{Layer-wise LSSO diagnostics from trained LSSO-r32 checkpoints.}
+\label{fig:diagnostics}
+\end{figure*}
+
+\subsection{Sequence Scaling}
+
+We benchmark single-layer token mixers at sequence lengths from 128 to 2048
+with batch size 8, $D=256$, 8 heads, bf16 autocast, and no optimizer update.
+Figure~\ref{fig:scaling} shows forward latency, forward+backward latency,
+incremental peak memory, and theoretical mixer MACs.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.96\linewidth]{../paper_results/sequence_scaling/sequence_scaling.png}
+\caption{Sequence scaling benchmark on an NVIDIA RTX 5070 Ti.  MACs are
+theoretical per-sample single-layer mixer MACs; latency and memory use batch
+8.}
+\label{fig:scaling}
+\end{figure*}
+
+At $N=2048$, LSSO-r16 uses 0.357G mixer MACs compared with 2.684G for MHA,
+an 86.7\% reduction, and reduces forward+backward latency from 2.61 ms to
+1.88 ms.  LSSO-r32 uses 0.453G MACs and takes 1.95 ms.  Peak memory is closer
+to optimized MHA than the dense $O(N^2)$ formula would suggest because current
+PyTorch MHA uses memory-efficient Flash/SDPA kernels.  Thus this benchmark
+supports the arithmetic scaling and long-sequence latency claim, not a
+universal memory-savings claim.
+
+\subsection{Vision and Diffusion Boundary Results}
+
+Table~\ref{tab:cv} reports vision encoder results.  On CIFAR-100, LSSO gives
+a cost-accuracy trade-off but does not dominate the official Nystr\"omformer
+baseline.  On ImageNet-100, MHA remains stronger at one seed, while LSSO
+reduces mixer MACs substantially.  These results support LSSO as a general
+encoder mixer candidate rather than a universal replacement.
+
+\begin{table}[t]
+\centering
+\caption{Vision encoder results.  CIFAR-100 is 3 seeds; ImageNet-100 is one
+seed.}
+\label{tab:cv}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{llrrr}
+\toprule
+Dataset & Model & MACs (G) & Top-1 & Top-5 \\
+\midrule
+CIFAR-100 & MHA & 0.0665 & $55.40\pm0.27$ & -- \\
+CIFAR-100 & Nystr\"omformer & 0.0389 & $59.98\pm0.58$ & -- \\
+CIFAR-100 & LSSO-r16 & 0.0249 & $54.79\pm0.14$ & -- \\
+CIFAR-100 & LSSO-r32 & 0.0385 & $55.38\pm0.18$ & -- \\
+\midrule
+ImageNet-100 & MHA & 0.520 & 82.26 & 95.54 \\
+ImageNet-100 & LSSO-r16 & 0.137 & 80.54 & 94.88 \\
+ImageNet-100 & LSSO-r32 & 0.174 & 80.58 & 94.76 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+We also ran a latent diffusion boundary experiment on ImageNet-100 latent
+tokens.  It reports noise-prediction validation MSE only, without FID/KID or
+sample-quality claims.  Pure LSSO retains much of the MHA optimization quality
+with lower theoretical mixer MACs, but it is not yet a direct replacement for
+attention in diffusion generation.
+
+\clearpage
+
+\section{Discussion}
+
+\paragraph{What LSSO is.}
+LSSO is a low-rank global solve, a stable implicit correction operator for
+fixed $U$, and a bidirectional encoder token mixer.
+
+\paragraph{What LSSO is not.}
+LSSO is not an attention approximation.  It is not currently a causal
+decoder-only replacement, because causal masking destroys the simple low-rank
+Woodbury structure.  It is also not yet a universal diffusion backbone.
+
+\paragraph{Why retrieval is a natural fit.}
+Retrieval encoders require global bidirectional semantic compression rather
+than precise causal next-token routing.  A low-rank global correction can
+capture document-level structure while avoiding explicit all-pairs value
+routing.
+
+\section{Limitations}
+
+First, the theory analyzes fixed-$U$ operator properties.  It does not prove
+stability of full end-to-end training dynamics.  Second, LSSO is designed for
+bidirectional encoders; causal and autoregressive extensions require new
+prefix-restricted solves or cached global states.  Third, rank is a real
+capacity knob: some tasks use only a compact subspace, while others, such as
+SciFact in our diagnostics, use much more of rank 32.  Fourth, vision and
+diffusion experiments show useful cost-accuracy trade-offs but not universal
+dominance over attention or strong attention alternatives.
+
+\section{Conclusion}
+
+We introduced LSSO, a learnable low-rank Sylvester-style solve operator for
+efficient bidirectional token mixing.  The operator is well posed, efficiently
+computable through Woodbury, spectrally bounded for fixed relation features,
+conditioned by $\gamma/\mu$ and the scale of $U$, and equivalent to solving a
+strongly convex global correction energy.  Experiments show strong retrieval
+and transfer performance under lower mixer-only cost, while boundary studies
+clarify where LSSO is and is not currently effective.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\appendix
+
+\section{Full Woodbury Derivation}
+
+The Woodbury identity gives
+\[
+  (A+UCV)^{-1}
+  =
+  A^{-1}-A^{-1}U(C^{-1}+VA^{-1}U)^{-1}VA^{-1}.
+\]
+Set $A=\mu I_N$, $C=\gamma I_r$, and $V=U^\top$:
+\[
+\begin{aligned}
+  (\mu I+\gamma UU^\top)^{-1}
+  ={}& \mu^{-1}I\\
+  &-\mu^{-1}U(\gamma^{-1}I+\mu^{-1}U^\top U)^{-1}
+    U^\top\mu^{-1}.
+\end{aligned}
+\]
+For implementation it is preferable to avoid $\gamma^{-1}$, so we rewrite the
+solution as
+\[
+  Y
+  = \mu^{-1}C
+  - \mu^{-1}U(I+\gamma\mu^{-1}U^\top U)^{-1}
+    (\gamma\mu^{-1}U^\top C).
+\]
+This expression remains valid at $\gamma=0$.
+
+\section{Implementation Notes}
+
+The PyTorch implementation computes $U^\top U$ and $U^\top C$ in batched
+form, solves the small $r\times r$ system in float32 for numerical stability
+under fp16/bf16 autocast, and casts the result back to the activation dtype.
+Diagnostics record $\gamma/\mu$, effective rank of $U^\top U$, and the ratio
+between the Woodbury correction and the local $\mu^{-1}C$ term.
+
+\end{document}

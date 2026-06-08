@@ -52,3 +52,5 @@ Thumbs.db
 
 # Local scratch files
 =*
+# LaTeX build outputs
+paper/build/

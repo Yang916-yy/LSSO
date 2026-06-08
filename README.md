@@ -150,6 +150,9 @@ visible without being diluted by FFN cost.
 ## Paper Experiment Results
 
 Completed experiments are organized under [`paper_results/`](paper_results/).
+An initial theory-and-experiments preprint draft is available under
+[`paper/`](paper/), with the compiled PDF at
+[`paper/LSSO_draft.pdf`](paper/LSSO_draft.pdf).
 The repository tracks lightweight artifacts only: summary tables, manifests,
 source notebooks/scripts, and JSONL logs. Model checkpoints are not tracked in
 git; they are available from one GitHub Release:
