@@ -1,6 +1,6 @@
-# LSSO Paper Draft
+# LSSO Paper
 
-`main.tex` is a compact six-page preprint-style draft built from the completed
+`main.tex` is a compact seven-page preprint-style paper built from the completed
 experiments under `paper_results/`. It contains:
 
 - the LSSO formulation and Woodbury implementation;
@@ -16,9 +16,10 @@ Compile with the bundled Tectonic binary or a normal LaTeX installation:
 tectonic main.tex --outdir build
 ```
 
-The checked draft is available as `LSSO_draft.pdf`; local compile intermediates
-are written to `build/` and are not intended for version control.
+The versioned paper is available as
+`LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf`;
+local compile intermediates are written to `build/` and are not intended for
+version control.
 
-Before submission, replace `Anonymous Authors`, choose the target venue style,
-add dataset and training-detail citations, and complete the missing formal
-experiments noted in the repository roadmap.
+The current version lists Zhaoyang Wang as the author and links directly to the
+repository from the title block.

@@ -154,9 +154,9 @@ visible without being diluted by FFN cost.
 ## Paper Experiment Results
 
 Completed experiments are organized under [`paper_results/`](paper_results/).
-An initial theory-and-experiments preprint draft is available under
+The versioned theory-and-experiments preprint is available under
 [`paper/`](paper/), with the compiled PDF at
-[`paper/LSSO_draft.pdf`](paper/LSSO_draft.pdf).
+[`paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf`](paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf).
 The repository tracks lightweight artifacts only: summary tables, manifests,
 source notebooks/scripts, and JSONL logs. Model checkpoints are not tracked in
 git; they are available from one GitHub Release:

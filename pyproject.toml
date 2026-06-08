@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
-    { name = "LSSO contributors" },
+    { name = "Zhaoyang Wang", email = "zhaoy@uir.edu.cn" },
 ]
 keywords = [
     "pytorch",
@@ -34,6 +34,11 @@ classifiers = [
 dependencies = [
     "torch>=2.1",
 ]
+
+[project.urls]
+Repository = "https://github.com/Yang916-yy/LSSO"
+Paper = "https://github.com/Yang916-yy/LSSO/blob/main/paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf"
+Issues = "https://github.com/Yang916-yy/LSSO/issues"
 
 [project.optional-dependencies]
 hf = [
