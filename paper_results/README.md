@@ -15,6 +15,8 @@ See `release_assets.tsv` for asset names, sizes, SHA256 checksums, and contents.
 - `cifar100_cv_main/`: CIFAR-100 CV main table, patch=2, CLS pooling, medium augmentation, 3 seeds.
 - `imagenet100_cv_main/`: ImageNet-100 CV main table, image size 224, patch=8, 1 seed.
 - `diffusion_imagenet100/`: one-seed ImageNet-100 latent diffusion boundary experiment with MHA, Nystromformer, LSSO-r16, and LSSO-r32.
+- `sequence_scaling/`: single-layer latency, forward+backward time, allocated peak memory, and mixer MAC scaling from 128 to 2048 tokens.
+- `operator_diagnostics/`: trained layer-wise `gamma/mu`, global correction ratio, and effective-rank visualizations.
 
 ## Notes
 

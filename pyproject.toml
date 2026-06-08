@@ -44,6 +44,7 @@ hf = [
     "scikit-learn",
 ]
 experiments = [
+    "matplotlib",
     "numpy",
     "tqdm",
     "torchinfo",
@@ -54,6 +55,7 @@ experiments = [
     "scikit-learn",
 ]
 all = [
+    "matplotlib",
     "numpy",
     "tqdm",
     "torchinfo",

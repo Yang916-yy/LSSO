@@ -283,6 +283,31 @@ rank 8 saves about 31% and begins to trade accuracy for compression.
 
 Full table: [`paper_results/rank_pruning/summary.tsv`](paper_results/rank_pruning/summary.tsv).
 
+### Sequence Scaling
+
+A single-layer bf16 benchmark compares MHA, official Nystromformer,
+LSSO-r16, and LSSO-r32 at sequence lengths from 128 to 2048 with
+`batch=8`, `dim=256`, and `heads=8`.
+
+At `N=2048`, LSSO-r16 uses 86.7% fewer theoretical mixer MACs than MHA and
+reduces forward+backward time from 2.61 ms to 1.88 ms. LSSO-r32 uses 83.1%
+fewer MACs and takes 1.95 ms. Optimized PyTorch MHA uses Flash/SDPA, so peak
+allocated memory remains close; this benchmark supports the arithmetic and
+long-sequence latency claim rather than claiming universal memory savings.
+
+Figure and raw data:
+[`paper_results/sequence_scaling/`](paper_results/sequence_scaling/).
+
+### Operator Diagnostics
+
+Trained LSSO-r32 checkpoints were evaluated layer by layer on FIQA, NFCorpus,
+SciFact, and CIFAR-100. All tasks retain a nonzero global correction, and the
+learned effective rank is task dependent: the mean is about 3.77 on FIQA,
+4.36 on NFCorpus, 20.81 on SciFact, and 2.49 on CIFAR-100.
+
+Combined figure and layer-level tables:
+[`paper_results/operator_diagnostics/`](paper_results/operator_diagnostics/).
+
 ### Checkpoints
 
 Download checkpoints from the relevant release and extract the needed archive:
