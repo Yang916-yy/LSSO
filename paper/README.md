@@ -1,6 +1,6 @@
 # LSSO Paper Draft
 
-`main.tex` is an eight-page preprint-style draft built from the completed
+`main.tex` is a compact six-page preprint-style draft built from the completed
 experiments under `paper_results/`. It contains:
 
 - the LSSO formulation and Woodbury implementation;
