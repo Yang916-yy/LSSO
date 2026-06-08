@@ -385,71 +385,75 @@ shortcut.
 
 All four models use the same randomly initialized BERT-style architecture,
 MS MARCO training data, tokenizer, pooling, optimizer, three seeds, and
-document length 512.  Only the token mixer changes.  Macro averages over FIQA,
-NFCorpus, SciFact, ArguAna, and TREC-COVID are shown in
-Table~\ref{tab:transfer}; per-dataset nDCG@10 is shown in
-Table~\ref{tab:transfer-datasets}.
+document length 512.  Only the token mixer changes.  Table~\ref{tab:transfer}
+reports per-dataset nDCG@10 with seed variation, together with macro retrieval
+quality and mixer cost.
 
-\begin{center}
-\begin{minipage}{\columnwidth}
+\begin{table*}[!t]
 \centering
-\captionof{table}{MS MARCO to BEIR transfer macro average over five datasets.}
+\caption{Zero-shot BEIR transfer after MS MARCO pretraining.  Dataset columns
+report nDCG@10 as mean $\pm$ standard deviation over three seeds.  Macro
+columns average the five dataset means; MACs are mixer-only at document length
+512.  Best values are bold.}
 \label{tab:transfer}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrr}
+\scriptsize
+\setlength{\tabcolsep}{2.8pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrccccccc}
 \toprule
-Model & MACs (G) & nDCG@10 & Recall@100 \\
+Model & MACs (G) & Save &
+ArguAna & FIQA & NFCorpus & SciFact & TREC-COVID &
+\shortstack{Macro\\nDCG@10} & \shortstack{Macro\\Recall@100} \\
 \midrule
-MHA & 2.147 & 0.22945 & 0.36061 \\
-Nystr\"omformer & 1.270 & 0.20523 & 0.33456 \\
-LSSO-r16 & 0.713 & 0.22973 & 0.35889 \\
-LSSO-r32 & 0.908 & 0.22940 & 0.36367 \\
+MHA
+& 2.147 & 0.0\%
+& $\mathbf{0.2026{\pm}0.0046}$
+& $0.0737{\pm}0.0040$
+& $0.1857{\pm}0.0046$
+& $0.2984{\pm}0.0075$
+& $0.3869{\pm}0.0112$
+& 0.22945 & 0.36061 \\
+Nystr\"omformer
+& 1.270 & 40.9\%
+& $0.1825{\pm}0.0089$
+& $0.0725{\pm}0.0037$
+& $0.1661{\pm}0.0081$
+& $0.2585{\pm}0.0171$
+& $0.3466{\pm}0.0081$
+& 0.20523 & 0.33456 \\
+LSSO-r16
+& \textbf{0.713} & \textbf{66.8\%}
+& $0.1990{\pm}0.0079$
+& $0.0732{\pm}0.0042$
+& $0.1802{\pm}0.0095$
+& $0.3088{\pm}0.0117$
+& $\mathbf{0.3875{\pm}0.0209}$
+& \textbf{0.22973} & 0.35889 \\
+LSSO-r32
+& 0.908 & 57.7\%
+& $0.1978{\pm}0.0025$
+& $\mathbf{0.0769{\pm}0.0032}$
+& $\mathbf{0.1870{\pm}0.0073}$
+& $\mathbf{0.3315{\pm}0.0075}$
+& $0.3538{\pm}0.0110$
+& 0.22940 & \textbf{0.36367} \\
 \bottomrule
 \end{tabular}
 }
-\end{minipage}
-\end{center}
+\end{table*}
 
 The LSSO models preserve MHA-level transfer under substantially lower mixer
-cost.  LSSO-r16 nearly matches the MHA macro nDCG@10
+cost.  LSSO-r16 slightly exceeds the MHA macro nDCG@10
 ($0.22973$ vs. $0.22945$) while using 66.8\% fewer mixer MACs.  LSSO-r32 has
-the strongest macro Recall@100 among the four models ($0.36367$) while still
-using 57.7\% fewer mixer MACs.  In this setting the official Nystr\"omformer
-baseline is cheaper than MHA but trails both MHA and LSSO on the macro
-averages, suggesting that the low-rank solve is not merely a cheaper attention
-approximation but a competitive transfer-oriented encoder bias.
+the strongest macro Recall@100 ($0.36367$) while using 57.7\% fewer mixer
+MACs.  The official Nystr\"omformer baseline is cheaper than MHA but trails
+both MHA and LSSO on the macro metrics.
 
-\begin{center}
-\begin{minipage}{\columnwidth}
-\centering
-\captionof{table}{Zero-shot BEIR transfer after MS MARCO pretraining:
-per-dataset nDCG@10 over three seeds.}
-\label{tab:transfer-datasets}
-\scriptsize
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrrr}
-\toprule
-Dataset & MHA & Nystr\"om & LSSO-r16 & LSSO-r32 \\
-\midrule
-ArguAna & 0.20259 & 0.18247 & 0.19896 & 0.19783 \\
-FIQA & 0.07372 & 0.07253 & 0.07322 & 0.07686 \\
-NFCorpus & 0.18565 & 0.16607 & 0.18015 & 0.18704 \\
-SciFact & 0.29838 & 0.25846 & 0.30881 & 0.33148 \\
-TREC-COVID & 0.38694 & 0.34661 & 0.38749 & 0.35382 \\
-\midrule
-Macro avg. & 0.22945 & 0.20523 & 0.22973 & 0.22940 \\
-\bottomrule
-\end{tabular}
-}
-\end{minipage}
-\end{center}
-
-The per-dataset pattern is mixed, which is expected for zero-shot BEIR:
-MHA is best on ArguAna and TREC-COVID, LSSO-r32 is best on FIQA, NFCorpus, and
-SciFact, and LSSO-r16 is essentially tied with MHA on the macro average.  The
-important result is not that one LSSO rank dominates every target dataset, but
-that both LSSO ranks remain at MHA-level transfer quality while operating at a
-much lower mixer cost.
+The per-dataset pattern is mixed, as expected in zero-shot BEIR: MHA is best on
+ArguAna, LSSO-r16 is best on TREC-COVID and on macro nDCG@10, and LSSO-r32 is
+best on FIQA, NFCorpus, SciFact, and macro Recall@100.  The main result is not
+universal dominance by one rank, but that both LSSO settings retain MHA-level
+cross-domain transfer while substantially reducing mixer computation.
 
 \subsection{Ablations and Diagnostics}
 
