@@ -386,60 +386,46 @@ shortcut.
 All four models use the same randomly initialized BERT-style architecture,
 MS MARCO training data, tokenizer, pooling, optimizer, three seeds, and
 document length 512.  Only the token mixer changes.  Table~\ref{tab:transfer}
-reports per-dataset nDCG@10 with seed variation, together with macro retrieval
-quality and mixer cost.
+therefore focuses on the quality--cost trade-off: each retrieval metric is
+first macro-averaged over the five target datasets for each seed, then reported
+as mean $\pm$ standard deviation across seeds.  The models have comparable
+total parameter counts (13.53--14.33M), so the table reports the mixer MACs
+that distinguish their computational cost.  Full per-dataset and per-seed
+results are included in the released experiment artifacts.
 
 \begin{table*}[!t]
 \centering
-\caption{Zero-shot BEIR transfer after MS MARCO pretraining.  Dataset columns
-report nDCG@10 as mean $\pm$ standard deviation over three seeds.  Macro
-columns average the five dataset means; MACs are mixer-only at document length
-512.  Best values are bold.}
+\caption{Zero-shot BEIR transfer after MS MARCO pretraining.  Retrieval metrics
+are five-dataset macro averages, reported as mean $\pm$ standard deviation over
+three seeds.  MACs are mixer-only at document length 512.  Best values are
+bold.}
 \label{tab:transfer}
-\scriptsize
-\setlength{\tabcolsep}{2.8pt}
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{lrrccccccc}
+\begin{tabular}{lrrrr}
 \toprule
-Model & MACs (G) & Save &
-ArguAna & FIQA & NFCorpus & SciFact & TREC-COVID &
-\shortstack{Macro\\nDCG@10} & \shortstack{Macro\\Recall@100} \\
+Model & Mixer MACs (G) & nDCG@10 & Recall@100 & MRR@10 \\
 \midrule
 MHA
-& 2.147 & 0.0\%
-& $\mathbf{0.2026{\pm}0.0046}$
-& $0.0737{\pm}0.0040$
-& $0.1857{\pm}0.0046$
-& $0.2984{\pm}0.0075$
-& $0.3869{\pm}0.0112$
-& 0.22945 & 0.36061 \\
+& 2.147
+& $0.22945{\pm}0.00208$
+& $0.36061{\pm}0.00365$
+& $\mathbf{0.30225{\pm}0.00442}$ \\
 Nystr\"omformer
-& 1.270 & 40.9\%
-& $0.1825{\pm}0.0089$
-& $0.0725{\pm}0.0037$
-& $0.1661{\pm}0.0081$
-& $0.2585{\pm}0.0171$
-& $0.3466{\pm}0.0081$
-& 0.20523 & 0.33456 \\
+& 1.270 {\scriptsize($-40.9\%$)}
+& $0.20523{\pm}0.00495$
+& $0.33456{\pm}0.00837$
+& $0.27115{\pm}0.01046$ \\
 LSSO-r16
-& \textbf{0.713} & \textbf{66.8\%}
-& $0.1990{\pm}0.0079$
-& $0.0732{\pm}0.0042$
-& $0.1802{\pm}0.0095$
-& $0.3088{\pm}0.0117$
-& $\mathbf{0.3875{\pm}0.0209}$
-& \textbf{0.22973} & 0.35889 \\
+& \textbf{0.713} {\scriptsize($-66.8\%$)}
+& $\mathbf{0.22973{\pm}0.00232}$
+& $0.35889{\pm}0.00226$
+& $0.29382{\pm}0.01446$ \\
 LSSO-r32
-& 0.908 & 57.7\%
-& $0.1978{\pm}0.0025$
-& $\mathbf{0.0769{\pm}0.0032}$
-& $\mathbf{0.1870{\pm}0.0073}$
-& $\mathbf{0.3315{\pm}0.0075}$
-& $0.3538{\pm}0.0110$
-& 0.22940 & \textbf{0.36367} \\
+& 0.908 {\scriptsize($-57.7\%$)}
+& $0.22940{\pm}0.00337$
+& $\mathbf{0.36367{\pm}0.00830}$
+& $0.29858{\pm}0.00624$ \\
 \bottomrule
 \end{tabular}
-}
 \end{table*}
 
 The LSSO models preserve MHA-level transfer under substantially lower mixer
@@ -449,11 +435,11 @@ the strongest macro Recall@100 ($0.36367$) while using 57.7\% fewer mixer
 MACs.  The official Nystr\"omformer baseline is cheaper than MHA but trails
 both MHA and LSSO on the macro metrics.
 
-The per-dataset pattern is mixed, as expected in zero-shot BEIR: MHA is best on
-ArguAna, LSSO-r16 is best on TREC-COVID and on macro nDCG@10, and LSSO-r32 is
-best on FIQA, NFCorpus, SciFact, and macro Recall@100.  The main result is not
-universal dominance by one rank, but that both LSSO settings retain MHA-level
-cross-domain transfer while substantially reducing mixer computation.
+The three macro metrics expose complementary behavior: LSSO-r16 gives the best
+nDCG@10--cost trade-off, LSSO-r32 gives the highest Recall@100, and MHA retains
+the highest MRR@10.  The main result is therefore not universal dominance by
+one rank, but that both LSSO settings remain on the MHA-level transfer frontier
+while substantially reducing mixer computation.
 
 \subsection{Ablations and Diagnostics}
 
@@ -622,37 +608,20 @@ clarify where LSSO is and is not currently effective.
 
 \section{Full Woodbury Derivation}
 
-The Woodbury identity gives
+Using the Woodbury identity with $A=\mu I_N$, $C=\gamma I_r$, and
+$V=U^\top$ gives
+{\small
 \[
-  (A+UCV)^{-1}
-  =
-  A^{-1}-A^{-1}U(C^{-1}+VA^{-1}U)^{-1}VA^{-1}.
+(\mu I+\gamma UU^\top)^{-1}
+= \mu^{-1}I
+-\mu^{-1}U(\gamma^{-1}I+\mu^{-1}U^\top U)^{-1}U^\top\mu^{-1}.
 \]
-Set $A=\mu I_N$, $C=\gamma I_r$, and $V=U^\top$:
+}
+Multiplying the small inverse by $\gamma$ avoids an explicit $\gamma^{-1}$ and
+gives the implementation form
 \[
-\begin{aligned}
-  (\mu I+\gamma UU^\top)^{-1}
-  ={}& \mu^{-1}I\\
-  &-\mu^{-1}U(\gamma^{-1}I+\mu^{-1}U^\top U)^{-1}
-    U^\top\mu^{-1}.
-\end{aligned}
+Y=\mu^{-1}C-\mu^{-1}U(I+\gamma\mu^{-1}U^\top U)^{-1}
+(\gamma\mu^{-1}U^\top C),
 \]
-For implementation it is preferable to avoid $\gamma^{-1}$, so we rewrite the
-solution as
-\[
-  Y
-  = \mu^{-1}C
-  - \mu^{-1}U(I+\gamma\mu^{-1}U^\top U)^{-1}
-    (\gamma\mu^{-1}U^\top C).
-\]
-This expression remains valid at $\gamma=0$.
-
-\section{Implementation Notes}
-
-The PyTorch implementation computes $U^\top U$ and $U^\top C$ in batched
-form, solves the small $r\times r$ system in float32 for numerical stability
-under fp16/bf16 autocast, and casts the result back to the activation dtype.
-Diagnostics record $\gamma/\mu$, effective rank of $U^\top U$, and the ratio
-between the Woodbury correction and the local $\mu^{-1}C$ term.
 
 \end{document}

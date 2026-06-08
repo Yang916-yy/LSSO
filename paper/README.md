@@ -8,7 +8,7 @@ experiments under `paper_results/`. It contains:
 - retrieval, transfer, ablation, diagnostics, sequence-scaling, and vision
   results;
 - explicit scope and limitations;
-- a full Woodbury derivation and implementation notes in the appendix.
+- a compact Woodbury derivation in the appendix.
 
 Compile with the bundled Tectonic binary or a normal LaTeX installation:
 
