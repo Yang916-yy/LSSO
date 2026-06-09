@@ -83,8 +83,8 @@ attention methods reduce the cost by approximating or sparsifying the routing
 matrix.  LSSO asks a different question: can a global token interaction be
 learned without constructing such a matrix at all?
 
-For an input sequence $X\in\R^{B\times N\times D}$, LSSO learns a low-rank
-relation feature $U(X)$ and a content state $C(X)$.  For each head it solves
+For an input sequence $X\in\R^{B\times N\times D}$, LSSO learns low-rank
+relation features $U(X)$ and a content state $C(X)$.  Each head solves
 \[
   (\mu I_N+\gamma U U^\top)Y=C,
   \qquad \mu>0,\quad \gamma\geq 0,
@@ -152,12 +152,12 @@ Transformer-style block this is simply
   \qquad
   X_{\mathrm{out}} = X' + \operatorname{MLP}(\operatorname{LN}(X')).
 \]
-The replacement is local: the input and output shapes match MHA, so the same
+The replacement is local: its input and output shapes match MHA, so the
 residual path, normalization, positional encoding, feed-forward block, and task
 head can be kept.  In the BERT-style retrieval experiments we preserve the
 post-LN BERT block used by the baseline; in the ViT-style vision experiments we
-use the pre-LN form above.  Thus the comparison changes the mixer, not the
-surrounding block convention.
+use the pre-LN form above.  The comparison therefore changes the mixer without
+changing the surrounding block convention.
 
 \subsection{LSSO Definition}
 
@@ -166,7 +166,7 @@ For each head, let
   U = XW_u\in\R^{B\times N\times r},\qquad
   C = XW_c\in\R^{B\times N\times d_h}.
 \]
-There is one pair of scalar solve parameters per head.  We RMS-normalize $U$
+Each head has its own pair of scalar solve parameters.  We RMS-normalize $U$
 along its rank dimension by default,
 \[
   U \leftarrow U\big/\sqrt{\operatorname{mean}_r(U^2)+\epsilon},
@@ -211,12 +211,12 @@ Y
 \label{eq:woodbury}
 \end{equation}
 This expression remains valid at $\gamma=0$ and requires only an $r\times r$
-solve; Appendix~\ref{app:woodbury} gives the full derivation.
+solve.  Appendix~\ref{app:woodbury} gives the full derivation.
 The released implementation fuses the $U$ and $C$ projections into one linear
-map for efficiency, but this is algebraically identical to using separate
+map; this is algebraically identical to using separate
 $W_u$ and $W_c$.  The small positive-definite system is solved by Cholesky in
 float32 under fp16/bf16 autocast, then cast back to the activation dtype.  The
-current package also provides a custom autograd path whose backward pass reuses
+package also provides a custom autograd path whose backward pass reuses
 the same Woodbury solve on the adjoint, avoiding a dense $N\times N$ inverse in
 both directions.
 The core solve terms cost
@@ -332,8 +332,8 @@ For $\mu>0$ and $\gamma\geq0$, the LSSO output is the unique minimizer of
 
 \begin{proof}
 The Hessian of $\mathcal{E}$ is $\mu I+\gamma UU^\top$, which is positive
-definite by Proposition~\ref{prop:well-posedness}.  Setting the gradient to zero gives
-$(\mu I+\gamma UU^\top)Y=C$.
+definite by Proposition~\ref{prop:well-posedness}.  Setting the gradient to
+zero gives $(\mu I+\gamma UU^\top)Y=C$.
 \end{proof}
 
 Equivalently, up to an additive constant,
@@ -355,12 +355,117 @@ If $\gamma=0$, then
 No token mixing occurs except for pointwise projections.
 \end{proposition}
 
+\section{Exact Recurrent Prefix Form}
+\label{sec:recurrence}
+
+The LSSO layer studied above is bidirectional: all outputs come from one
+full-sequence solve.  Restricting the same system to successive prefixes,
+however, yields an exact finite-state recurrence.  We derive this form as a
+possible basis for a causal implementation of LSSO.
+
+For one head, write the rows of $U$ and $C$ as $u_t^\top\in\R^{1\times r}$
+and $c_t^\top\in\R^{1\times d_h}$.  Let $U_{1:t}$ and $C_{1:t}$ contain the
+first $t$ rows, and define
+\[
+  \alpha=\frac{\gamma}{\mu},\qquad
+  S_t=I_r+\alpha U_{1:t}^\top U_{1:t},\qquad
+  T_t=U_{1:t}^\top C_{1:t}.
+\]
+The two recurrent states are
+\[
+  P_t=S_t^{-1}\in\R^{r\times r},
+  \qquad
+  Z_t=P_tT_t\in\R^{r\times d_h}.
+\]
+
+\begin{proposition}[Exact prefix recurrence]
+\label{prop:prefix-recurrence}
+Initialize $P_0=I_r$ and $Z_0=0$.  For token $t$, define
+\[
+  q_t=P_{t-1}u_t,\qquad
+  \delta_t=1+\alpha u_t^\top q_t.
+\]
+Then the updates
+\begin{align}
+  P_t
+  &=P_{t-1}-\frac{\alpha}{\delta_t}q_tq_t^\top,
+  \label{eq:prefix-p}\\
+  Z_t
+  &=Z_{t-1}
+    +\frac{q_t}{\delta_t}
+      \left(c_t^\top-\alpha u_t^\top Z_{t-1}\right)
+  \label{eq:prefix-z}
+\end{align}
+are well defined, and the output at step $t$
+\begin{equation}
+  y_t^\top
+  =\mu^{-1}
+    \left(c_t^\top-\alpha u_t^\top Z_t\right)
+  \label{eq:prefix-output}
+\end{equation}
+is exactly the last row of the prefix solve
+\[
+  (\mu I_t+\gamma U_{1:t}U_{1:t}^\top)Y_{1:t}=C_{1:t}.
+\]
+\end{proposition}
+
+\begin{proof}
+Since $S_{t-1}$ is positive definite, so is $P_{t-1}$.  Therefore
+$\delta_t=1+\alpha u_t^\top P_{t-1}u_t\geq1$, and the denominator is positive.
+Moreover,
+\[
+  S_t=S_{t-1}+\alpha u_tu_t^\top.
+\]
+Applying the Sherman--Morrison rank-one inverse identity
+\citep{sherman1950adjustment} gives Eq.~\eqref{eq:prefix-p}, hence
+$P_t=S_t^{-1}$.  It also gives
+\[
+  P_tu_t=\frac{q_t}{\delta_t}.
+\]
+Using $T_t=T_{t-1}+u_tc_t^\top$ and
+$Z_{t-1}=P_{t-1}T_{t-1}$,
+\begin{align*}
+  Z_t
+  &=P_t(T_{t-1}+u_tc_t^\top)\\
+  &=Z_{t-1}
+    -\frac{\alpha q_tu_t^\top Z_{t-1}}{\delta_t}
+    +\frac{q_tc_t^\top}{\delta_t},
+\end{align*}
+which is Eq.~\eqref{eq:prefix-z}.  Finally, applying the Woodbury expression
+in Eq.~\eqref{eq:woodbury} to the length-$t$ prefix yields
+\[
+  Y_{1:t}
+  =\mu^{-1}
+    \left(C_{1:t}-\alpha U_{1:t}S_t^{-1}T_t\right).
+\]
+Taking its last row and substituting $Z_t=S_t^{-1}T_t$ proves
+Eq.~\eqref{eq:prefix-output}.
+\end{proof}
+
+Per head, the recurrence stores $r^2+rd_h$ values, independent of prefix
+length, and costs $O(r^2+rd_h)$ per token beyond the projections.  In this
+operational sense it resembles a state-space sequence model: each token
+updates a fixed-size state and produces an output without retaining the
+prefix.  It is not a linear state-space recurrence.  The transitions in
+Eqs.~\eqref{eq:prefix-p}--\eqref{eq:prefix-z} are input-dependent rational
+maps, similar in that respect to selective state-space models
+\citep{gu2023mamba}.
+
+Equation~\eqref{eq:prefix-output} gives the last-row solution for the prefix
+available at step $t$.  It does not recover the $t$-th row of a longer
+bidirectional solve, since appending a token also changes earlier solved
+states.  The recurrence therefore implements a causal \emph{prefix LSSO};
+the parallel Woodbury form computes the bidirectional LSSO studied in this
+paper.  The algebra therefore suggests two possible implementations of the
+same low-rank construction: parallel full-context encoding and fixed-state
+recurrent processing.
+
 \section{Experiments}
 \label{sec:experiments}
 
 \subsection{Setup}
 
-All main retrieval and vision comparisons use randomly initialized encoders.
+All main retrieval and vision comparisons train randomly initialized encoders.
 The retrieval backbone follows a BERT-style bidirectional encoder
 layout~\citep{devlin2019bert}.  We reuse standard tokenization but train every
 encoder weight from scratch.  Models are optimized with
@@ -377,12 +482,12 @@ cross-entropy at temperature 0.05, using batch size 64, AdamW with learning
 rate $3\times10^{-4}$ and weight decay 0.01, 5\% linear warmup followed by
 cosine decay, and gradient clipping at 1.0.  Each target-dataset run uses at
 most 50,000 training pairs for 20 epochs; the checkpoint with the highest
-validation R@10 is evaluated.  All models see the same sampled pairs and use
-the same tokenizer, pooling rule, and three random seeds.
+validation R@10 is evaluated.  All models use the same sampled pairs,
+tokenizer, pooling rule, and three random seeds.
 
 \subsection{Retrieval Main Results}
 
-Table~\ref{tab:retrieval} reports 3-seed retrieval results on
+Table~\ref{tab:retrieval} reports three-seed retrieval results on
 FIQA~\citep{maia2018fiqa}, NFCorpus~\citep{boteva2016nfcorpus}, and
 SciFact~\citep{wadden2020scifact}, using their BEIR retrieval
 formulations~\citep{thakur2021beir}.  The baseline is a BERT-style MHA
@@ -438,14 +543,14 @@ covering finance, biomedicine, scientific fact checking, argument retrieval,
 and COVID literature.  Unlike the preceding experiments, this setting does
 not allow the encoder to adapt to each evaluation collection.
 
-All four models use the same randomly initialized BERT-style architecture,
-MS MARCO training data, tokenizer, pooling, optimizer, three seeds, and
-document length 512; only the token mixer changes.  For each seed, we first
-average a metric across the five target datasets and then report the mean and
-standard deviation of those macro averages.  Since total parameter counts are
-similar (13.53--14.33M), Table~\ref{tab:transfer} emphasizes mixer MACs.  The
-released artifacts contain the corresponding per-dataset and per-seed values.
-Specifically, each model is trained for two epochs on 500,000 MS MARCO pairs
+All four models use the same BERT-style architecture, initialization protocol,
+MS MARCO training data, tokenizer, pooling rule, optimizer, three seeds, and
+document length 512; only the token mixer changes.  For each seed, we average
+each metric across the five target datasets, then report the mean and standard
+deviation of these macro averages.  Since total parameter counts are similar
+(13.53--14.33M), Table~\ref{tab:transfer} emphasizes mixer MACs.  The released
+artifacts contain the corresponding per-dataset and per-seed values.  Each
+model is trained for two epochs on 500,000 MS MARCO pairs
 with batch size 192, bf16 autocast, learning rate $3\times10^{-4}$, 5\%
 warmup, and the same temperature and clipping settings as the target-dataset
 runs.  Corpus embeddings are computed once per checkpoint and searched by
@@ -565,7 +670,7 @@ CIFAR-100.
 
 The low effective ranks in Figure~\ref{fig:diagnostics} suggest that a trained
 rank-32 model may not need every coordinate at inference.  For each input and
-head, we rank coordinates by their mean squared activation in $U$ and retain
+head, we rank coordinates by mean squared activation in $U$ and retain
 the top $k$ before the Woodbury solve.  Table~\ref{tab:rank-pruning} evaluates
 this procedure directly on the three-seed LSSO-r32 retrieval checkpoints,
 without finetuning after pruning.
@@ -575,7 +680,7 @@ without finetuning after pruning.
 \centering
 \captionof{table}{Inference-time pruning of trained LSSO-r32 models.  ``Save''
 is the theoretical mixer-MAC reduction of a compact rank-$k$ implementation
-relative to rank 32; the current dynamic evaluator is used only to measure
+relative to rank 32; the dynamic evaluator is used only to measure
 quality.}
 \label{tab:rank-pruning}
 \scriptsize
@@ -644,8 +749,8 @@ size 256, and 120 epochs, with Mixup 0.8, CutMix 1.0, RandAugment, and label
 smoothing 0.1.  Both use AdamW, cosine decay, and identical settings across
 mixers within a dataset.
 
-On CIFAR-100, the LSSO models
-trade accuracy for cost and do not match Nystr\"omformer.  On ImageNet-100,
+On CIFAR-100, the LSSO models trade accuracy for cost and do not match
+Nystr\"omformer.  On ImageNet-100,
 MHA is about 1.7 points stronger in the single-seed run, whereas LSSO cuts
 mixer MACs by roughly three to four times.  Vision therefore gives a more
 mixed picture than retrieval: the operator remains competitive, but its
@@ -655,7 +760,7 @@ efficiency gain is not free.
 \begin{minipage}{\columnwidth}
 \centering
 \captionof{table}{Vision encoder results.  MACs cover all mixer layers in the
-encoder.  CIFAR-100 is 3 seeds; ImageNet-100 is one seed.}
+encoder.  CIFAR-100 results use three seeds; ImageNet-100 uses one.}
 \label{tab:cv}
 \resizebox{\columnwidth}{!}{%
 \begin{tabular}{llrrr}
@@ -676,9 +781,9 @@ ImageNet-100 & LSSO-r32 & 1.391 & 80.58 & 94.76 \\
 \end{minipage}
 \end{center}
 
-We also tested a pure-LSSO latent diffusion backbone on ImageNet-100.  The
-available experiment measures only noise-prediction validation MSE, not FID,
-KID, or sample quality.  LSSO reaches a similar optimization regime at lower
+We also tested a pure-LSSO latent diffusion backbone on ImageNet-100.  This
+experiment reports noise-prediction validation MSE rather than FID, KID, or
+sample quality.  LSSO reaches a similar optimization regime at lower
 theoretical mixer cost, but this evidence is not sufficient to claim that it
 can replace attention in a generative model.
 
@@ -696,11 +801,16 @@ Table~\ref{tab:retrieval}, the zero-shot transfer results in
 Table~\ref{tab:transfer}, and the nonzero correction ratios in
 Figure~\ref{fig:diagnostics}.
 
-The same construction is less natural for causal decoding.  Applying a causal
-mask breaks the simple low-rank Woodbury form, and an autoregressive extension
-would require prefix-restricted solves or a different cached state.  The
-diffusion experiment points to a second boundary: global semantic mixing alone
-may not recover the fine-grained routing that generation demands.
+\paragraph{Recurrent extension.}
+The prefix recurrence in Section~\ref{sec:recurrence} suggests a possible
+extension of LSSO beyond its present bidirectional setting.  Its state size is
+independent of sequence length, and its transition follows from the same
+positive-shifted solve used by the parallel operator.  It may therefore serve
+as a starting point for streaming encoders, causal sequence models, and scan-
+or chunk-based implementations.  A practical recurrent operator would,
+however, require dedicated kernels, numerically stable low-precision rank-one
+updates, and a separate experimental study.  We leave this implementation and
+evaluation to future work.
 
 \section{Limitations}
 \label{sec:limitations}
@@ -724,7 +834,9 @@ particularly effective for retrieval: LSSO preserves MHA-level transfer while
 substantially reducing mixer computation (Tables~\ref{tab:retrieval}
 and~\ref{tab:transfer}).  Vision and diffusion results are less decisive,
 which helps delimit the present claim: LSSO is a promising efficient mixer for
-bidirectional encoders, rather than a general replacement for attention.
+bidirectional encoders, rather than a general replacement for attention.  The
+exact prefix recurrence suggests a possible direction for future streaming and
+causal models.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
