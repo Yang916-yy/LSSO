@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsso-operator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Learnable Sylvester Solve Operator token mixer for encoder models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,9 @@ Paper = "https://github.com/Yang916-yy/LSSO/blob/main/paper/LSSO_Learnable_Low-R
 Issues = "https://github.com/Yang916-yy/LSSO/issues"
 
 [project.optional-dependencies]
+triton = [
+    "triton",
+]
 hf = [
     "transformers",
     "datasets",

@@ -1,0 +1,6 @@
+dataset	model	n	best_acc_mean	best_acc_std	delta_vs_lsso_same_rank	avg_epoch_s_mean
+CIFAR-100	MHA	3	0.5540	0.0027		3.8471
+CIFAR-100	LSSO-r16	3	0.5479	0.0014		4.0331
+CIFAR-100	LSSO-r32	3	0.5538	0.0018		4.9880
+CIFAR-100	RoPE-LSSO-r16	3	0.5452	0.0031	-0.0027	5.2039
+CIFAR-100	RoPE-LSSO-r32	3	0.5634	0.0058	+0.0096	7.3170

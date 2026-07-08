@@ -23,10 +23,148 @@ class LSSOAux:
     gamma: torch.Tensor
 
 
+@dataclass
+class SolveStateCache:
+    """Compressed low-rank solve state.
+
+    The cache stores only prefix/global statistics:
+
+        S = sum U_i^T U_i
+        P = sum U_i^T C_i
+
+    For RoPE-LSSO, apply RoPE to ``U`` before updating the state.
+    """
+
+    S: torch.Tensor
+    P: torch.Tensor
+    length: int = 0
+
+
+def _solve_dtype(*tensors: torch.Tensor) -> torch.dtype:
+    return torch.float64 if any(t.dtype == torch.float64 for t in tensors) else torch.float32
+
+
+def _bmm_accumulate(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Batched matmul for compact LSSO statistics.
+
+    The default keeps AMP inputs in their native dtype because this is the
+    fastest path on current CUDA kernels. Float64 is preserved for gradcheck and
+    high-precision reference use.
+    """
+    if dtype == torch.float64:
+        return torch.bmm(left.to(torch.float64), right.to(torch.float64))
+    if left.dtype == right.dtype:
+        return torch.bmm(left, right)
+    return torch.bmm(left.to(torch.float32), right.to(torch.float32))
+
+
 def _cholesky_spd_solve(G: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Solve a batch of SPD systems G @ x = rhs in float32."""
-    chol = torch.linalg.cholesky_ex(G, check_errors=False).L
-    return torch.cholesky_solve(rhs, chol)
+    with torch.amp.autocast(device_type=G.device.type, enabled=False):
+        chol = torch.linalg.cholesky_ex(G, check_errors=False).L
+        return torch.cholesky_solve(rhs, chol)
+
+
+def make_solve_state(
+    U: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+) -> SolveStateCache:
+    """Build an S/P solve-state cache from relation features and targets.
+
+    Args:
+        U: low-rank relation features, [B, H, N, r]. If using RoPE-LSSO,
+            pass the already-rotated U.
+        C: target states, [B, H, N, dh].
+        valid_mask: optional valid-token mask, [B, N].
+    """
+    if U.dim() != 4 or C.dim() != 4:
+        raise ValueError("U and C must have shapes [B, H, N, r] and [B, H, N, dh]")
+    if U.shape[:3] != C.shape[:3]:
+        raise ValueError(f"U and C leading dimensions must match, got {tuple(U.shape)} and {tuple(C.shape)}")
+    if valid_mask is not None:
+        mask = valid_mask[:, None, :, None].to(device=U.device, dtype=U.dtype)
+        U = U * mask
+        C = C * mask
+
+    B, H, N, r = U.shape
+    dh = C.shape[-1]
+    calc_dtype = _solve_dtype(U, C)
+    U_bh = U.flatten(0, 1)
+    C_bh = C.flatten(0, 1)
+    Ut = U_bh.transpose(1, 2)
+    S = _bmm_accumulate(Ut, U_bh, dtype=calc_dtype).view(B, H, r, r)
+    P = _bmm_accumulate(Ut, C_bh, dtype=calc_dtype).view(B, H, r, dh)
+    return SolveStateCache(S=S, P=P, length=N)
+
+
+def update_solve_state(
+    cache: SolveStateCache | None,
+    U: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+) -> SolveStateCache:
+    """Append tokens to an S/P solve-state cache."""
+    new_state = make_solve_state(U, C, valid_mask=valid_mask)
+    if cache is None:
+        return new_state
+    if cache.S.shape != new_state.S.shape:
+        raise ValueError(f"cache.S shape {tuple(cache.S.shape)} does not match new S shape {tuple(new_state.S.shape)}")
+    if cache.P.shape != new_state.P.shape:
+        raise ValueError(f"cache.P shape {tuple(cache.P.shape)} does not match new P shape {tuple(new_state.P.shape)}")
+    return SolveStateCache(S=cache.S + new_state.S, P=cache.P + new_state.P, length=cache.length + new_state.length)
+
+
+def read_solve_state(
+    U: torch.Tensor,
+    C: torch.Tensor,
+    cache: SolveStateCache,
+    mu: torch.Tensor,
+    gamma: torch.Tensor,
+) -> torch.Tensor:
+    """Read solved token states from an S/P solve-state cache.
+
+    ``cache`` should contain exactly the context that the current token(s) may
+    use. For inclusive causal decoding, update the cache with the current token
+    before calling this function.
+    """
+    B, H, N, r = U.shape
+    dh = C.shape[-1]
+    if cache.S.shape != (B, H, r, r):
+        raise ValueError(f"cache.S shape {tuple(cache.S.shape)} does not match {(B, H, r, r)}")
+    if cache.P.shape != (B, H, r, dh):
+        raise ValueError(f"cache.P shape {tuple(cache.P.shape)} does not match {(B, H, r, dh)}")
+    if mu.dim() == 1:
+        mu = mu.view(1, H, 1, 1)
+    if gamma.dim() == 1:
+        gamma = gamma.view(1, H, 1, 1)
+
+    solve_dtype = _solve_dtype(U, C, mu, gamma)
+    output_dtype = C.dtype if U.dtype == C.dtype else torch.promote_types(U.dtype, C.dtype)
+    S = cache.S.to(solve_dtype)
+    P = cache.P.to(solve_dtype)
+    mu_calc = mu.to(solve_dtype)
+    gamma_calc = gamma.to(solve_dtype)
+    inv_mu = mu_calc.reciprocal()
+    alpha = gamma_calc * inv_mu
+    gamma_over_mu2 = alpha * inv_mu
+
+    eye = torch.eye(r, device=U.device, dtype=solve_dtype).view(1, 1, r, r)
+    G = eye + alpha * S
+    K = _cholesky_spd_solve(
+        G.reshape(B * H, r, r),
+        P.reshape(B * H, r, dh),
+    ).to(output_dtype).view(B, H, r, dh)
+    correction = torch.bmm(U.flatten(0, 1).to(output_dtype), K.flatten(0, 1)).view(B, H, N, dh)
+    Y = C.to(output_dtype).mul(inv_mu.to(output_dtype)) - gamma_over_mu2.to(output_dtype) * correction
+    return Y.to(C.dtype)
 
 
 def _lsso_woodbury_forward(
@@ -66,6 +204,164 @@ def _lsso_woodbury_forward(
     UK.mul_(gamma_over_mu2)
     Y = C_calc.mul(inv_mu)
     Y.sub_(UK)
+    return Y.to(output_dtype)
+
+
+def _exclusive_prefix(x: torch.Tensor) -> torch.Tensor:
+    zeros = x.new_zeros(*x.shape[:2], 1, *x.shape[3:])
+    return torch.cat((zeros, x[:, :, :-1]), dim=2)
+
+
+def _lsso_prefix_forward(
+    U: torch.Tensor,
+    C: torch.Tensor,
+    mu: torch.Tensor,
+    gamma: torch.Tensor,
+    eye: torch.Tensor | None = None,
+    *,
+    exclusive: bool = False,
+    return_aux: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, LSSOAux]:
+    B, H, N, r = U.shape
+    dh = C.shape[-1]
+    output_dtype = C.dtype if U.dtype == C.dtype else torch.promote_types(U.dtype, C.dtype)
+    calc_dtype = torch.float64 if U.dtype == torch.float64 or C.dtype == torch.float64 else torch.float32
+
+    U_calc = U.to(calc_dtype)
+    C_calc = C.to(calc_dtype)
+    mu_calc = mu.to(calc_dtype)
+    gamma_calc = gamma.to(calc_dtype)
+    inv_mu = mu_calc.reciprocal()
+    gamma_over_mu = gamma_calc * inv_mu
+    gamma_over_mu2 = gamma_over_mu * inv_mu
+
+    S_token = U_calc.unsqueeze(-1) * U_calc.unsqueeze(-2)
+    P_token = U_calc.unsqueeze(-1) * C_calc.unsqueeze(-2)
+    S = torch.cumsum(S_token, dim=2)
+    P = torch.cumsum(P_token, dim=2)
+    if exclusive:
+        S = _exclusive_prefix(S)
+        P = _exclusive_prefix(P)
+
+    if eye is None:
+        eye = torch.eye(r, device=U.device, dtype=calc_dtype).view(1, 1, 1, r, r)
+    elif eye.dim() == 4:
+        eye = eye.unsqueeze(2)
+
+    solve_dtype = torch.float64 if calc_dtype == torch.float64 else torch.float32
+    G = eye.to(solve_dtype) + gamma_over_mu.unsqueeze(2).to(solve_dtype) * S.to(solve_dtype)
+    K = _cholesky_spd_solve(
+        G.reshape(B * H * N, r, r),
+        P.to(solve_dtype).reshape(B * H * N, r, dh),
+    ).to(calc_dtype).view(B, H, N, r, dh)
+
+    UK = torch.einsum("bhnr,bhnrd->bhnd", U_calc, K)
+    local = inv_mu * C_calc
+    correction = gamma_over_mu2 * UK
+    Y = local - correction
+
+    if return_aux:
+        return (
+            Y.to(output_dtype),
+            LSSOAux(
+                UtU=S.detach() if not torch.is_grad_enabled() else S,
+                local=local.to(output_dtype),
+                correction=correction.to(output_dtype),
+                mu=mu,
+                gamma=gamma,
+            ),
+        )
+    return Y.to(output_dtype)
+
+
+def _lsso_prefix_chunked_forward(
+    U: torch.Tensor,
+    C: torch.Tensor,
+    mu: torch.Tensor,
+    gamma: torch.Tensor,
+    eye: torch.Tensor | None = None,
+    *,
+    exclusive: bool = False,
+    chunk_size: int = 128,
+    return_aux: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, LSSOAux]:
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    B, H, N, r = U.shape
+    dh = C.shape[-1]
+    output_dtype = C.dtype if U.dtype == C.dtype else torch.promote_types(U.dtype, C.dtype)
+    calc_dtype = torch.float64 if U.dtype == torch.float64 or C.dtype == torch.float64 else torch.float32
+
+    U_calc = U.to(calc_dtype)
+    C_calc = C.to(calc_dtype)
+    mu_calc = mu.to(calc_dtype)
+    gamma_calc = gamma.to(calc_dtype)
+    inv_mu = mu_calc.reciprocal()
+    gamma_over_mu = gamma_calc * inv_mu
+    gamma_over_mu2 = gamma_over_mu * inv_mu
+
+    if eye is None:
+        eye = torch.eye(r, device=U.device, dtype=calc_dtype).view(1, 1, 1, r, r)
+    elif eye.dim() == 4:
+        eye = eye.unsqueeze(2)
+
+    solve_dtype = torch.float64 if calc_dtype == torch.float64 else torch.float32
+    S_state = torch.zeros(B, H, r, r, device=U.device, dtype=calc_dtype)
+    P_state = torch.zeros(B, H, r, dh, device=U.device, dtype=calc_dtype)
+    Y_chunks: list[torch.Tensor] = []
+    UtU_chunks: list[torch.Tensor] = []
+    local_chunks: list[torch.Tensor] = []
+    correction_chunks: list[torch.Tensor] = []
+
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        U_block = U_calc[:, :, start:end]
+        C_block = C_calc[:, :, start:end]
+
+        S_token = U_block.unsqueeze(-1) * U_block.unsqueeze(-2)
+        P_token = U_block.unsqueeze(-1) * C_block.unsqueeze(-2)
+        S_prefix = torch.cumsum(S_token, dim=2)
+        P_prefix = torch.cumsum(P_token, dim=2)
+        if exclusive:
+            S_block = S_state.unsqueeze(2) + _exclusive_prefix(S_prefix)
+            P_block = P_state.unsqueeze(2) + _exclusive_prefix(P_prefix)
+        else:
+            S_block = S_state.unsqueeze(2) + S_prefix
+            P_block = P_state.unsqueeze(2) + P_prefix
+
+        G = eye.to(solve_dtype) + gamma_over_mu.unsqueeze(2).to(solve_dtype) * S_block.to(solve_dtype)
+        block_len = end - start
+        K = _cholesky_spd_solve(
+            G.reshape(B * H * block_len, r, r),
+            P_block.to(solve_dtype).reshape(B * H * block_len, r, dh),
+        ).to(calc_dtype).view(B, H, block_len, r, dh)
+
+        UK = torch.einsum("bhnr,bhnrd->bhnd", U_block, K)
+        local = inv_mu * C_block
+        correction = gamma_over_mu2 * UK
+        Y_chunks.append(local - correction)
+
+        if return_aux:
+            UtU_chunks.append(S_block)
+            local_chunks.append(local)
+            correction_chunks.append(correction)
+
+        S_state = S_state + S_token.sum(dim=2)
+        P_state = P_state + P_token.sum(dim=2)
+
+    Y = torch.cat(Y_chunks, dim=2)
+    if return_aux:
+        return (
+            Y.to(output_dtype),
+            LSSOAux(
+                UtU=torch.cat(UtU_chunks, dim=2),
+                local=torch.cat(local_chunks, dim=2).to(output_dtype),
+                correction=torch.cat(correction_chunks, dim=2).to(output_dtype),
+                mu=mu,
+                gamma=gamma,
+            ),
+        )
     return Y.to(output_dtype)
 
 
@@ -136,6 +432,10 @@ def lsso(
     *,
     eye: torch.Tensor | None = None,
     no_global: bool = False,
+    causal: bool = False,
+    causal_exclusive: bool = False,
+    causal_chunk_size: int | None = None,
+    causal_backend: str = "torch",
     return_aux: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, LSSOAux]:
     """
@@ -148,6 +448,16 @@ def lsso(
         gamma: global strength, broadcastable to [B, H, 1, 1] or [H].
         eye: optional identity buffer shaped [1, 1, r, r].
         no_global: if true, returns only mu^-1 C.
+        causal: if true, uses prefix low-rank statistics so token i only
+            depends on tokens <= i.
+        causal_exclusive: if true with causal, shifts prefix statistics so token
+            i only uses tokens < i for the global correction.
+        causal_chunk_size: optional block size for a FlashAttention-style
+            prefix implementation that scans chunks and carries only low-rank
+            prefix states between chunks. If omitted, the causal path
+            materializes full-sequence prefix tensors.
+        causal_backend: "torch" or "triton". Triton is causal-only and
+            experimental; diagnostics fall back to the PyTorch path.
         return_aux: if true, also returns tensors used for diagnostics.
 
     Returns:
@@ -165,9 +475,48 @@ def lsso(
     gamma_over_mu = gamma * inv_mu
     gamma_over_mu2 = gamma_over_mu * inv_mu
 
+    if causal_backend not in ("torch", "triton"):
+        raise ValueError(f"causal_backend must be 'torch' or 'triton', got {causal_backend!r}")
+
+    if causal and not no_global and causal_backend == "triton" and not return_aux:
+        from .causal_triton import causal_prefix_lsso_triton
+
+        return causal_prefix_lsso_triton(
+            U,
+            C,
+            mu,
+            gamma,
+            exclusive=causal_exclusive,
+            chunk_size=causal_chunk_size or 256,
+        )
+
+    if causal and not no_global and causal_chunk_size is not None:
+        return _lsso_prefix_chunked_forward(
+            U,
+            C,
+            mu,
+            gamma,
+            eye,
+            exclusive=causal_exclusive,
+            chunk_size=causal_chunk_size,
+            return_aux=return_aux,
+        )
+
+    if causal and not no_global:
+        return _lsso_prefix_forward(
+            U,
+            C,
+            mu,
+            gamma,
+            eye,
+            exclusive=causal_exclusive,
+            return_aux=return_aux,
+        )
+
     if (
         torch.is_grad_enabled()
         and not no_global
+        and not causal
         and not return_aux
         and (U.requires_grad or C.requires_grad or mu.requires_grad or gamma.requires_grad)
     ):
@@ -183,20 +532,25 @@ def lsso(
         if return_aux:
             local = Y
             correction = torch.zeros_like(Y)
-            UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
+            if causal:
+                UtU = torch.cumsum(U.unsqueeze(-1) * U.unsqueeze(-2), dim=2)
+                if causal_exclusive:
+                    UtU = _exclusive_prefix(UtU)
+            else:
+                UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
         else:
             UtU = None
     else:
-        UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
-        UtC = torch.bmm(Ut_bh, C_bh).view(B, H, r, dh)
+        solve_dtype = _solve_dtype(U, C, mu, gamma)
+        UtU = _bmm_accumulate(Ut_bh, U_bh, dtype=solve_dtype).view(B, H, r, r)
+        UtC = _bmm_accumulate(Ut_bh, C_bh, dtype=solve_dtype).view(B, H, r, dh)
 
         if eye is None:
-            eye = torch.eye(r, device=U.device, dtype=U.dtype).view(1, 1, r, r)
-        solve_dtype = torch.float64 if U.dtype == torch.float64 or C.dtype == torch.float64 else torch.float32
-        G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
+            eye = torch.eye(r, device=U.device, dtype=solve_dtype).view(1, 1, r, r)
+        G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU
         K = _cholesky_spd_solve(
             G.view(B * H, r, r),
-            UtC.to(G.dtype).view(B * H, r, dh),
+            UtC.to(solve_dtype).view(B * H, r, dh),
         ).to(U.dtype)
 
         UK = torch.bmm(U_bh, K).view(B, H, N, dh)
@@ -238,6 +592,10 @@ class LSSO(nn.Module):
         theta_gamma_init: float = -4.0,
         no_global: bool = False,
         normalize_u: bool = True,
+        causal: bool = False,
+        causal_exclusive: bool = False,
+        causal_chunk_size: int | None = None,
+        causal_backend: str = "torch",
     ) -> None:
         super().__init__()
 
@@ -252,6 +610,12 @@ class LSSO(nn.Module):
         self.gamma_max = gamma_max
         self.no_global = no_global
         self.normalize_u = normalize_u
+        self.causal = causal
+        self.causal_exclusive = causal_exclusive
+        self.causal_chunk_size = causal_chunk_size
+        if causal_backend not in ("torch", "triton"):
+            raise ValueError(f"causal_backend must be 'torch' or 'triton', got {causal_backend!r}")
+        self.causal_backend = causal_backend
 
         self.uc_dim = num_heads * rank + dim
         self.w_uc = nn.Linear(dim, self.uc_dim, bias=False)
@@ -317,6 +681,10 @@ class LSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
+                causal=self.causal,
+                causal_exclusive=self.causal_exclusive,
+                causal_chunk_size=self.causal_chunk_size,
+                causal_backend=self.causal_backend,
                 return_aux=True,
             )
         else:
@@ -327,6 +695,10 @@ class LSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
+                causal=self.causal,
+                causal_exclusive=self.causal_exclusive,
+                causal_chunk_size=self.causal_chunk_size,
+                causal_backend=self.causal_backend,
             )
             aux = None
 

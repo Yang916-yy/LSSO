@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from lsso import LSSO
+from lsso import LSSO, RoPELSSO
 
 from .common import EncoderBlock
 
@@ -86,6 +86,6 @@ class VisionEncoder(nn.Module):
         layers = []
         for block in self.blocks:
             mixer = getattr(block, "mixer", None)
-            if isinstance(mixer, LSSO):
+            if isinstance(mixer, (LSSO, RoPELSSO)):
                 layers.append(mixer)
         return layers

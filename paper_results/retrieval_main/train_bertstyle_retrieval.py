@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer-name", default="bert-base-uncased")
     parser.add_argument(
         "--mixer",
-        choices=["mha", "performer", "nystrom", "bimamba", "lsso", "lsso-no-global"],
+        choices=["mha", "performer", "nystrom", "bimamba", "lsso", "lsso-no-global", "rope-lsso"],
         default="lsso",
     )
     parser.add_argument("--rank", type=int, default=16)
@@ -105,7 +105,7 @@ def estimate_encoder_macs(args: argparse.Namespace, seq_len: int) -> dict[str, i
         # Official Mamba kernels mix projections, convolution, scan, and gating.
         # Keep this conservative placeholder out of paper tables until profiled.
         mixer_macs = 0
-    elif args.mixer in {"lsso", "lsso-no-global"}:
+    elif args.mixer in {"lsso", "lsso-no-global", "rope-lsso"}:
         mixer_macs = seq_len * D * (H * r + D) + seq_len * D * D
         if args.mixer != "lsso-no-global":
             mixer_macs += H * seq_len * r * r

@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980">
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .panel { fill: #ffffff; stroke: #d7dce5; stroke-width: 2; rx: 18; }
+      .box { fill: #ffffff; stroke: #2f3a4a; stroke-width: 2.2; rx: 12; }
+      .soft { fill: #edf7ff; stroke: #2978b5; }
+      .solve { fill: #f4efff; stroke: #7256b3; }
+      .state { fill: #eefaf2; stroke: #2f8f55; }
+      .warn { fill: #fff7e6; stroke: #d4861f; }
+      .text { font-family: Inter, Segoe UI, Arial, sans-serif; fill: #111827; }
+      .title { font-size: 34px; font-weight: 750; }
+      .subtitle { font-size: 18px; fill: #46566c; }
+      .label { font-size: 20px; font-weight: 700; }
+      .small { font-size: 16px; fill: #374151; }
+      .tiny { font-size: 14px; fill: #4b5563; }
+      .math { font-family: Cambria Math, STIX Two Math, Georgia, serif; font-size: 18px; }
+      .arrow { stroke: #243043; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .arrow-soft { stroke: #2978b5; stroke-width: 2.4; fill: none; marker-end: url(#arrowBlue); }
+      .arrow-green { stroke: #2f8f55; stroke-width: 2.4; fill: none; marker-end: url(#arrowGreen); }
+      .dash { stroke-dasharray: 8 7; }
+      .note { fill: #ffffff; stroke: #ccd3df; stroke-width: 1.6; rx: 10; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#243043" />
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#2978b5" />
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#2f8f55" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="980" />
+
+  <text class="text title" x="60" y="60">LSSO as a Transformer Encoder Token Mixer</text>
+  <text class="text subtitle" x="60" y="92">Drop-in replacement for bidirectional self-attention: same residual/FFN scaffold, global low-rank solve inside the mixer.</text>
+
+  <rect class="panel" x="50" y="130" width="520" height="790" />
+  <text class="text label" x="86" y="178">Encoder block scaffold</text>
+  <text class="text small" x="86" y="205">Current examples keep LayerNorm, residuals, FFN, head and positions unchanged.</text>
+
+  <rect class="box state" x="150" y="250" width="320" height="58" />
+  <text class="text label" x="230" y="286">Input tokens X</text>
+
+  <path class="arrow" d="M310 308 L310 340" />
+  <rect class="box" x="150" y="340" width="320" height="58" />
+  <text class="text label" x="260" y="376">LayerNorm</text>
+
+  <path class="arrow" d="M310 398 L310 430" />
+  <rect class="box solve" x="150" y="430" width="320" height="82" />
+  <text class="text label" x="249" y="463">LSSO mixer</text>
+  <text class="text tiny" x="215" y="492">replaces MHA / attention</text>
+
+  <path class="arrow" d="M310 512 L310 555" />
+  <rect class="box warn" x="150" y="555" width="320" height="58" />
+  <text class="text label" x="239" y="591">Add residual</text>
+  <path class="arrow" d="M150 279 C80 279,80 584,150 584" />
+
+  <path class="arrow" d="M310 613 L310 645" />
+  <rect class="box" x="150" y="645" width="320" height="58" />
+  <text class="text label" x="260" y="681">LayerNorm</text>
+
+  <path class="arrow" d="M310 703 L310 735" />
+  <rect class="box soft" x="150" y="735" width="320" height="58" />
+  <text class="text label" x="278" y="771">FFN</text>
+
+  <path class="arrow" d="M310 793 L310 835" />
+  <rect class="box warn" x="150" y="835" width="320" height="58" />
+  <text class="text label" x="239" y="871">Add residual</text>
+  <path class="arrow" d="M150 584 C95 584,95 864,150 864" />
+
+  <rect class="note" x="88" y="220" width="425" height="36" />
+  <text class="text tiny" x="105" y="243">Pre-LN block: X = X + Mixer(LN(X)); X = X + FFN(LN(X))</text>
+
+  <rect class="panel" x="610" y="130" width="930" height="790" />
+  <text class="text label" x="650" y="178">Inside the LSSO mixer</text>
+  <text class="text small" x="650" y="205">Implementation path in lsso/modules.py: fused U/C projection, RMS-normalized relation features, rank-r Cholesky solve.</text>
+
+  <rect class="box state" x="675" y="250" width="250" height="58" />
+  <text class="text label" x="732" y="286">LN(X)</text>
+
+  <path class="arrow-soft" d="M925 279 L980 279" />
+  <rect class="box soft" x="980" y="235" width="270" height="88" />
+  <text class="text label" x="1060" y="268">W_uc</text>
+  <text class="text tiny" x="1010" y="296">one linear projection, then split</text>
+
+  <path class="arrow-soft" d="M1115 323 L995 390" />
+  <path class="arrow-soft" d="M1115 323 L1235 390" />
+
+  <rect class="box soft" x="785" y="390" width="265" height="86" />
+  <text class="text label" x="884" y="422">U</text>
+  <text class="text tiny" x="829" y="450">[B, H, N, r], RMS norm</text>
+
+  <rect class="box soft" x="1180" y="390" width="265" height="86" />
+  <text class="text label" x="1279" y="422">C</text>
+  <text class="text tiny" x="1226" y="450">[B, H, N, dh]</text>
+
+  <rect class="box warn" x="660" y="525" width="225" height="86" />
+  <text class="text label" x="703" y="558">Learned scales</text>
+  <text class="text tiny" x="700" y="584">mu = softplus(theta_mu)</text>
+  <text class="text tiny" x="700" y="604">gamma = gamma_max sigmoid(theta)</text>
+
+  <path class="arrow-soft" d="M918 476 L918 525" />
+  <rect class="box solve" x="930" y="525" width="285" height="86" />
+  <text class="text label" x="994" y="558">Small system</text>
+  <text class="text math" x="963" y="586">G = I + (gamma/mu) U<tspan baseline-shift="super" font-size="12">T</tspan>U</text>
+
+  <path class="arrow-soft" d="M1312 476 L1312 525" />
+  <rect class="box solve" x="1260" y="525" width="230" height="86" />
+  <text class="text label" x="1310" y="558">Right side</text>
+  <text class="text math" x="1322" y="586">U<tspan baseline-shift="super" font-size="12">T</tspan>C</text>
+
+  <path class="arrow" d="M885 568 L930 568" />
+  <path class="arrow" d="M1215 568 L1260 568" />
+
+  <path class="arrow" d="M1072 611 L1072 660" />
+  <path class="arrow" d="M1375 611 L1375 660" />
+  <rect class="box solve" x="1010" y="660" width="430" height="88" />
+  <text class="text label" x="1139" y="693">Cholesky solve</text>
+  <text class="text math" x="1062" y="722">K = solve(G, U<tspan baseline-shift="super" font-size="12">T</tspan>C), only r x r per head</text>
+
+  <path class="arrow-green" d="M918 476 C918 610,970 670,1010 704" />
+  <path class="arrow-green" d="M1225 748 L1225 800" />
+  <rect class="box state" x="895" y="800" width="390" height="82" />
+  <text class="text label" x="983" y="833">Solved token states</text>
+  <text class="text math" x="930" y="861">Y = mu<tspan baseline-shift="super" font-size="12">-1</tspan>C - (gamma/mu<tspan baseline-shift="super" font-size="12">2</tspan>) U K</text>
+
+  <path class="arrow-green" d="M1312 476 C1312 650,1265 735,1235 800" />
+  <text class="text tiny" x="1282" y="735">local term</text>
+
+  <path class="arrow-green" d="M1285 841 L1315 841" />
+  <rect class="box state" x="1315" y="812" width="105" height="58" />
+  <text class="text label" x="1340" y="847">W_o</text>
+  <path class="arrow-green" d="M1420 841 L1450 841" />
+  <rect class="box state" x="1450" y="812" width="70" height="58" />
+  <text class="text small" x="1461" y="847">out</text>
+
+  <rect class="note" x="650" y="640" width="300" height="82" />
+  <text class="text small" x="675" y="670">Why it differs from attention</text>
+  <text class="text tiny" x="675" y="696">Attention: build N x N routing weights</text>
+  <text class="text tiny" x="675" y="716">LSSO: solve a global rank-r system</text>
+
+  <rect class="note" x="650" y="790" width="225" height="92" />
+  <text class="text small" x="675" y="820">Default paper scale</text>
+  <text class="text tiny" x="675" y="846">rank r = 16 or 32</text>
+  <text class="text tiny" x="675" y="866">gamma_max = 0.3, theta = -4</text>
+
+  <rect class="panel" x="610" y="940" width="930" height="0" opacity="0" />
+
+  <line x1="600" y1="130" x2="600" y2="920" stroke="#d7dce5" stroke-width="2" />
+
+  <rect class="note" x="62" y="930" width="1478" height="38" />
+  <text class="text tiny" x="82" y="954">Slide note: in LSSO, token-token interaction is implicit through U U^T and the positive-shifted solve, not explicit softmax routing over all token pairs.</text>
+</svg>

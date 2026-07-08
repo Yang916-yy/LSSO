@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .baselines import OfficialNystromAttention, PerformerAttention
-from lsso import LSSO
+from .baselines import LinearAttention, OfficialNystromAttention, PerformerAttention
+from lsso import LSSO, RoPELSSO
 
 from .common import MLP
 
@@ -37,17 +37,26 @@ class BertStyleBlock(nn.Module):
             self.mixer = PerformerAttention(
                 dim=dim,
                 num_heads=num_heads,
+                nb_features=rank,
+            )
+            self._mixer_type = "dense"
+        elif mixer == "linear":
+            self.mixer = LinearAttention(
+                dim=dim,
+                num_heads=num_heads,
             )
             self._mixer_type = "dense"
         elif mixer == "nystrom":
             self.mixer = OfficialNystromAttention(
                 dim=dim,
                 num_heads=num_heads,
+                num_landmarks=rank,
                 dropout=dropout,
             )
             self._mixer_type = "dense"
-        elif mixer in {"lsso", "lsso-no-global"}:
-            self.mixer = LSSO(
+        elif mixer in {"lsso", "lsso-no-global", "rope-lsso"}:
+            mixer_cls = RoPELSSO if mixer == "rope-lsso" else LSSO
+            self.mixer = mixer_cls(
                 dim=dim,
                 num_heads=num_heads,
                 rank=rank,
@@ -181,6 +190,6 @@ class BertStyleEncoder(nn.Module):
         layers = []
         for block in self.blocks:
             mixer = getattr(block, "mixer", None)
-            if isinstance(mixer, LSSO):
+            if isinstance(mixer, (LSSO, RoPELSSO)):
                 layers.append(mixer)
         return layers

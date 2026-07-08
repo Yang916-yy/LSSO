@@ -42,6 +42,7 @@ requirements-hf.txt
 *.jsonl
 *.log
 *.pid
+*.windows_pid
 *.done
 
 # OS/editor
@@ -52,5 +53,8 @@ Thumbs.db
 
 # Local scratch files
 =*
+.tmp/
+third_party/
+paper/$out/
 # LaTeX build outputs
 paper/build/

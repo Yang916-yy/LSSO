@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from lsso import LSSO
-from .baselines import OfficialNystromAttention, PerformerAttention
+from lsso import LSSO, RoPELSSO
+from .baselines import LinearAttention, OfficialNystromAttention, PerformerAttention
 
 
 class MLP(nn.Module):
@@ -55,6 +55,12 @@ class EncoderBlock(nn.Module):
                 nb_features=rank,
             )
             self._uses_mha = False
+        elif mixer == "linear":
+            self.mixer = LinearAttention(
+                dim=dim,
+                num_heads=num_heads,
+            )
+            self._uses_mha = False
         elif mixer == "nystrom":
             self.mixer = OfficialNystromAttention(
                 dim=dim,
@@ -63,8 +69,9 @@ class EncoderBlock(nn.Module):
                 dropout=dropout,
             )
             self._uses_mha = False
-        elif mixer in {"lsso", "lsso-no-global"}:
-            self.mixer = LSSO(
+        elif mixer in {"lsso", "lsso-no-global", "rope-lsso"}:
+            mixer_cls = RoPELSSO if mixer == "rope-lsso" else LSSO
+            self.mixer = mixer_cls(
                 dim=dim,
                 num_heads=num_heads,
                 rank=rank,

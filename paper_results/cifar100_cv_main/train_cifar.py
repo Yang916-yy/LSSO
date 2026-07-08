@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", default="runs")
     parser.add_argument(
         "--mixer",
-        choices=["mha", "performer", "nystrom", "bimamba", "lsso", "lsso-no-global"],
+        choices=["mha", "performer", "nystrom", "bimamba", "lsso", "lsso-no-global", "rope-lsso"],
         default="lsso",
     )
     parser.add_argument("--rank", type=int, default=16)

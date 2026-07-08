@@ -48,6 +48,13 @@ python -m pip install -e . --no-build-isolation
 
 The core package only depends on PyTorch.
 
+For the experimental causal Triton forward path on Linux/WSL CUDA
+environments:
+
+```bash
+python -m pip install -e ".[triton]" --no-build-isolation
+```
+
 ## Quick Start
 
 ```python
@@ -74,7 +81,7 @@ LayerNorm, FFN, residual path, classification head, and positional encoding.
 The package intentionally exposes only the core operator:
 
 ```python
-from lsso import LSSO, lsso
+from lsso import LSSO, RoPELSSO, lsso
 ```
 
 `LSSO` is the module form. The functional API is useful when integrating LSSO
@@ -88,6 +95,53 @@ from lsso import lsso
 Y = lsso(U, C, mu, gamma)
 ```
 
+`RoPELSSO` is the v2 module. It applies rotary position phases to the low-rank
+solve basis `U` before calling the same LSSO solve:
+
+```python
+from lsso import RoPELSSO
+
+# Bidirectional Rank-RoPE LSSO
+mixer = RoPELSSO(dim=256, num_heads=8, rank=32)
+
+# Causal prefix Rank-RoPE LSSO
+mixer = RoPELSSO(dim=256, num_heads=8, rank=32, causal=True, causal_chunk_size=256)
+```
+
+The rank must be even because RoPE rotates rank channels in pairs. Optional
+`position_ids` can be passed at forward time for offset or packed-sequence
+experiments:
+
+```python
+y = mixer(x, position_ids=position_ids)
+```
+
+For simple solve-state cache experiments, use the generic S/P cache helpers:
+
+```python
+from lsso import (
+    apply_rank_rope,
+    update_solve_state,
+    read_solve_state,
+)
+
+# For RoPE-LSSO, rotate U first. Plain LSSO can pass U directly.
+U_tilde = apply_rank_rope(U, position_ids)
+cache = update_solve_state(None, U_tilde[:, :, :1], C[:, :, :1])
+cache = update_solve_state(cache, U_tilde[:, :, 1:2], C[:, :, 1:2])
+y_t = read_solve_state(U_tilde[:, :, 1:2], C[:, :, 1:2], cache, mu, gamma)
+```
+
+The cache stores only the two low-rank statistics needed by the solve:
+
+```text
+S = sum_i U_i^T U_i
+P = sum_i U_i^T C_i
+```
+
+For RoPE-LSSO, the same cache is used after the rank basis has been rotated,
+so `S = sum_i U_tilde_i^T U_tilde_i` and `P = sum_i U_tilde_i^T C_i`.
+
 Useful module arguments:
 
 ```text
@@ -96,6 +150,10 @@ gamma_max: maximum global correction strength, default 0.3
 theta_gamma_init: gamma initialization, default -4.0
 normalize_u: RMS-normalize U for stability
 no_global: ablation path with gamma = 0
+causal: prefix low-rank causal mode for experiments
+causal_exclusive: use tokens < i instead of tokens <= i in causal correction
+causal_chunk_size: optional chunk size for FlashAttention-style prefix scans
+causal_backend: "torch" or experimental causal-only "triton"
 ```
 
 Repository model wrappers for ViT-style classifiers, BERT-style retrieval
@@ -150,6 +208,56 @@ for the factorizations.
 This is most attractive when `r << N`. In the current paper tables, MACs are
 reported as **mixer-only MACs** so the effect of replacing the token mixer is
 visible without being diluted by FFN cost.
+
+## Experimental Causal Prefix Mode
+
+The core module also exposes an experimental causal path:
+
+```python
+mixer = LSSO(dim=256, num_heads=8, rank=16, causal=True)
+
+# Memory-friendlier prototype: scan chunks and carry only S/P prefix states
+# between chunks instead of materializing full-sequence prefix tensors.
+mixer = LSSO(dim=256, num_heads=8, rank=16, causal=True, causal_chunk_size=128)
+
+# Optional Triton forward path for causal prefix experiments.
+mixer = LSSO(
+    dim=256,
+    num_heads=8,
+    rank=16,
+    causal=True,
+    causal_chunk_size=256,
+    causal_backend="triton",
+)
+```
+
+This does not apply an explicit `N x N` triangular mask. Instead, token `i`
+uses prefix low-rank statistics:
+
+```text
+S_i = sum_{j<=i} u_j^T u_j
+P_i = sum_{j<=i} u_j^T c_j
+y_i = (c_i - gamma/mu * u_i (I + gamma/mu * S_i)^-1 P_i) / mu
+```
+
+Training/prefill can therefore be written as prefix sums plus batched small
+`rank x rank` solves. Autoregressive decoding can cache `S_t` and `P_t`.
+
+The optional `causal_chunk_size` path is a PyTorch prototype of a
+FlashAttention-style implementation: each chunk forms local prefix statistics,
+adds the running low-rank state from previous chunks, solves the small systems,
+and writes the output chunk. It reduces the explicit prefix-tensor footprint.
+
+The optional `causal_backend="triton"` path is causal-only and experimental.
+Its forward kernel maintains the inverse prefix state with the
+Sherman-Morrison update, avoiding a fresh small solve at every token. In
+forward-only tests this substantially reduces the prefix-state memory footprint
+and can be faster than the materialized PyTorch prefix path for long sequences.
+Training still uses a PyTorch recomputation fallback in backward, so the Triton
+path should be treated as a forward/prefill kernel prototype rather than a
+complete fused training kernel. The causal path is intended for kernel and
+causal-model experiments; the paper's main claims still target bidirectional
+encoders.
 
 ## Paper Experiment Results
 

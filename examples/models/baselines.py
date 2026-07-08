@@ -4,6 +4,109 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LinearAttention(nn.Module):
+    """Plain positive-feature linear attention using phi(x)=elu(x)+1."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.eps = eps
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, N, D = x.shape
+        qkv = self.qkv(x).view(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
+        q = F.elu(q) + 1.0
+        k = F.elu(k) + 1.0
+
+        if valid_mask is not None:
+            mask = valid_mask[:, None, :, None].to(dtype=x.dtype)
+            k = k * mask
+            v = v * mask
+
+        k_sum = k.sum(dim=-2)
+        denom = torch.einsum("bhnd,bhd->bhn", q.float(), k_sum.float()).clamp_min(self.eps)
+        kv = torch.einsum("bhnd,bhne->bhde", k.float(), v.float())
+        y = torch.einsum("bhnd,bhde,bhn->bhne", q.float(), kv, denom.reciprocal())
+        y = y.to(dtype=x.dtype).transpose(1, 2).contiguous().view(B, N, D)
+        y = self.out_proj(y)
+        if valid_mask is not None:
+            y = y * valid_mask[:, :, None].to(dtype=y.dtype)
+        return y
+
+
+class LinformerAttention(nn.Module):
+    """Linformer-style low-rank attention over the sequence dimension."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        low_rank_features: int = 16,
+        max_len: int = 2001,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.low_rank_features = low_rank_features
+        self.max_len = max_len
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.low_rank_kernel = nn.Parameter(torch.empty(max_len, low_rank_features))
+        self.dropout = nn.Dropout(dropout)
+        nn.init.xavier_uniform_(self.low_rank_kernel)
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, N, D = x.shape
+        if N > self.max_len:
+            raise ValueError(f"input length {N} exceeds Linformer max_len={self.max_len}")
+
+        qkv = self.qkv(x).view(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
+        if valid_mask is not None:
+            mask = valid_mask[:, None, :, None].to(dtype=x.dtype)
+            k = k * mask
+            v = v * mask
+
+        proj = self.low_rank_kernel[:N].to(dtype=x.dtype)
+        k = torch.einsum("nm,bhnd->bhmd", proj, k)
+        v = torch.einsum("nm,bhnd->bhmd", proj, v)
+
+        attn = torch.matmul(q.float() * (self.head_dim ** -0.5), k.float().transpose(-2, -1))
+        attn = attn.softmax(dim=-1).to(dtype=x.dtype)
+        attn = self.dropout(attn)
+        y = torch.matmul(attn, v)
+        y = y.transpose(1, 2).contiguous().view(B, N, D)
+        y = self.out_proj(y)
+        if valid_mask is not None:
+            y = y * valid_mask[:, :, None].to(dtype=y.dtype)
+        return y
 
 
 def _softmax_kernel(

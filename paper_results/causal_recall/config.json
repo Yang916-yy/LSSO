@@ -1,0 +1,36 @@
+{
+  "amp": true,
+  "batch_size": 64,
+  "depth": 3,
+  "device": "cuda",
+  "dim": 128,
+  "eval_batch_size": 128,
+  "heads": 4,
+  "log_every": 300,
+  "lr": 0.0008,
+  "mlp_ratio": 2.0,
+  "models": [
+    "mha",
+    "linear",
+    "performer-r32",
+    "rope-lsso-r16",
+    "rope-lsso-r32"
+  ],
+  "mqar_pair_divisor": 16,
+  "num_keys": 128,
+  "num_queries": 4,
+  "num_values": 16,
+  "online_train": true,
+  "out": "paper_results/causal_recall/candidate_n512_3000.tsv",
+  "position_mode": "learned",
+  "ruler_assignment_divisor": 12,
+  "seed": 1,
+  "seq_lens": [
+    512
+  ],
+  "steps": 3000,
+  "tasks": "mqar-candidate,ruler-vt-candidate",
+  "train_samples": 8192,
+  "val_samples": 4096,
+  "weight_decay": 0.01
+}
