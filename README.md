@@ -1,7 +1,9 @@
 # LSSO
 
-LSSO is the **Learnable Sylvester Solve Operator**, a PyTorch token mixer for
-bidirectional encoder-style models.
+LSSO is the **Learnable Sylvester Solve Operator**, a PyTorch token mixer built
+around learned low-rank linear solves.  The main implementation targets
+bidirectional encoder-style models, and the package also exposes an
+experimental causal prefix form for streaming and autoregressive studies.
 
 Instead of routing values with pairwise attention, LSSO learns low-rank global
 relation features and solves a positive-shifted linear system:
@@ -11,15 +13,19 @@ LSSO(X) = Y W_o
 (mu I + gamma U(X) U(X)^T) Y = C(X)
 ```
 
-The implementation uses the Woodbury form, so the solve is over a small
-`rank x rank` system instead of an `N x N` inverse. This makes LSSO a drop-in
-candidate for non-causal encoder token mixing, especially when sequence length
-or token count makes dense attention expensive.
+The bidirectional implementation uses the Woodbury form, so the solve is over a
+small `rank x rank` system instead of an `N x N` inverse. This makes LSSO a
+drop-in candidate for non-causal encoder token mixing, especially when sequence
+length or token count makes dense attention expensive.  The causal path rewrites
+triangular masking as prefix low-rank statistics rather than forming an
+explicit causal attention matrix.
 
 ## Highlights
 
 - **Encoder-oriented token mixer:** designed to replace bidirectional
   self-attention in Transformer-style encoder blocks.
+- **Causal prefix form:** token `i` can be defined by its own prefix solve,
+  using only statistics from tokens `1..i`.
 - **Global solve, not value routing:** constructs a learned low-rank global
   relation field `U U^T`, then solves for token states consistent with that
   field.
@@ -27,9 +33,9 @@ or token count makes dense attention expensive.
   keep the solve well behaved.
 - **Low-rank Woodbury solve:** the expensive part scales with rank `r`, not
   the full token-token matrix.
-- **Small core API:** the installed package exposes only `LSSO` and the
-  functional `lsso` operator. Model wrappers and experiments live in
-  `examples/` and `paper_results/`.
+- **Small core API:** the installed package exposes the core LSSO operators,
+  solve-state cache helpers, and RoPE-LSSO. Model wrappers and experiments live
+  in `examples/` and `paper_results/`.
 
 ## Install
 
@@ -232,12 +238,19 @@ mixer = LSSO(
 ```
 
 This does not apply an explicit `N x N` triangular mask. Instead, token `i`
-uses prefix low-rank statistics:
+is defined by the prefix solve
 
 ```text
+y_i = [(mu I + gamma U_{<=i} U_{<=i}^T)^(-1) C_{<=i}]_i
+```
+
+Woodbury turns this into prefix low-rank statistics:
+
+```text
+alpha = gamma / mu
 S_i = sum_{j<=i} u_j^T u_j
 P_i = sum_{j<=i} u_j^T c_j
-y_i = (c_i - gamma/mu * u_i (I + gamma/mu * S_i)^-1 P_i) / mu
+y_i = (c_i - alpha * u_i (I + alpha S_i)^(-1) P_i) / mu
 ```
 
 Training/prefill can therefore be written as prefix sums plus batched small
@@ -255,16 +268,15 @@ forward-only tests this substantially reduces the prefix-state memory footprint
 and can be faster than the materialized PyTorch prefix path for long sequences.
 Training still uses a PyTorch recomputation fallback in backward, so the Triton
 path should be treated as a forward/prefill kernel prototype rather than a
-complete fused training kernel. The causal path is intended for kernel and
-causal-model experiments; the paper's main claims still target bidirectional
-encoders.
+complete fused training kernel. The causal form is exact for prefix-LSSO, but
+the paper's main empirical claims still target bidirectional encoders.
 
 ## Paper Experiment Results
 
 Completed experiments are organized under [`paper_results/`](paper_results/).
 The versioned theory-and-experiments preprint is available under
 [`paper/`](paper/), with the compiled PDF at
-[`paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf`](paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf).
+[`paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.2.pdf`](paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.2.pdf).
 The repository tracks lightweight artifacts only: summary tables, manifests,
 source notebooks/scripts, and JSONL logs. Model checkpoints are not tracked in
 git; they are available from one GitHub Release:

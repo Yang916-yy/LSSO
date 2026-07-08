@@ -66,7 +66,9 @@ Across retrieval, MS MARCO-to-BEIR transfer, and vision classification, LSSO
 matches or approaches attention-based encoders while using substantially fewer
 mixer MACs.  Ablations, rank pruning, and sequence-scaling experiments further
 show when the global correction is useful and where the current formulation
-falls short.
+falls short.  We also derive an exact causal prefix form: causal masking can be
+rewritten as prefix low-rank statistics and batched small solves, with a
+fixed-size solve-state cache for decoding.
 \end{abstract}
 
 \section{Introduction}
@@ -110,6 +112,9 @@ The main contributions are:
   low-rank solve whose implementation only solves an $r\times r$ system.
   \item We characterize the fixed-$U$ operator through its spectrum,
   conditioning, norm bound, and equivalent convex energy.
+  \item We derive a causal prefix-LSSO form that avoids an explicit triangular
+  attention matrix by using prefix low-rank statistics and fixed-size
+  solve-state caches.
   \item We evaluate the mixer on retrieval, zero-shot transfer, vision, rank
   pruning, diagnostics, and long-sequence scaling, including settings where
   LSSO does not outperform attention.
@@ -355,21 +360,77 @@ If $\gamma=0$, then
 No token mixing occurs except for pointwise projections.
 \end{proposition}
 
-\section{Exact Recurrent Prefix Form}
+\section{Causal Prefix-LSSO}
 \label{sec:recurrence}
 
 The LSSO layer studied above is bidirectional: all outputs come from one
-full-sequence solve.  Restricting the same system to successive prefixes,
-however, yields an exact finite-state recurrence.  We derive this form as a
-possible basis for a causal implementation of LSSO.
+full-sequence solve.  A causal variant should not be obtained by inserting an
+$N\times N$ triangular mask into Eq.~\eqref{eq:lsso-system}; that would obscure
+the low-rank structure.  Instead, define each output by the solve on its own
+prefix.  For position $t$,
+\begin{equation}
+  y_t^\top
+  =
+  \left[
+  (\mu I_t+\gamma U_{1:t}U_{1:t}^\top)^{-1}C_{1:t}
+  \right]_{t,:}.
+  \label{eq:causal-prefix-def}
+\end{equation}
+This is an exact causal operator: $y_t$ depends only on tokens $1,\ldots,t$.
+The inclusive prefix in Eq.~\eqref{eq:causal-prefix-def} matches standard
+causal attention, where a token can read itself.  An exclusive version is
+obtained by using statistics from $1,\ldots,t-1$.
 
 For one head, write the rows of $U$ and $C$ as $u_t^\top\in\R^{1\times r}$
 and $c_t^\top\in\R^{1\times d_h}$.  Let $U_{1:t}$ and $C_{1:t}$ contain the
-first $t$ rows, and define
+first $t$ rows, and set
 \[
-  \alpha=\frac{\gamma}{\mu},\qquad
-  S_t=I_r+\alpha U_{1:t}^\top U_{1:t},\qquad
-  T_t=U_{1:t}^\top C_{1:t}.
+  \alpha=\frac{\gamma}{\mu}.
+\]
+Define the prefix low-rank statistics
+\begin{align}
+  G_t &= \sum_{j\leq t} u_j u_j^\top
+       = U_{1:t}^\top U_{1:t}\in\R^{r\times r},
+  \label{eq:prefix-g}\\
+  M_t &= \sum_{j\leq t} u_j c_j^\top
+       = U_{1:t}^\top C_{1:t}\in\R^{r\times d_h}.
+  \label{eq:prefix-m}
+\end{align}
+Applying Eq.~\eqref{eq:woodbury} to each prefix gives
+\begin{equation}
+  y_t^\top
+  =
+  \mu^{-1}
+  \left[
+    c_t^\top
+    - \alpha u_t^\top (I_r+\alpha G_t)^{-1}M_t
+  \right].
+  \label{eq:causal-prefix-woodbury}
+\end{equation}
+Thus causal training or prefill can be written as a parallel prefix scan:
+compute the per-token outer products $u_tu_t^\top$ and $u_tc_t^\top$, scan them
+over the sequence to obtain $G_t$ and $M_t$ for every position, and solve the
+batched $r\times r$ systems in Eq.~\eqref{eq:causal-prefix-woodbury}.  The only
+sequential primitive is the scan; the solves are independent across positions
+once the prefix statistics are available.
+
+For autoregressive decoding, one may simply cache $G_t$ and $M_t$:
+\begin{align}
+  G_t &= G_{t-1}+u_tu_t^\top,\\
+  M_t &= M_{t-1}+u_tc_t^\top.
+\end{align}
+The cache size per layer and head is $r^2+rd_h$, independent of the generated
+length.  The next token can then be read with
+Eq.~\eqref{eq:causal-prefix-woodbury}.  This is analogous in role to a KV cache,
+but it stores solve statistics rather than past keys and values.
+
+\subsection{Rank-One Recurrent Readout}
+
+The prefix solve also admits an equivalent recurrence that updates the inverse
+small system directly.  Let
+\[
+  S_t=I_r+\alpha G_t,\qquad
+  T_t=M_t.
 \]
 The two recurrent states are
 \[
@@ -456,9 +517,9 @@ available at step $t$.  It does not recover the $t$-th row of a longer
 bidirectional solve, since appending a token also changes earlier solved
 states.  The recurrence therefore implements a causal \emph{prefix LSSO};
 the parallel Woodbury form computes the bidirectional LSSO studied in this
-paper.  The algebra therefore suggests two possible implementations of the
-same low-rank construction: parallel full-context encoding and fixed-state
-recurrent processing.
+paper.  The algebra therefore suggests three compatible implementations of the
+same low-rank construction: parallel full-context encoding, prefix-scan causal
+training, and fixed-state recurrent decoding.
 
 \section{Experiments}
 \label{sec:experiments}
@@ -801,16 +862,16 @@ Table~\ref{tab:retrieval}, the zero-shot transfer results in
 Table~\ref{tab:transfer}, and the nonzero correction ratios in
 Figure~\ref{fig:diagnostics}.
 
-\paragraph{Recurrent extension.}
-The prefix recurrence in Section~\ref{sec:recurrence} suggests a possible
-extension of LSSO beyond its present bidirectional setting.  Its state size is
-independent of sequence length, and its transition follows from the same
-positive-shifted solve used by the parallel operator.  It may therefore serve
-as a starting point for streaming encoders, causal sequence models, and scan-
-or chunk-based implementations.  A practical recurrent operator would,
-however, require dedicated kernels, numerically stable low-precision rank-one
-updates, and a separate experimental study.  We leave this implementation and
-evaluation to future work.
+\paragraph{Causal prefix form.}
+Section~\ref{sec:recurrence} shows that the same positive-shifted low-rank
+solve has an exact causal prefix form.  During training or prefill, the masked
+dependency can be expressed as prefix statistics followed by batched small
+solves; during decoding, the same operator admits a fixed-size solve-state
+cache.  This makes causal LSSO a concrete extension rather than a triangular
+masking trick.  At the same time, the empirical evidence in this paper remains
+focused on bidirectional encoders.  Competitive causal language modeling would
+still require dedicated kernels, careful low-precision state updates, and a
+separate study of optimization and generation quality.
 
 \section{Limitations}
 \label{sec:limitations}
@@ -835,8 +896,9 @@ substantially reducing mixer computation (Tables~\ref{tab:retrieval}
 and~\ref{tab:transfer}).  Vision and diffusion results are less decisive,
 which helps delimit the present claim: LSSO is a promising efficient mixer for
 bidirectional encoders, rather than a general replacement for attention.  The
-exact prefix recurrence suggests a possible direction for future streaming and
-causal models.
+causal prefix form derived in Section~\ref{sec:recurrence} gives a concrete
+route toward future streaming and autoregressive variants, but those variants
+require their own implementation and empirical evaluation.
 
 \bibliographystyle{plainnat}
 \bibliography{references}

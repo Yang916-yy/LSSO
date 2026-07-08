@@ -5,7 +5,8 @@ experiments under `paper_results/`. It contains:
 
 - the LSSO formulation and Woodbury implementation;
 - fixed-U well-posedness, spectral, norm, conditioning, and energy results;
-- an exact recurrent prefix form derived by rank-one inverse updates;
+- an exact causal prefix-LSSO form, including prefix-scan training/prefill and
+  fixed-size solve-state decoding;
 - retrieval, transfer, ablation, diagnostics, sequence-scaling, and vision
   results;
 - explicit scope and limitations;
@@ -18,7 +19,7 @@ tectonic main.tex --outdir build
 ```
 
 The versioned paper is available as
-`LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf`;
+`LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.2.pdf`;
 local compile intermediates are written to `build/` and are not intended for
 version control.
 
