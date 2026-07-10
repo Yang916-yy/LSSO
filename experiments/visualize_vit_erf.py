@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from experiments.cv_vit_rrlsso_cifar100 import build_model, make_loaders
 from lsso.modules_v2 import apply_rank_rotary
