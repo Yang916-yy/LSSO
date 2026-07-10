@@ -11,6 +11,8 @@ See `release_assets.tsv` for asset names, sizes, SHA256 checksums, and contents.
 - `gamma_strength_sweep/`: active ViT-B/4 strength-selection evidence after
   strict length normalization; G=4/G=12 and two seeds recommend initial
   `gamma/mu=0.85-1.15`.
+- `cv_vit_b4_formal/`: active 80-epoch CIFAR-100 ViT-B/4 MHA vs RRLSSO
+  mixer-replacement run, including convergence and receptive-field figures.
 - `cifar100_cv_main/`: CIFAR-100 bidirectional encoder baseline table,
   patch=2, CLS pooling, medium augmentation, 3 seeds.
 - `imagenet100_cv_main/`: ImageNet-100 bidirectional encoder baseline table,
