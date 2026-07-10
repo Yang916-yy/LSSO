@@ -1,9 +1,10 @@
 # LSSO
 
 LSSO is the **Learnable Sylvester Solve Operator**, a PyTorch token mixer built
-around learned low-rank linear solves.  The main implementation targets
-bidirectional encoder-style models, and the package also exposes an
-experimental causal prefix form for streaming and autoregressive studies.
+around learned low-rank linear solves for **bidirectional encoder-style
+models**. The active research direction is computer vision: replacing the
+token mixer in classifier, retrieval, and segmentation encoders without
+changing the surrounding encoder block.
 
 Instead of routing values with pairwise attention, LSSO learns low-rank global
 relation features and solves a positive-shifted linear system:
@@ -13,19 +14,15 @@ LSSO(X) = Y W_o
 (mu I + gamma U(X) U(X)^T) Y = C(X)
 ```
 
-The bidirectional implementation uses the Woodbury form, so the solve is over a
-small `rank x rank` system instead of an `N x N` inverse. This makes LSSO a
-drop-in candidate for non-causal encoder token mixing, especially when sequence
-length or token count makes dense attention expensive.  The causal path rewrites
-triangular masking as prefix low-rank statistics rather than forming an
-explicit causal attention matrix.
+The implementation uses the Woodbury form, so the solve is over a small
+`rank x rank` system instead of an `N x N` inverse. This makes LSSO a drop-in
+candidate for full-context encoder token mixing, especially when image token
+count makes dense attention expensive.
 
 ## Highlights
 
 - **Encoder-oriented token mixer:** designed to replace bidirectional
   self-attention in Transformer-style encoder blocks.
-- **Causal prefix form:** token `i` can be defined by its own prefix solve,
-  using only statistics from tokens `1..i`.
 - **Global solve, not value routing:** constructs a learned low-rank global
   relation field `U U^T`, then solves for token states consistent with that
   field.
@@ -34,7 +31,7 @@ explicit causal attention matrix.
 - **Low-rank Woodbury solve:** the expensive part scales with rank `r`, not
   the full token-token matrix.
 - **Small core API:** the installed package exposes the core LSSO operators,
-  solve-state cache helpers, and RoPE-LSSO. Model wrappers and experiments live
+  solve-state cache helpers, and RRLSSO. Model wrappers and experiments live
   in `examples/` and `paper_results/`.
 
 ## Install
@@ -52,14 +49,8 @@ offline, reuse the current environment's build tools:
 python -m pip install -e . --no-build-isolation
 ```
 
-The core package only depends on PyTorch.
-
-For the experimental causal Triton forward path on Linux/WSL CUDA
-environments:
-
-```bash
-python -m pip install -e ".[triton]" --no-build-isolation
-```
+The core package only depends on PyTorch. CUDA acceleration is provided by the
+optional MathDx extension documented in [`docs/mathdx_backend.md`](docs/mathdx_backend.md).
 
 ## Quick Start
 
@@ -87,7 +78,7 @@ LayerNorm, FFN, residual path, classification head, and positional encoding.
 The package intentionally exposes only the core operator:
 
 ```python
-from lsso import LSSO, RoPELSSO, lsso
+from lsso import LSSO, RRLSSO, lsso
 ```
 
 `LSSO` is the module form. The functional API is useful when integrating LSSO
@@ -101,20 +92,19 @@ from lsso import lsso
 Y = lsso(U, C, mu, gamma)
 ```
 
-`RoPELSSO` is the v2 module. It applies rotary position phases to the low-rank
-solve basis `U` before calling the same LSSO solve:
+`RRLSSO` is the v2 module: **Rank-Rotary LSSO**. It applies a fixed rotary
+transform to the low-rank solve basis `U` before calling the same LSSO solve.
+This is not a learned or absolute position embedding; it only rotates `U`
+inside the operator.
 
 ```python
-from lsso import RoPELSSO
+from lsso import RRLSSO
 
-# Bidirectional Rank-RoPE LSSO
-mixer = RoPELSSO(dim=256, num_heads=8, rank=32)
-
-# Causal prefix Rank-RoPE LSSO
-mixer = RoPELSSO(dim=256, num_heads=8, rank=32, causal=True, causal_chunk_size=256)
+# Rank-Rotary LSSO for bidirectional encoders
+mixer = RRLSSO(dim=256, num_heads=8, rank=32)
 ```
 
-The rank must be even because RoPE rotates rank channels in pairs. Optional
+The rank must be even because the rank rotary map rotates channels in pairs. Optional
 `position_ids` can be passed at forward time for offset or packed-sequence
 experiments:
 
@@ -122,44 +112,16 @@ experiments:
 y = mixer(x, position_ids=position_ids)
 ```
 
-For simple solve-state cache experiments, use the generic S/P cache helpers:
-
-```python
-from lsso import (
-    apply_rank_rope,
-    update_solve_state,
-    read_solve_state,
-)
-
-# For RoPE-LSSO, rotate U first. Plain LSSO can pass U directly.
-U_tilde = apply_rank_rope(U, position_ids)
-cache = update_solve_state(None, U_tilde[:, :, :1], C[:, :, :1])
-cache = update_solve_state(cache, U_tilde[:, :, 1:2], C[:, :, 1:2])
-y_t = read_solve_state(U_tilde[:, :, 1:2], C[:, :, 1:2], cache, mu, gamma)
-```
-
-The cache stores only the two low-rank statistics needed by the solve:
-
-```text
-S = sum_i U_i^T U_i
-P = sum_i U_i^T C_i
-```
-
-For RoPE-LSSO, the same cache is used after the rank basis has been rotated,
-so `S = sum_i U_tilde_i^T U_tilde_i` and `P = sum_i U_tilde_i^T C_i`.
-
 Useful module arguments:
 
 ```text
 rank: low-rank solve size, usually 16 or 32
-gamma_max: maximum global correction strength, default 0.3
-theta_gamma_init: gamma initialization, default -4.0
+gamma_max: maximum global correction strength, default 1.2
+theta_gamma_init: gamma initialization, default 0.5
 normalize_u: RMS-normalize U for stability
+length_normalize: use effective-length mean statistics, default true
+length_reference: reference multiplier for mean statistics, default 1.0
 no_global: ablation path with gamma = 0
-causal: prefix low-rank causal mode for experiments
-causal_exclusive: use tokens < i instead of tokens <= i in causal correction
-causal_chunk_size: optional chunk size for FlashAttention-style prefix scans
-causal_backend: "torch" or experimental causal-only "triton"
 ```
 
 Repository model wrappers for ViT-style classifiers, BERT-style retrieval
@@ -169,15 +131,18 @@ but are not part of the installed core API.
 
 ## Recommended Solve Scale
 
-The recommended initialization is:
+For the default bidirectional, effective-length-normalized operator, the
+recommended initialization is:
 
 ```python
 LSSO(
     dim=dim,
     num_heads=heads,
     rank=rank,
-    gamma_max=0.3,
-    theta_gamma_init=-4.0,
+    gamma_max=1.2,
+    theta_gamma_init=0.5,
+    length_normalize=True,
+    length_reference=1.0,
 )
 ```
 
@@ -185,15 +150,22 @@ With `theta_mu = 0`, this gives roughly:
 
 ```text
 mu ~= softplus(0) ~= 0.693
-gamma ~= 0.3 * sigmoid(-4) ~= 0.0054
-gamma / mu ~= 0.0078
+gamma ~= 1.2 * sigmoid(0.5) ~= 0.747
+gamma / mu ~= 1.078
 ```
 
-This is intentionally not tiny. If `gamma_max` is too small or
-`theta_gamma_init` is too negative, LSSO can behave almost like the local
-`mu^-1 C(X)` projection early in training, weakening the global solve term.
-For example, `gamma_max=0.1, theta_gamma_init=-6.0` starts around
-`gamma / mu ~= 3.6e-4`, which is usually too conservative for main
+After normalizing `U` per token, bidirectional LSSO rescales it by
+`sqrt(length_reference / effective_length)`. Consequently `U^T U` and
+`U^T C` are effective-length means rather than token-count-dependent sums.
+Padding supplied through `valid_mask` does not change the scale. A CIFAR-100
+ViT-B/4 short-run sweep over G=4 Grouped-RRLSSO and G=12 RRLSSO found a robust
+`gamma / mu` initialization region of about `0.85..1.15`; the default above is
+a directly tested point near its upper half. See
+[`paper_results/gamma_strength_sweep/README.md`](paper_results/gamma_strength_sweep/README.md).
+
+The old `gamma_max=0.3, theta_gamma_init=-4.0` setting starts at
+`gamma / mu ~= 0.0078`. Under strict mean normalization this is effectively a
+near-local ablation and is too conservative for the main bidirectional CV
 experiments.
 
 ## Complexity Notes
@@ -215,67 +187,19 @@ This is most attractive when `r << N`. In the current paper tables, MACs are
 reported as **mixer-only MACs** so the effect of replacing the token mixer is
 visible without being diluted by FFN cost.
 
-## Experimental Causal Prefix Mode
+## Scope and archived causal prototype
 
-The core module also exposes an experimental causal path:
-
-```python
-mixer = LSSO(dim=256, num_heads=8, rank=16, causal=True)
-
-# Memory-friendlier prototype: scan chunks and carry only S/P prefix states
-# between chunks instead of materializing full-sequence prefix tensors.
-mixer = LSSO(dim=256, num_heads=8, rank=16, causal=True, causal_chunk_size=128)
-
-# Optional Triton forward path for causal prefix experiments.
-mixer = LSSO(
-    dim=256,
-    num_heads=8,
-    rank=16,
-    causal=True,
-    causal_chunk_size=256,
-    causal_backend="triton",
-)
-```
-
-This does not apply an explicit `N x N` triangular mask. Instead, token `i`
-is defined by the prefix solve
-
-```text
-y_i = [(mu I + gamma U_{<=i} U_{<=i}^T)^(-1) C_{<=i}]_i
-```
-
-Woodbury turns this into prefix low-rank statistics:
-
-```text
-alpha = gamma / mu
-S_i = sum_{j<=i} u_j^T u_j
-P_i = sum_{j<=i} u_j^T c_j
-y_i = (c_i - alpha * u_i (I + alpha S_i)^(-1) P_i) / mu
-```
-
-Training/prefill can therefore be written as prefix sums plus batched small
-`rank x rank` solves. Autoregressive decoding can cache `S_t` and `P_t`.
-
-The optional `causal_chunk_size` path is a PyTorch prototype of a
-FlashAttention-style implementation: each chunk forms local prefix statistics,
-adds the running low-rank state from previous chunks, solves the small systems,
-and writes the output chunk. It reduces the explicit prefix-tensor footprint.
-
-The optional `causal_backend="triton"` path is causal-only and experimental.
-Its forward kernel maintains the inverse prefix state with the
-Sherman-Morrison update, avoiding a fresh small solve at every token. In
-forward-only tests this substantially reduces the prefix-state memory footprint
-and can be faster than the materialized PyTorch prefix path for long sequences.
-Training still uses a PyTorch recomputation fallback in backward, so the Triton
-path should be treated as a forward/prefill kernel prototype rather than a
-complete fused training kernel. The causal form is exact for prefix-LSSO, but
-the paper's main empirical claims still target bidirectional encoders.
+The causal Prefix-LSSO prototype is archived and is not part of the supported
+package API, benchmark suite, or current paper claim. The research record is
+retained in [`docs/causal_prefix_lsso_notes.md`](docs/causal_prefix_lsso_notes.md)
+and the archived result directories for possible future work. Passing
+Any non-default causal argument now raises an explicit error.
 
 ## Paper Experiment Results
 
-Completed experiments are organized under [`paper_results/`](paper_results/).
-The versioned theory-and-experiments preprint is available under
-[`paper/`](paper/), with the compiled PDF at
+Completed and archived experiments are organized under
+[`paper_results/`](paper_results/). The versioned theory-and-experiments
+preprint is available under [`paper/`](paper/), with the historical PDF at
 [`paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.2.pdf`](paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.2.pdf).
 The repository tracks lightweight artifacts only: summary tables, manifests,
 source notebooks/scripts, and JSONL logs. Model checkpoints are not tracked in
@@ -288,7 +212,22 @@ https://github.com/Yang916-yy/LSSO/releases/tag/paper-results-v1
 See [`paper_results/release_assets.tsv`](paper_results/release_assets.tsv) for
 release asset names, sizes, SHA256 checksums, and contents.
 
-### Retrieval Main Table
+### Active CV program
+
+The active empirical program is bidirectional vision encoding: image
+classification first, followed by image retrieval and semantic segmentation.
+The strict length-normalization and global-strength selection protocol is
+documented in
+[`paper_results/gamma_strength_sweep/`](paper_results/gamma_strength_sweep/).
+Its current bidirectional default is `gamma_max=1.2`,
+`theta_gamma_init=0.5`, and `length_reference=1.0`.
+
+The CV tables below are useful historical baselines. They were trained before
+the strict effective-length normalization retuning, so they should not be used
+to select the new default strength. Retrieval and diffusion records are retained
+as secondary historical evidence rather than the active paper centerpiece.
+
+### Legacy Retrieval Main Table
 
 Random-initialized BERT-style retrieval encoders, 3 seeds, `dim=256`,
 `depth=8`, `heads=8`, `max_doc_len=512`, mean pooling. MACs are mixer-only
@@ -311,7 +250,7 @@ document-side MACs.
 
 Full table: [`paper_results/retrieval_main/summary.tsv`](paper_results/retrieval_main/summary.tsv).
 
-### MS MARCO -> BEIR Transfer
+### Legacy MS MARCO -> BEIR Transfer
 
 Random-initialized BERT-style retrieval encoders are pretrained on MS MARCO and
 evaluated zero-shot on BEIR-style datasets across 3 seeds. The evaluated BEIR
@@ -327,7 +266,7 @@ document-side mixer MACs at `doc_len=512`.
 
 Full table: [`paper_results/msmarco_beir_transfer/summary.tsv`](paper_results/msmarco_beir_transfer/summary.tsv).
 
-### Retrieval Ablations
+### Legacy Retrieval Ablations
 
 The main ablations use FIQA and SciFact with the same retrieval setup. The
 `no-global` variant fixes `gamma=0`, removing the global solve correction.
@@ -347,7 +286,7 @@ The main ablations use FIQA and SciFact with the same retrieval setup. The
 
 Full table: [`paper_results/retrieval_ablation/summary.tsv`](paper_results/retrieval_ablation/summary.tsv).
 
-### CV Encoder Tables
+### Active CV Encoder Tables
 
 CIFAR-100 uses a patch-2 ViT-style encoder, 3 seeds, `dim=96`, `depth=3`,
 `heads=6`, CLS pooling, RandAugment(2,9), Mixup=0.2, CutMix=0.5.
@@ -378,7 +317,7 @@ The LSSO-r32 ImageNet-100 result above is the corrected controlled run. The
 superseded run accidentally used Mixup=0 and CutMix=0 while MHA and LSSO-r16
 used Mixup=0.8 and CutMix=1.0.
 
-### Latent Diffusion Boundary Experiment
+### Legacy Latent Diffusion Boundary Experiment
 
 The one-seed ImageNet-100 latent diffusion experiment uses cached VAE latent
 means, 784 tokens, `dim=384`, `depth=8`, `heads=8`, and 50 training epochs.

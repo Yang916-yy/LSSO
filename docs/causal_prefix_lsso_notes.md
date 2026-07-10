@@ -1,4 +1,9 @@
-# Causal Prefix-LSSO Notes
+# Archived: Causal Prefix-LSSO Notes
+
+> Status: archived. The active project scope is bidirectional encoder mixing,
+> with computer vision as the primary experimental domain. This note preserves
+> an earlier causal derivation only; the current package rejects `causal=True`,
+> ships no causal Triton backend, and makes no causal benchmark claim.
 
 This note records a possible causal extension of LSSO. The point is not to
 force an `N x N` triangular mask into the non-causal operator. Instead, the

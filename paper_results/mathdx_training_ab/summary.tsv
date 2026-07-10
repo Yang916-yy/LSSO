@@ -1,0 +1,7 @@
+model	relation_groups	backend	batch_size	dtype	train_steps_per_epoch	epoch2_sec	epoch3_sec	steady_avg_sec	effective_ms_per_train_step	effective_train_images_per_sec	speedup_vs_off	time_reduction_pct	peak_mem_gb	status
+rrlsso	12	off	128	bf16	120	13.703223	13.628064	13.665643	113.880	1123.99	1.000	0.00	3.8312	ok
+rrlsso	12	on	128	bf16	120	12.373726	12.312855	12.343290	102.861	1244.40	1.107	9.68	3.8339	ok
+grouped-rrlsso	4	off	128	bf16	120	12.849395	12.787194	12.818294	106.819	1198.29	1.000	0.00	3.6601	ok
+grouped-rrlsso	4	on	128	bf16	120	11.419839	11.388454	11.404147	95.035	1346.88	1.124	11.03	3.6592	ok
+grouped-rrlsso	1	off	128	bf16	120									failed: torch solve_ex MAGMA illegal memory access
+grouped-rrlsso	1	on	128	bf16	120	11.001093	10.949518	10.975306	91.461	1399.51			3.6023	ok

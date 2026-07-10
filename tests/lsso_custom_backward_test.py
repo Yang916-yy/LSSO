@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch.autograd import gradcheck
 
-from lsso.modules import _lsso_woodbury_forward, lsso
+from lsso.modules import _lsso_woodbury_forward, length_normalize_basis, lsso
 
 
 def test_lsso_custom_backward_matches_autograd() -> None:
@@ -30,7 +30,7 @@ def test_lsso_custom_backward_matches_autograd() -> None:
         C = C0.clone().requires_grad_(True)
         mu = mu0.clone().requires_grad_(True)
         gamma = gamma0.clone().requires_grad_(True)
-        Y = _lsso_woodbury_forward(U, C, mu, gamma)
+        Y = _lsso_woodbury_forward(length_normalize_basis(U), C, mu, gamma)
         loss = (Y * probe).sum()
         loss.backward()
         return Y.detach(), (U.grad, C.grad, mu.grad, gamma.grad)
@@ -88,7 +88,7 @@ def test_lsso_custom_backward_cuda_matches_autograd() -> None:
         C = C0.clone().requires_grad_(True)
         mu = mu0.clone().requires_grad_(True)
         gamma = gamma0.clone().requires_grad_(True)
-        Y = _lsso_woodbury_forward(U, C, mu, gamma)
+        Y = _lsso_woodbury_forward(length_normalize_basis(U), C, mu, gamma)
         (Y * probe).sum().backward()
         return Y.detach(), (U.grad, C.grad, mu.grad, gamma.grad)
 

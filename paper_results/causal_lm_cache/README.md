@@ -1,4 +1,7 @@
-# Causal LM Cache Experiments
+# Archived: Causal LM Cache Experiments
+
+> These records are retained for historical reference only. Causal LSSO is not
+> a supported package path or an active experimental direction.
 
 This folder keeps the non-paper-main but useful causal LSSO cache checks from
 the local IMDB next-token experiments.

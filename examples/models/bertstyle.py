@@ -20,8 +20,8 @@ class BertStyleBlock(nn.Module):
         rank: int = 16,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         normalize_u: bool = True,
     ) -> None:
         super().__init__()
@@ -122,8 +122,8 @@ class BertStyleEncoder(nn.Module):
         rank: int = 16,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         normalize_u: bool = True,
         pad_id: int = 0,
     ) -> None:

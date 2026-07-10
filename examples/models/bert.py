@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lsso.modules import LSSODiagnostics
+from lsso.modules import LSSODiagnostics, length_normalize_basis
 
 
 class BertLSSOSelfAttention(nn.Module):
@@ -27,10 +27,12 @@ class BertLSSOSelfAttention(nn.Module):
         self,
         config,
         rank: int = 16,
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         eps: float = 1e-5,
         no_global: bool = False,
+        length_normalize: bool = True,
+        length_reference: float = 1.0,
     ) -> None:
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0:
@@ -44,6 +46,10 @@ class BertLSSOSelfAttention(nn.Module):
         self.theta_gamma_init = theta_gamma_init
         self.eps = eps
         self.no_global = no_global
+        self.length_normalize = length_normalize
+        if length_reference <= 0:
+            raise ValueError(f"length_reference must be positive, got {length_reference}")
+        self.length_reference = float(length_reference)
         self.is_decoder = getattr(config, "is_decoder", False)
 
         self.w_u = nn.Linear(config.hidden_size, config.num_attention_heads * rank, bias=False)
@@ -96,6 +102,12 @@ class BertLSSOSelfAttention(nn.Module):
             head_valid = valid_mask[:, None, :, None].to(dtype=x.dtype)
             U = U * head_valid
             C = C * head_valid
+        if self.length_normalize:
+            U = length_normalize_basis(
+                U,
+                valid_mask,
+                reference_length=self.length_reference,
+            )
 
         mu = F.softplus(self.theta_mu) + self.eps
         gamma = self.gamma_max * torch.sigmoid(self.theta_gamma)
@@ -188,16 +200,16 @@ class BertLSSOSelfAttention(nn.Module):
 @dataclass
 class BertLSSOConfig:
     rank: int = 16
-    gamma_max: float = 0.3
-    theta_gamma_init: float = -4.0
+    gamma_max: float = 1.2
+    theta_gamma_init: float = 0.5
     no_global: bool = False
 
 
 def replace_bert_self_attention_with_lsso(
     model: nn.Module,
     rank: int = 16,
-    gamma_max: float = 0.3,
-    theta_gamma_init: float = -4.0,
+    gamma_max: float = 1.2,
+    theta_gamma_init: float = 0.5,
     no_global: bool = False,
 ) -> nn.Module:
     """

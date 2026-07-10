@@ -86,8 +86,8 @@ class DiTBlock(nn.Module):
         mlp_ratio: float = 4.0,
         mixer: str = "lsso",
         rank: int = 16,
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -169,8 +169,8 @@ class LatentDiT(nn.Module):
         num_classes: int | None = None,
         learn_sigma: bool = False,
         mixer: str = "lsso",
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()

@@ -55,6 +55,7 @@ Thumbs.db
 =*
 .tmp/
 third_party/
+external/
 paper/$out/
 # LaTeX build outputs
 paper/build/

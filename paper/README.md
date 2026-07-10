@@ -5,8 +5,6 @@ experiments under `paper_results/`. It contains:
 
 - the LSSO formulation and Woodbury implementation;
 - fixed-U well-posedness, spectral, norm, conditioning, and energy results;
-- an exact causal prefix-LSSO form, including prefix-scan training/prefill and
-  fixed-size solve-state decoding;
 - retrieval, transfer, ablation, diagnostics, sequence-scaling, and vision
   results;
 - explicit scope and limitations;
@@ -25,3 +23,10 @@ version control.
 
 The current version lists Zhaoyang Wang as the author and links directly to the
 repository from the title block.
+
+## Scope note
+
+The checked-in v1.2 PDF is a historical preprint and still contains a causal
+prefix section. The active paper direction is a bidirectional encoder paper
+with CV as its primary empirical domain; causal material is archived and will
+not be carried forward as a supported method or empirical claim.

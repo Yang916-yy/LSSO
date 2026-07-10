@@ -1,3 +1,5 @@
+"""Archived causal-prefix benchmark; not runnable against the supported API."""
+
 from __future__ import annotations
 
 import argparse

@@ -32,8 +32,8 @@ class EncoderBlock(nn.Module):
         rank: int = 16,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         normalize_u: bool = True,
     ) -> None:
         super().__init__()

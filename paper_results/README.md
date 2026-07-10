@@ -8,22 +8,39 @@ See `release_assets.tsv` for asset names, sizes, SHA256 checksums, and contents.
 
 ## Experiment Groups
 
-- `retrieval_main/`: FIQA, NFCorpus, SciFact retrieval main table with MHA, official Nystromformer, LSSO-r16, and LSSO-r32.
-- `retrieval_ablation/`: FIQA and SciFact LSSO ablations: no-global, fixed scale, no U RMS norm, r8, and r4.
-- `msmarco_beir_transfer/`: MS MARCO pretraining followed by 3-seed zero-shot BEIR transfer evaluation on FIQA, NFCorpus, SciFact, ArguAna, and TREC-COVID.
-- `rank_pruning/`: inference-time rank pruning for trained LSSO-r32 retrieval checkpoints.
-- `cifar100_cv_main/`: CIFAR-100 CV main table, patch=2, CLS pooling, medium augmentation, 3 seeds.
-- `imagenet100_cv_main/`: ImageNet-100 CV main table, image size 224, patch=8, 1 seed.
-- `diffusion_imagenet100/`: one-seed ImageNet-100 latent diffusion boundary experiment with MHA, Nystromformer, LSSO-r16, and LSSO-r32.
-- `sequence_scaling/`: single-layer latency, forward+backward time, allocated peak memory, and mixer MAC scaling from 128 to 2048 tokens.
-- `operator_diagnostics/`: trained layer-wise `gamma/mu`, global correction ratio, and effective-rank visualizations.
+- `gamma_strength_sweep/`: active ViT-B/4 strength-selection evidence after
+  strict length normalization; G=4/G=12 and two seeds recommend initial
+  `gamma/mu=0.85-1.15`.
+- `cifar100_cv_main/`: CIFAR-100 bidirectional encoder baseline table,
+  patch=2, CLS pooling, medium augmentation, 3 seeds.
+- `imagenet100_cv_main/`: ImageNet-100 bidirectional encoder baseline table,
+  image size 224, patch=8, 1 seed.
+- `sequence_scaling/`: single-layer latency, forward+backward time, allocated
+  peak memory, and mixer MAC scaling from 128 to 2048 tokens.
+- `operator_diagnostics/`: trained layer-wise `gamma/mu`, global correction
+  ratio, and effective-rank visualizations.
+- `retrieval_main/`, `retrieval_ablation/`, `msmarco_beir_transfer/`, and
+  `rank_pruning/`: historical bidirectional retrieval evidence.
+- `diffusion_imagenet100/`: historical one-seed diffusion boundary experiment.
+
+## Archived causal records
+
+`causal_lm_cache/` and `causal_recall/` are preserved as historical logs only.
+They are outside the supported package API, the active CV program, and current
+empirical claims.
 
 ## Notes
 
 - Retrieval models use `max_doc_len=512`, mean pooling, dim=256, depth=8, heads=8.
 - CIFAR-100 uses image size 32, patch size 2, dim=96, depth=3, heads=6, RandAugment(2,9), Mixup=0.2, CutMix=0.5.
+- The active `gamma_strength_sweep/` uses a separate ViT-B/4 protocol:
+  image size 32, patch size 4, dim=768, depth=12, heads=12, rank=16,
+  BF16, strict `length_reference=1`, and 640-update selection runs.
 - ImageNet-100 uses image size 224, patch size 8, dim=256, depth=8, heads=8, DeiT-style augmentation, and bf16 AMP.
 - The ImageNet-100 LSSO-r32 CV entry was corrected on June 6, 2026: the earlier run accidentally disabled Mixup and CutMix while the other models used Mixup=0.8 and CutMix=1.0.
 - The diffusion experiment reports noise-prediction validation loss and mixer cost only; FID/KID and controlled samples remain future work.
-- LSSO runs use `gamma_max=0.3` and `theta_gamma_init=-4.0`.
+- Historical paper-result runs use `gamma_max=0.3` and
+  `theta_gamma_init=-4.0`. After effective-length mean normalization, new
+  bidirectional runs use `gamma_max=1.2` and `theta_gamma_init=0.5`; see the
+  dedicated strength sweep before comparing the two regimes.
 - Checkpoints are packaged together in release `paper-results-v1`.

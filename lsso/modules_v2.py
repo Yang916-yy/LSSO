@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .modules import LSSODiagnostics, lsso
+from .modules import _ARCHIVED_CAUSAL_MESSAGE, LSSODiagnostics, lsso
 
 
-def apply_rank_rope(
+def apply_rank_rotary(
     U: torch.Tensor,
     position_ids: torch.Tensor | None = None,
     *,
@@ -15,14 +15,14 @@ def apply_rank_rope(
     scale: float = 1.0,
 ) -> torch.Tensor:
     """
-    Apply RoPE in the low-rank LSSO solve basis.
+    Apply a fixed rank-space rotary transform to the LSSO solve basis.
 
     Args:
         U: relation features, [B, H, N, r].
-        position_ids: optional positions, [N] or [B, N]. If omitted, uses
-            arange(N). Positions are allowed to be non-contiguous for packed or
-            offset decoding experiments.
-        base: RoPE frequency base.
+        position_ids: optional sequence indices, [N] or [B, N]. If omitted,
+            uses arange(N). These indices only parameterize the rank-space
+            rotation applied to U; this is not an embedding table.
+        base: rotary frequency base.
         scale: multiplier applied to positions before forming angles.
 
     Returns:
@@ -32,7 +32,7 @@ def apply_rank_rope(
         raise ValueError(f"U must have shape [B, H, N, r], got {tuple(U.shape)}")
     B, _H, N, r = U.shape
     if r % 2 != 0:
-        raise ValueError(f"Rank-RoPE requires an even rank, got rank={r}")
+        raise ValueError(f"Rank rotary requires an even rank, got rank={r}")
 
     half = r // 2
     calc_dtype = torch.float64 if U.dtype == torch.float64 else torch.float32
@@ -68,22 +68,34 @@ def apply_rank_rope(
     return out
 
 
-class RoPELSSO(nn.Module):
-    """
-    LSSO v2: Rank-RoPE LSSO.
+def apply_rank_rope(
+    U: torch.Tensor,
+    position_ids: torch.Tensor | None = None,
+    *,
+    base: float = 10000.0,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Backward-compatible name for :func:`apply_rank_rotary`."""
+    return apply_rank_rotary(U, position_ids, base=base, scale=scale)
 
-    The v1 solve is kept intact, but the low-rank solve basis is rotated by
-    position before building the global or prefix statistics:
+
+class RRLSSO(nn.Module):
+    """
+    Rank-Rotary LSSO.
+
+    The v1 solve is kept intact, but the low-rank solve basis U is transformed
+    by a fixed rank-space rotary map before building the global statistics:
 
         U_tilde_i = R(p_i) U_i
         (mu I + gamma U_tilde U_tilde^T) Y = C
 
-    This yields the relative-position kernel:
+    This yields a relative-index kernel in the rank basis:
 
         K_ij = u_i^T R(p_j - p_i) u_j
 
-    Both bidirectional and causal prefix modes are supported through the same
-    ``causal`` flag used by v1.
+    Despite the historical RoPE-LSSO name, this transform is not a learned or
+    absolute position embedding. It only rotates U inside the bidirectional
+    LSSO operator.
     """
 
     def __init__(
@@ -93,25 +105,28 @@ class RoPELSSO(nn.Module):
         rank: int = 16,
         dropout: float = 0.0,
         eps: float = 1e-5,
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         no_global: bool = False,
         normalize_u: bool = True,
+        length_normalize: bool = True,
+        length_reference: float = 1.0,
         causal: bool = False,
         causal_exclusive: bool = False,
         causal_chunk_size: int | None = None,
         causal_backend: str = "torch",
         rope_base: float = 10000.0,
         rope_scale: float = 1.0,
+        bias: bool = False,
     ) -> None:
         super().__init__()
 
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         if rank % 2 != 0:
-            raise ValueError(f"RoPELSSO requires an even rank, got rank={rank}")
-        if causal_backend not in ("torch", "triton"):
-            raise ValueError(f"causal_backend must be 'torch' or 'triton', got {causal_backend!r}")
+            raise ValueError(f"RRLSSO requires an even rank, got rank={rank}")
+        if causal or causal_exclusive or causal_chunk_size is not None or causal_backend != "torch":
+            raise NotImplementedError(_ARCHIVED_CAUSAL_MESSAGE)
 
         self.dim = dim
         self.num_heads = num_heads
@@ -121,16 +136,20 @@ class RoPELSSO(nn.Module):
         self.gamma_max = gamma_max
         self.no_global = no_global
         self.normalize_u = normalize_u
-        self.causal = causal
-        self.causal_exclusive = causal_exclusive
-        self.causal_chunk_size = causal_chunk_size
+        self.length_normalize = length_normalize
+        if length_reference <= 0:
+            raise ValueError(f"length_reference must be positive, got {length_reference}")
+        self.length_reference = float(length_reference)
+        self.causal = False
+        self.causal_exclusive = False
+        self.causal_chunk_size = None
         self.causal_backend = causal_backend
         self.rope_base = rope_base
         self.rope_scale = rope_scale
 
         self.uc_dim = num_heads * rank + dim
-        self.w_uc = nn.Linear(dim, self.uc_dim, bias=False)
-        self.w_o = nn.Linear(dim, dim, bias=False)
+        self.w_uc = nn.Linear(dim, self.uc_dim, bias=bias)
+        self.w_o = nn.Linear(dim, dim, bias=bias)
         self.register_buffer(
             "_eye",
             torch.eye(rank).view(1, 1, rank, rank),
@@ -169,7 +188,7 @@ class RoPELSSO(nn.Module):
         if self.normalize_u:
             U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + self.eps)
 
-        U = apply_rank_rope(
+        U = apply_rank_rotary(
             U,
             position_ids,
             base=self.rope_base,
@@ -184,7 +203,7 @@ class RoPELSSO(nn.Module):
         if self.prune_rank_keep is not None and 0 < self.prune_rank_keep < r:
             keep = int(self.prune_rank_keep)
             if keep % 2 != 0:
-                raise ValueError("RoPELSSO rank pruning must keep an even number of channels")
+                raise ValueError("RRLSSO rank pruning must keep an even number of channels")
             pair_scores = U.float().square().mean(dim=-2).view(B, H, r // 2, 2).sum(dim=-1)
             pair_indices = pair_scores.topk(k=keep // 2, dim=-1, largest=True, sorted=False).indices
             indices = torch.stack((2 * pair_indices, 2 * pair_indices + 1), dim=-1).flatten(-2)
@@ -211,6 +230,9 @@ class RoPELSSO(nn.Module):
                 causal_chunk_size=self.causal_chunk_size,
                 causal_backend=self.causal_backend,
                 return_aux=True,
+                length_normalize=self.length_normalize,
+                length_reference=self.length_reference,
+                valid_mask=valid_mask,
             )
         else:
             Y = lsso(
@@ -224,6 +246,9 @@ class RoPELSSO(nn.Module):
                 causal_exclusive=self.causal_exclusive,
                 causal_chunk_size=self.causal_chunk_size,
                 causal_backend=self.causal_backend,
+                length_normalize=self.length_normalize,
+                length_reference=self.length_reference,
+                valid_mask=valid_mask,
             )
             aux = None
 
@@ -269,3 +294,6 @@ class RoPELSSO(nn.Module):
             effective_rank=effective_rank.detach().float().cpu(),
             correction_ratio=correction_ratio.detach().float().cpu(),
         )
+
+
+RoPELSSO = RRLSSO

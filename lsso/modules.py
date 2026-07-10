@@ -6,6 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .mathdx_backend import solve_spd_autograd, try_stats_solve_spd
+
+
+_ARCHIVED_CAUSAL_MESSAGE = (
+    "Causal Prefix-LSSO has been archived. The supported LSSO API targets "
+    "bidirectional encoder models; use causal=False."
+)
+
 
 @dataclass
 class LSSODiagnostics:
@@ -27,21 +35,64 @@ class LSSOAux:
 class SolveStateCache:
     """Compressed low-rank solve state.
 
-    The cache stores only prefix/global statistics:
+    The cache stores only aggregate low-rank statistics:
 
         S = sum U_i^T U_i
         P = sum U_i^T C_i
 
-    For RoPE-LSSO, apply RoPE to ``U`` before updating the state.
+    For RRLSSO, apply the rank rotary transform to ``U`` before updating the state.
     """
 
     S: torch.Tensor
     P: torch.Tensor
-    length: int = 0
+    length: int | torch.Tensor = 0
 
 
 def _solve_dtype(*tensors: torch.Tensor) -> torch.dtype:
     return torch.float64 if any(t.dtype == torch.float64 for t in tensors) else torch.float32
+
+
+def length_normalize_basis(
+    U: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    *,
+    reference_length: float = 1.0,
+) -> torch.Tensor:
+    """Scale a bidirectional relation basis by ``sqrt(L_ref / L_eff)``.
+
+    With this scaling, ``U.T @ U`` and the complete Woodbury correction use
+    mean rather than sum statistics, so duplicating/padding a sequence does not
+    change the global correction strength. ``reference_length`` is a fixed
+    compatibility scale: setting it to the training length preserves the old
+    operator exactly at that length while still removing length drift.
+    """
+
+    if U.dim() != 4:
+        raise ValueError(f"U must have shape [B, H, N, r], got {tuple(U.shape)}")
+    if reference_length <= 0:
+        raise ValueError(f"reference_length must be positive, got {reference_length}")
+
+    B, _H, N, _r = U.shape
+    calc_dtype = torch.float64 if U.dtype == torch.float64 else torch.float32
+    if valid_mask is None:
+        lengths = torch.full(
+            (B,),
+            float(N),
+            device=U.device,
+            dtype=calc_dtype,
+        )
+    else:
+        if valid_mask.shape != (B, N):
+            raise ValueError(
+                f"valid_mask must have shape {(B, N)}, got {tuple(valid_mask.shape)}"
+            )
+        lengths = valid_mask.to(device=U.device, dtype=calc_dtype).sum(dim=-1)
+
+    scale = torch.sqrt(
+        torch.as_tensor(reference_length, device=U.device, dtype=calc_dtype)
+        / lengths.clamp_min(1.0)
+    )
+    return U * scale.to(dtype=U.dtype).view(B, 1, 1, 1)
 
 
 def _bmm_accumulate(
@@ -63,11 +114,10 @@ def _bmm_accumulate(
     return torch.bmm(left.to(torch.float32), right.to(torch.float32))
 
 
-def _cholesky_spd_solve(G: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    """Solve a batch of SPD systems G @ x = rhs in float32."""
+def _solve_no_check(G: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Solve batched small systems without synchronization-heavy error checks."""
     with torch.amp.autocast(device_type=G.device.type, enabled=False):
-        chol = torch.linalg.cholesky_ex(G, check_errors=False).L
-        return torch.cholesky_solve(rhs, chol)
+        return solve_spd_autograd(G, rhs)
 
 
 def make_solve_state(
@@ -79,8 +129,8 @@ def make_solve_state(
     """Build an S/P solve-state cache from relation features and targets.
 
     Args:
-        U: low-rank relation features, [B, H, N, r]. If using RoPE-LSSO,
-            pass the already-rotated U.
+        U: low-rank relation features, [B, H, N, r]. If using RRLSSO,
+            pass the already rank-rotated U.
         C: target states, [B, H, N, dh].
         valid_mask: optional valid-token mask, [B, N].
     """
@@ -101,7 +151,12 @@ def make_solve_state(
     Ut = U_bh.transpose(1, 2)
     S = _bmm_accumulate(Ut, U_bh, dtype=calc_dtype).view(B, H, r, r)
     P = _bmm_accumulate(Ut, C_bh, dtype=calc_dtype).view(B, H, r, dh)
-    return SolveStateCache(S=S, P=P, length=N)
+    cache_length: int | torch.Tensor
+    if valid_mask is None:
+        cache_length = N
+    else:
+        cache_length = valid_mask.to(device=U.device, dtype=torch.long).sum(dim=-1)
+    return SolveStateCache(S=S, P=P, length=cache_length)
 
 
 def update_solve_state(
@@ -128,12 +183,14 @@ def read_solve_state(
     cache: SolveStateCache,
     mu: torch.Tensor,
     gamma: torch.Tensor,
+    *,
+    length_normalize: bool = True,
+    length_reference: float = 1.0,
 ) -> torch.Tensor:
     """Read solved token states from an S/P solve-state cache.
 
-    ``cache`` should contain exactly the context that the current token(s) may
-    use. For inclusive causal decoding, update the cache with the current token
-    before calling this function.
+    This is a low-level aggregate-statistics utility retained for diagnostics
+    and archived research; it is not part of the supported causal API.
     """
     B, H, N, r = U.shape
     dh = C.shape[-1]
@@ -150,6 +207,22 @@ def read_solve_state(
     output_dtype = C.dtype if U.dtype == C.dtype else torch.promote_types(U.dtype, C.dtype)
     S = cache.S.to(solve_dtype)
     P = cache.P.to(solve_dtype)
+    if length_normalize:
+        if length_reference <= 0:
+            raise ValueError(f"length_reference must be positive, got {length_reference}")
+        if isinstance(cache.length, torch.Tensor):
+            if cache.length.shape != (B,):
+                raise ValueError(
+                    f"tensor cache.length must have shape {(B,)}, got {tuple(cache.length.shape)}"
+                )
+            length_scale = (
+                float(length_reference)
+                / cache.length.to(device=U.device, dtype=solve_dtype).clamp_min(1)
+            ).view(B, 1, 1, 1)
+        else:
+            length_scale = float(length_reference) / max(1, cache.length)
+        S = S * length_scale
+        P = P * length_scale
     mu_calc = mu.to(solve_dtype)
     gamma_calc = gamma.to(solve_dtype)
     inv_mu = mu_calc.reciprocal()
@@ -158,7 +231,7 @@ def read_solve_state(
 
     eye = torch.eye(r, device=U.device, dtype=solve_dtype).view(1, 1, r, r)
     G = eye + alpha * S
-    K = _cholesky_spd_solve(
+    K = _solve_no_check(
         G.reshape(B * H, r, r),
         P.reshape(B * H, r, dh),
     ).to(output_dtype).view(B, H, r, dh)
@@ -189,17 +262,19 @@ def _lsso_woodbury_forward(
 
     U_bh = U_calc.flatten(0, 1)
     C_bh = C_calc.flatten(0, 1)
-    Ut_bh = U_bh.transpose(1, 2)
-    UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
-    UtC = torch.bmm(Ut_bh, C_bh).view(B, H, r, dh)
-    if eye is None:
-        eye = torch.eye(r, device=U.device, dtype=calc_dtype).view(1, 1, r, r)
-    G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
-
-    K = _cholesky_spd_solve(
-        G.view(B * H, r, r),
-        UtC.to(solve_dtype).view(B * H, r, dh),
-    ).to(calc_dtype)
+    alpha_bh = gamma_over_mu.expand(B, H, 1, 1).reshape(B * H).float()
+    K = try_stats_solve_spd(U_bh, C_bh, alpha_bh)
+    if K is None:
+        Ut_bh = U_bh.transpose(1, 2)
+        UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
+        UtC = torch.bmm(Ut_bh, C_bh).view(B, H, r, dh)
+        if eye is None:
+            eye = torch.eye(r, device=U.device, dtype=calc_dtype).view(1, 1, r, r)
+        G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
+        K = _solve_no_check(
+            G.view(B * H, r, r),
+            UtC.to(solve_dtype).view(B * H, r, dh),
+        ).to(calc_dtype)
     UK = torch.bmm(U_bh, K).view(B, H, N, dh)
     UK.mul_(gamma_over_mu2)
     Y = C_calc.mul(inv_mu)
@@ -250,7 +325,7 @@ def _lsso_prefix_forward(
 
     solve_dtype = torch.float64 if calc_dtype == torch.float64 else torch.float32
     G = eye.to(solve_dtype) + gamma_over_mu.unsqueeze(2).to(solve_dtype) * S.to(solve_dtype)
-    K = _cholesky_spd_solve(
+    K = _solve_no_check(
         G.reshape(B * H * N, r, r),
         P.to(solve_dtype).reshape(B * H * N, r, dh),
     ).to(calc_dtype).view(B, H, N, r, dh)
@@ -332,7 +407,7 @@ def _lsso_prefix_chunked_forward(
 
         G = eye.to(solve_dtype) + gamma_over_mu.unsqueeze(2).to(solve_dtype) * S_block.to(solve_dtype)
         block_len = end - start
-        K = _cholesky_spd_solve(
+        K = _solve_no_check(
             G.reshape(B * H * block_len, r, r),
             P_block.to(solve_dtype).reshape(B * H * block_len, r, dh),
         ).to(calc_dtype).view(B, H, block_len, r, dh)
@@ -437,6 +512,9 @@ def lsso(
     causal_chunk_size: int | None = None,
     causal_backend: str = "torch",
     return_aux: bool = False,
+    length_normalize: bool = True,
+    length_reference: float = 1.0,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, LSSOAux]:
     """
     Functional LSSO core, analogous to an attention kernel.
@@ -448,23 +526,44 @@ def lsso(
         gamma: global strength, broadcastable to [B, H, 1, 1] or [H].
         eye: optional identity buffer shaped [1, 1, r, r].
         no_global: if true, returns only mu^-1 C.
-        causal: if true, uses prefix low-rank statistics so token i only
-            depends on tokens <= i.
-        causal_exclusive: if true with causal, shifts prefix statistics so token
-            i only uses tokens < i for the global correction.
-        causal_chunk_size: optional block size for a FlashAttention-style
-            prefix implementation that scans chunks and carries only low-rank
-            prefix states between chunks. If omitted, the causal path
-            materializes full-sequence prefix tensors.
-        causal_backend: "torch" or "triton". Triton is causal-only and
-            experimental; diagnostics fall back to the PyTorch path.
+        causal: archived compatibility argument. `True` is unsupported.
+        causal_exclusive: archived compatibility argument.
+        causal_chunk_size: archived compatibility argument.
+        causal_backend: archived compatibility argument; only the default
+            value `"torch"` is accepted with `causal=False`.
         return_aux: if true, also returns tensors used for diagnostics.
+        length_normalize: use effective-length mean statistics instead of
+            sequence sums.
+        length_reference: fixed positive compatibility scale. A value matching
+            an old checkpoint's training length preserves its old strength at
+            that length.
+        valid_mask: optional [B, N] mask used for effective lengths. Masked U/C
+            entries are zeroed here as a safety measure.
 
     Returns:
         Y: solved token states, [B, H, N, dh].
     """
     B, H, N, r = U.shape
     dh = C.shape[-1]
+
+    if valid_mask is not None:
+        if valid_mask.shape != (B, N):
+            raise ValueError(
+                f"valid_mask must have shape {(B, N)}, got {tuple(valid_mask.shape)}"
+            )
+        solve_mask = valid_mask[:, None, :, None].to(device=U.device, dtype=U.dtype)
+        U = U * solve_mask
+        C = C * solve_mask.to(dtype=C.dtype)
+
+    if causal or causal_exclusive or causal_chunk_size is not None or causal_backend != "torch":
+        raise NotImplementedError(_ARCHIVED_CAUSAL_MESSAGE)
+
+    if length_normalize:
+        U = length_normalize_basis(
+            U,
+            valid_mask,
+            reference_length=length_reference,
+        )
 
     if mu.dim() == 1:
         mu = mu.view(1, H, 1, 1)
@@ -474,9 +573,6 @@ def lsso(
     inv_mu = mu.reciprocal()
     gamma_over_mu = gamma * inv_mu
     gamma_over_mu2 = gamma_over_mu * inv_mu
-
-    if causal_backend not in ("torch", "triton"):
-        raise ValueError(f"causal_backend must be 'torch' or 'triton', got {causal_backend!r}")
 
     if causal and not no_global and causal_backend == "triton" and not return_aux:
         from .causal_triton import causal_prefix_lsso_triton
@@ -542,16 +638,24 @@ def lsso(
             UtU = None
     else:
         solve_dtype = _solve_dtype(U, C, mu, gamma)
-        UtU = _bmm_accumulate(Ut_bh, U_bh, dtype=solve_dtype).view(B, H, r, r)
-        UtC = _bmm_accumulate(Ut_bh, C_bh, dtype=solve_dtype).view(B, H, r, dh)
+        K = None
+        if not return_aux:
+            alpha_bh = gamma_over_mu.expand(B, H, 1, 1).reshape(B * H).float()
+            K = try_stats_solve_spd(U_bh, C_bh, alpha_bh)
+        if K is None:
+            UtU = _bmm_accumulate(Ut_bh, U_bh, dtype=solve_dtype).view(B, H, r, r)
+            UtC = _bmm_accumulate(Ut_bh, C_bh, dtype=solve_dtype).view(B, H, r, dh)
 
-        if eye is None:
-            eye = torch.eye(r, device=U.device, dtype=solve_dtype).view(1, 1, r, r)
-        G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU
-        K = _cholesky_spd_solve(
-            G.view(B * H, r, r),
-            UtC.to(solve_dtype).view(B * H, r, dh),
-        ).to(U.dtype)
+            if eye is None:
+                eye = torch.eye(r, device=U.device, dtype=solve_dtype).view(1, 1, r, r)
+            G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU
+            K = _solve_no_check(
+                G.view(B * H, r, r),
+                UtC.to(solve_dtype).view(B * H, r, dh),
+            ).to(U.dtype)
+        else:
+            UtU = None
+            K = K.to(U.dtype)
 
         UK = torch.bmm(U_bh, K).view(B, H, N, dh)
         if return_aux:
@@ -588,14 +692,17 @@ class LSSO(nn.Module):
         rank: int = 16,
         dropout: float = 0.0,
         eps: float = 1e-5,
-        gamma_max: float = 0.3,
-        theta_gamma_init: float = -4.0,
+        gamma_max: float = 1.2,
+        theta_gamma_init: float = 0.5,
         no_global: bool = False,
         normalize_u: bool = True,
+        length_normalize: bool = True,
+        length_reference: float = 1.0,
         causal: bool = False,
         causal_exclusive: bool = False,
         causal_chunk_size: int | None = None,
         causal_backend: str = "torch",
+        bias: bool = False,
     ) -> None:
         super().__init__()
 
@@ -610,16 +717,20 @@ class LSSO(nn.Module):
         self.gamma_max = gamma_max
         self.no_global = no_global
         self.normalize_u = normalize_u
-        self.causal = causal
-        self.causal_exclusive = causal_exclusive
-        self.causal_chunk_size = causal_chunk_size
-        if causal_backend not in ("torch", "triton"):
-            raise ValueError(f"causal_backend must be 'torch' or 'triton', got {causal_backend!r}")
+        self.length_normalize = length_normalize
+        if length_reference <= 0:
+            raise ValueError(f"length_reference must be positive, got {length_reference}")
+        self.length_reference = float(length_reference)
+        if causal or causal_exclusive or causal_chunk_size is not None or causal_backend != "torch":
+            raise NotImplementedError(_ARCHIVED_CAUSAL_MESSAGE)
+        self.causal = False
+        self.causal_exclusive = False
+        self.causal_chunk_size = None
         self.causal_backend = causal_backend
 
         self.uc_dim = num_heads * rank + dim
-        self.w_uc = nn.Linear(dim, self.uc_dim, bias=False)
-        self.w_o = nn.Linear(dim, dim, bias=False)
+        self.w_uc = nn.Linear(dim, self.uc_dim, bias=bias)
+        self.w_o = nn.Linear(dim, dim, bias=bias)
         self.register_buffer(
             "_eye",
             torch.eye(rank).view(1, 1, rank, rank),
@@ -686,6 +797,9 @@ class LSSO(nn.Module):
                 causal_chunk_size=self.causal_chunk_size,
                 causal_backend=self.causal_backend,
                 return_aux=True,
+                length_normalize=self.length_normalize,
+                length_reference=self.length_reference,
+                valid_mask=valid_mask,
             )
         else:
             Y = lsso(
@@ -699,6 +813,9 @@ class LSSO(nn.Module):
                 causal_exclusive=self.causal_exclusive,
                 causal_chunk_size=self.causal_chunk_size,
                 causal_backend=self.causal_backend,
+                length_normalize=self.length_normalize,
+                length_reference=self.length_reference,
+                valid_mask=valid_mask,
             )
             aux = None
 
