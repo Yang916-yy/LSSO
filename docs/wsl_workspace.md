@@ -21,3 +21,8 @@ source .venv/bin/activate
 
 Set `LSSO_MATHDX_LIBRARY` to a MathDx shared library built for the active GPU
 when running native backend experiments.
+
+The large dataset cache remains at `/mnt/d/LSSO/data` to avoid duplicating
+datasets. Pass that path explicitly, for example
+`--data-dir /mnt/d/LSSO/data/torchvision`, when running experiments from the
+native WSL tree.
