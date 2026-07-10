@@ -12,13 +12,11 @@ Formal checkpoints that are too large for Git live under
 `/root/LSSO/artifacts/` (ignored by Git). The concise metrics, figures, and
 reproduction scripts belong in `paper_results/` and are tracked.
 
-For the current WSL runtime, the existing CUDA Python environment can be used
-from `/mnt/d/LSSO/.venv` while a native environment is being provisioned:
+The native WSL runtime is in `/root/LSSO/.venv`:
 
 ```bash
 cd /root/LSSO
-source /mnt/d/LSSO/.venv/bin/activate
-export PYTHONPATH=/root/LSSO
+source .venv/bin/activate
 ```
 
 Set `LSSO_MATHDX_LIBRARY` to a MathDx shared library built for the active GPU
