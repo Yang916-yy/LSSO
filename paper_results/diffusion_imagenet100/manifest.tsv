@@ -1,5 +1,0 @@
-model	seed	rank	dim	depth	heads	tokens	epochs	batch_size	amp	log	checkpoint_release_asset
-MHA	1	32	384	8	8	784	50	192	bf16	logs/dit_fastcache_im100_mha_r32_d384_L8_h8_s1.jsonl	diffusion_imagenet100_checkpoints.tar
-Nystromformer	1	32	384	8	8	784	50	192	bf16	logs/dit_fastcache_im100_nystrom_r32_d384_L8_h8_s1.jsonl	diffusion_imagenet100_checkpoints.tar
-LSSO-r16	1	16	384	8	8	784	50	192	bf16	logs/dit_fastcache_im100_lsso_r16_d384_L8_h8_s1.jsonl	diffusion_imagenet100_checkpoints.tar
-LSSO-r32	1	32	384	8	8	784	50	192	bf16	logs/dit_fastcache_im100_lsso_r32_d384_L8_h8_s1.jsonl	diffusion_imagenet100_checkpoints.tar

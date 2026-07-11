@@ -42,7 +42,6 @@ class RRLSSOSelfAttention(nn.Module):
                 num_heads=num_heads,
                 rank=rank,
                 dropout=dropout,
-                causal=False,
                 bias=bias,
                 gamma_max=gamma_max,
                 theta_gamma_init=theta_gamma_init,

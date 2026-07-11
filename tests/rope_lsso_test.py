@@ -31,8 +31,8 @@ def test_rrlsso_zero_positions_matches_v1() -> None:
     torch.manual_seed(1)
     B, N, D, H, r = 2, 11, 48, 3, 8
     x = torch.randn(B, N, D)
-    v1 = LSSO(dim=D, num_heads=H, rank=r, causal=False)
-    v2 = RRLSSO(dim=D, num_heads=H, rank=r, causal=False)
+    v1 = LSSO(dim=D, num_heads=H, rank=r)
+    v2 = RRLSSO(dim=D, num_heads=H, rank=r)
     v2.load_state_dict(v1.state_dict(), strict=True)
     zeros = torch.zeros(N)
 

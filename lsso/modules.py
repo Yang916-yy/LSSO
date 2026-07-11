@@ -9,12 +9,6 @@ import torch.nn.functional as F
 from .mathdx_backend import solve_spd_autograd, try_stats_solve_spd
 
 
-_ARCHIVED_CAUSAL_MESSAGE = (
-    "Causal Prefix-LSSO has been archived. The supported LSSO API targets "
-    "bidirectional encoder models; use causal=False."
-)
-
-
 @dataclass
 class LSSODiagnostics:
     gamma_over_mu: torch.Tensor
@@ -190,7 +184,7 @@ def read_solve_state(
     """Read solved token states from an S/P solve-state cache.
 
     This is a low-level aggregate-statistics utility retained for diagnostics
-    and archived research; it is not part of the supported causal API.
+    and diagnostics.
     """
     B, H, N, r = U.shape
     dh = C.shape[-1]
@@ -507,10 +501,6 @@ def lsso(
     *,
     eye: torch.Tensor | None = None,
     no_global: bool = False,
-    causal: bool = False,
-    causal_exclusive: bool = False,
-    causal_chunk_size: int | None = None,
-    causal_backend: str = "torch",
     return_aux: bool = False,
     length_normalize: bool = True,
     length_reference: float = 1.0,
@@ -526,11 +516,6 @@ def lsso(
         gamma: global strength, broadcastable to [B, H, 1, 1] or [H].
         eye: optional identity buffer shaped [1, 1, r, r].
         no_global: if true, returns only mu^-1 C.
-        causal: archived compatibility argument. `True` is unsupported.
-        causal_exclusive: archived compatibility argument.
-        causal_chunk_size: archived compatibility argument.
-        causal_backend: archived compatibility argument; only the default
-            value `"torch"` is accepted with `causal=False`.
         return_aux: if true, also returns tensors used for diagnostics.
         length_normalize: use effective-length mean statistics instead of
             sequence sums.
@@ -555,9 +540,6 @@ def lsso(
         U = U * solve_mask
         C = C * solve_mask.to(dtype=C.dtype)
 
-    if causal or causal_exclusive or causal_chunk_size is not None or causal_backend != "torch":
-        raise NotImplementedError(_ARCHIVED_CAUSAL_MESSAGE)
-
     if length_normalize:
         U = length_normalize_basis(
             U,
@@ -574,45 +556,9 @@ def lsso(
     gamma_over_mu = gamma * inv_mu
     gamma_over_mu2 = gamma_over_mu * inv_mu
 
-    if causal and not no_global and causal_backend == "triton" and not return_aux:
-        from .causal_triton import causal_prefix_lsso_triton
-
-        return causal_prefix_lsso_triton(
-            U,
-            C,
-            mu,
-            gamma,
-            exclusive=causal_exclusive,
-            chunk_size=causal_chunk_size or 256,
-        )
-
-    if causal and not no_global and causal_chunk_size is not None:
-        return _lsso_prefix_chunked_forward(
-            U,
-            C,
-            mu,
-            gamma,
-            eye,
-            exclusive=causal_exclusive,
-            chunk_size=causal_chunk_size,
-            return_aux=return_aux,
-        )
-
-    if causal and not no_global:
-        return _lsso_prefix_forward(
-            U,
-            C,
-            mu,
-            gamma,
-            eye,
-            exclusive=causal_exclusive,
-            return_aux=return_aux,
-        )
-
     if (
         torch.is_grad_enabled()
         and not no_global
-        and not causal
         and not return_aux
         and (U.requires_grad or C.requires_grad or mu.requires_grad or gamma.requires_grad)
     ):
@@ -628,12 +574,7 @@ def lsso(
         if return_aux:
             local = Y
             correction = torch.zeros_like(Y)
-            if causal:
-                UtU = torch.cumsum(U.unsqueeze(-1) * U.unsqueeze(-2), dim=2)
-                if causal_exclusive:
-                    UtU = _exclusive_prefix(UtU)
-            else:
-                UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
+            UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
         else:
             UtU = None
     else:
@@ -698,10 +639,6 @@ class LSSO(nn.Module):
         normalize_u: bool = True,
         length_normalize: bool = True,
         length_reference: float = 1.0,
-        causal: bool = False,
-        causal_exclusive: bool = False,
-        causal_chunk_size: int | None = None,
-        causal_backend: str = "torch",
         bias: bool = False,
     ) -> None:
         super().__init__()
@@ -721,13 +658,6 @@ class LSSO(nn.Module):
         if length_reference <= 0:
             raise ValueError(f"length_reference must be positive, got {length_reference}")
         self.length_reference = float(length_reference)
-        if causal or causal_exclusive or causal_chunk_size is not None or causal_backend != "torch":
-            raise NotImplementedError(_ARCHIVED_CAUSAL_MESSAGE)
-        self.causal = False
-        self.causal_exclusive = False
-        self.causal_chunk_size = None
-        self.causal_backend = causal_backend
-
         self.uc_dim = num_heads * rank + dim
         self.w_uc = nn.Linear(dim, self.uc_dim, bias=bias)
         self.w_o = nn.Linear(dim, dim, bias=bias)
@@ -792,10 +722,6 @@ class LSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
-                causal=self.causal,
-                causal_exclusive=self.causal_exclusive,
-                causal_chunk_size=self.causal_chunk_size,
-                causal_backend=self.causal_backend,
                 return_aux=True,
                 length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
@@ -809,10 +735,6 @@ class LSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
-                causal=self.causal,
-                causal_exclusive=self.causal_exclusive,
-                causal_chunk_size=self.causal_chunk_size,
-                causal_backend=self.causal_backend,
                 length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
                 valid_mask=valid_mask,

@@ -57,6 +57,3 @@ Thumbs.db
 third_party/
 external/
 artifacts/
-paper/$out/
-# LaTeX build outputs
-paper/build/

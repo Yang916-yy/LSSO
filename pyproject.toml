@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsso-operator"
-version = "0.1.1"
-description = "Learnable Sylvester Solve Operator token mixer for bidirectional encoder and vision models."
+version = "0.2.0.dev0"
+description = "Bidirectional low-rank Sylvester-solve token mixers for vision encoders."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -19,7 +19,6 @@ keywords = [
     "efficient-transformer",
     "computer-vision",
     "vision-transformer",
-    "retrieval",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -39,38 +38,20 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/Yang916-yy/LSSO"
-Paper = "https://github.com/Yang916-yy/LSSO/blob/main/paper/LSSO_Learnable_Low-Rank_Sylvester_Solves_for_Efficient_Bidirectional_Encoders_v1.pdf"
 Issues = "https://github.com/Yang916-yy/LSSO/issues"
 
 [project.optional-dependencies]
-hf = [
-    "transformers",
-    "datasets",
-    "accelerate",
-    "evaluate",
-    "scikit-learn",
-]
 experiments = [
     "matplotlib",
     "numpy",
     "tqdm",
-    "torchinfo",
-    "transformers",
-    "datasets",
-    "accelerate",
-    "evaluate",
-    "scikit-learn",
+    "torchvision",
 ]
 all = [
     "matplotlib",
     "numpy",
     "tqdm",
-    "torchinfo",
-    "transformers",
-    "datasets",
-    "accelerate",
-    "evaluate",
-    "scikit-learn",
+    "torchvision",
 ]
 
 [tool.setuptools.packages.find]

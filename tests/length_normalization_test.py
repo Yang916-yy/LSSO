@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -84,18 +83,6 @@ def test_reference_length_preserves_legacy_anchor() -> None:
         length_reference=u.shape[2],
     )
     torch.testing.assert_close(anchored, legacy, rtol=1e-12, atol=1e-12)
-
-
-def test_archived_causal_path_errors_explicitly() -> None:
-    u, c, mu, gamma = _inputs(sequence=6)
-    with pytest.raises(NotImplementedError, match="archived"):
-        lsso(u, c, mu, gamma, causal=True)
-    with pytest.raises(NotImplementedError, match="archived"):
-        LSSO(dim=32, num_heads=4, rank=8, causal=True)
-    with pytest.raises(NotImplementedError, match="archived"):
-        RRLSSO(dim=32, num_heads=4, rank=8, causal=True)
-    with pytest.raises(NotImplementedError, match="archived"):
-        LSSO(dim=32, num_heads=4, rank=8, causal_chunk_size=128)
 
 
 def test_basis_helper_scales_from_effective_lengths() -> None:

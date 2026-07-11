@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .modules import _ARCHIVED_CAUSAL_MESSAGE, LSSODiagnostics, lsso
+from .modules import LSSODiagnostics, lsso
 
 
 def apply_rank_rotary(
@@ -111,10 +111,6 @@ class RRLSSO(nn.Module):
         normalize_u: bool = True,
         length_normalize: bool = True,
         length_reference: float = 1.0,
-        causal: bool = False,
-        causal_exclusive: bool = False,
-        causal_chunk_size: int | None = None,
-        causal_backend: str = "torch",
         rope_base: float = 10000.0,
         rope_scale: float = 1.0,
         bias: bool = False,
@@ -125,9 +121,6 @@ class RRLSSO(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         if rank % 2 != 0:
             raise ValueError(f"RRLSSO requires an even rank, got rank={rank}")
-        if causal or causal_exclusive or causal_chunk_size is not None or causal_backend != "torch":
-            raise NotImplementedError(_ARCHIVED_CAUSAL_MESSAGE)
-
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -140,10 +133,6 @@ class RRLSSO(nn.Module):
         if length_reference <= 0:
             raise ValueError(f"length_reference must be positive, got {length_reference}")
         self.length_reference = float(length_reference)
-        self.causal = False
-        self.causal_exclusive = False
-        self.causal_chunk_size = None
-        self.causal_backend = causal_backend
         self.rope_base = rope_base
         self.rope_scale = rope_scale
 
@@ -225,10 +214,6 @@ class RRLSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
-                causal=self.causal,
-                causal_exclusive=self.causal_exclusive,
-                causal_chunk_size=self.causal_chunk_size,
-                causal_backend=self.causal_backend,
                 return_aux=True,
                 length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
@@ -242,10 +227,6 @@ class RRLSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
-                causal=self.causal,
-                causal_exclusive=self.causal_exclusive,
-                causal_chunk_size=self.causal_chunk_size,
-                causal_backend=self.causal_backend,
                 length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
                 valid_mask=valid_mask,

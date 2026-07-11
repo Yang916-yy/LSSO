@@ -1,4 +1,0 @@
-dataset	model	n	params_M	mixer_MACs_G	best_epoch	top1	top5	train_samples_per_sec	max_mem_GB
-ImageNet-100	LSSO-r16	1	5.80	1.093	118	80.54	94.88	807.9	17.42
-ImageNet-100	LSSO-r32	1	6.06	1.391	120	80.58	94.76	743.5	19.64
-ImageNet-100	MHA	1	6.59	4.162	119	82.26	95.54	846.8	16.06

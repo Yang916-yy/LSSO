@@ -1,28 +1,25 @@
-# WSL workspace layout
+# WSL development workspace
 
-The canonical working tree for agent and CUDA work is `/root/LSSO` in the
-Ubuntu-24.04 WSL filesystem. This avoids routine source and metadata I/O on
-the Windows-mounted `/mnt/d` volume.
-
-The former Windows worktree at `D:\LSSO` is a migration source only. Do not
-develop independently in both locations: fetch/pull the same Git branch from
-the canonical WSL tree, and use GitHub as the synchronization boundary.
-
-Formal checkpoints that are too large for Git live under
-`/root/LSSO/artifacts/` (ignored by Git). The concise metrics, figures, and
-reproduction scripts belong in `paper_results/` and are tracked.
-
-The native WSL runtime is in `/root/LSSO/.venv`:
+The native development checkout is `/root/LSSO` in Ubuntu-24.04. It is the
+only checkout used for builds, tests, and GPU training. The Windows checkout
+is a Git mirror, not an independent experiment tree.
 
 ```bash
 cd /root/LSSO
+python -m venv .venv
 source .venv/bin/activate
+python -m pip install -e '.[experiments]'
 ```
 
-Set `LSSO_MATHDX_LIBRARY` to a MathDx shared library built for the active GPU
-when running native backend experiments.
+The dataset cache may remain on the Windows disk to avoid duplication. Pass
+it explicitly, for example `--data-dir /mnt/d/LSSO-data/torchvision` after the
+cache is moved outside the repository.
 
-The large dataset cache remains at `/mnt/d/LSSO/data` to avoid duplicating
-datasets. Pass that path explicitly, for example
-`--data-dir /mnt/d/LSSO/data/torchvision`, when running experiments from the
-native WSL tree.
+Build the optional MathDx extension from the native checkout:
+
+```bash
+bash tools/build_mathdx_backend.sh
+```
+
+Generated checkpoints, run logs, build products, and datasets are ignored by
+Git and must not be treated as source files.

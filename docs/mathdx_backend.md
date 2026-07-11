@@ -12,8 +12,8 @@ Grouped LSSO/RRLSSO for any relation-group count.
 - `stats_solve_spd`: one CTA computes FP32 `U.T @ U` with cuBLASDx, constructs
   `I + alpha * U.T @ U`, factors it with cuSolverDx, then loops over RHS tiles,
   computing `U.T @ C` and solving without writing Gram/RHS to global memory.
-- `lsso.modules` and the FlashBidirLSSO prototype use the autograd-aware
-  `solve_spd` path automatically. Missing libraries, CPU execution, unsupported
+- `lsso.modules` uses the autograd-aware `solve_spd` path automatically.
+  Missing libraries, CPU execution, unsupported
   ranks, and non-FP32 solve tensors fall back to `torch.linalg.solve_ex`.
 
 The fully fused one-CTA path is selected conservatively for CV-sized token
@@ -28,8 +28,8 @@ rather than forcing the fully fused kernel at every shape.
 The local development build targets the installed GPU:
 
 ```bash
-cd /mnt/d/LSSO
-bash scripts/build_mathdx_backend.sh
+cd /root/LSSO
+bash tools/build_mathdx_backend.sh
 ```
 
 The release build produces a fat binary for Ampere (SM80/86/87), Ada (SM89),
@@ -39,7 +39,7 @@ Hopper (SM90), and Blackwell (SM100/120):
 LSSO_MATHDX_RELEASE=1 \
 LSSO_MATHDX_BUILD_DIR="$HOME/.cache/lsso-mathdx-release" \
 LSSO_MATHDX_RECONFIGURE=1 \
-bash scripts/build_mathdx_backend.sh
+bash tools/build_mathdx_backend.sh
 ```
 
 Override `MATHDX_ROOT`, `CUDA_HOME`, `PYTHON_BIN`, or the architecture lists for
@@ -64,9 +64,8 @@ LD_LIBRARY_PATH=/usr/local/cuda-13.0/targets/x86_64-linux/lib \
 On the development RTX 5070 Ti (SM120), rank 16/32 numerical tests covered RHS
 widths 1--192 and non-aligned N=65/196. Maximum fused-path absolute error versus
 `torch.linalg.solve` was below `5e-6`. Measured solve-only speedups were
-`3.8--12.8x`; the complete FlashBidirLSSO forward improved by `1.85--2.13x` at
-N=196/3136 and `1.41x` at N=8192. These numbers are local measurements, not
-cross-GPU claims. With the conservative selector, a main-LSSO case with 64
+`3.8--12.8x`. These numbers are local measurements, not cross-GPU claims.
+With the conservative selector, a main-LSSO case with 64
 systems, N=196, rank 32, and RHS 64 was `1.58x` faster than the already
 accelerated parallel-stats + MathDx-solve hybrid; RHS 192 correctly selected
 the hybrid path.
@@ -83,6 +82,7 @@ On CIFAR-100 ViT-B/4 with BF16 autocast and batch 128, steady epoch timing over
 
 The G=1 MathDx run completed at 10.9753 seconds. The corresponding PyTorch
 `solve_ex` run failed reproducibly in MAGMA with an illegal memory access for
-RHS 768 at batch sizes 128 and 64, so it has no valid speed ratio. Full
-methodology and raw-result locations are recorded in
-`paper_results/mathdx_training_ab/README.md`.
+RHS 768 at batch sizes 128 and 64, so it has no valid speed ratio. Treat these
+as local development measurements and re-run
+`benchmarks/benchmark_mathdx_backend.py` on the target GPU before reporting
+hardware claims.
