@@ -160,3 +160,190 @@ def try_stats_solve_spd(
         u.contiguous(), c.contiguous(), alpha.contiguous()
     )
     return solution
+
+
+def try_masked_stats_solve_spd(
+    u: torch.Tensor,
+    c: torch.Tensor,
+    valid_mask: torch.Tensor,
+    length_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    *,
+    max_sequence: int = 512,
+) -> torch.Tensor | None:
+    """Fuse masked/scaled statistics and solve without reading padded U/C.
+
+    ``u`` and ``c`` retain their native training dtype. The CUDA kernel checks
+    ``valid_mask`` before loading either tensor, converts valid values to FP32
+    in shared memory, and accumulates/solves the compact system in FP32.
+    """
+
+    if torch.compiler.is_compiling():
+        return None
+    eligible = (
+        u.is_cuda
+        and c.is_cuda
+        and valid_mask.is_cuda
+        and length_scale.is_cuda
+        and alpha.is_cuda
+        and u.dtype == c.dtype
+        and u.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and valid_mask.dtype == torch.bool
+        and length_scale.dtype == torch.float32
+        and alpha.dtype == torch.float32
+        and u.ndim == 4
+        and c.ndim == 4
+        and valid_mask.ndim == 2
+        and length_scale.ndim == 1
+        and alpha.ndim == 1
+        and u.shape[:3] == c.shape[:3]
+        and valid_mask.shape == (u.shape[0], u.shape[2])
+        and length_scale.shape[0] == u.shape[0]
+        and alpha.shape[0] == u.shape[0] * u.shape[1]
+        and u.shape[3] in (16, 32)
+        and u.shape[2] <= max_sequence
+        and u.shape[0] * u.shape[1] <= 64
+        and c.shape[3] <= 64
+    )
+    if not eligible or not load_mathdx_backend():
+        return None
+    solution, _info = torch.ops.lsso_mathdx.masked_stats_solve_spd(
+        u.contiguous(),
+        c.contiguous(),
+        valid_mask.contiguous(),
+        length_scale.contiguous(),
+        alpha.contiguous(),
+    )
+    return solution
+
+
+class _RankRotaryFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(cos, sin)
+        return torch.ops.lsso_mathdx.rank_rotary(input, cos, sin, False)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        cos, sin = ctx.saved_tensors
+        grad_input = torch.ops.lsso_mathdx.rank_rotary(
+            grad_output.contiguous(), cos, sin, True
+        )
+        return grad_input, None, None
+
+
+def try_rank_rotary(
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor | None:
+    """Apply the fused CUDA rank rotation when the native backend is usable."""
+
+    if torch.compiler.is_compiling():
+        return None
+    eligible = (
+        input.is_cuda
+        and cos.is_cuda
+        and sin.is_cuda
+        and input.is_contiguous()
+        and cos.is_contiguous()
+        and sin.is_contiguous()
+        and input.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        and input.dtype == cos.dtype == sin.dtype
+        and input.ndim == 4
+        and input.shape[-1] % 2 == 0
+    )
+    if not eligible or not load_mathdx_backend():
+        return None
+    return _RankRotaryFunction.apply(input, cos, sin)
+
+
+class _NormalizeBasisFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, eps: float, length_scale: float):
+        output, inv_rms = torch.ops.lsso_mathdx.normalize_basis(
+            input, eps, length_scale
+        )
+        ctx.save_for_backward(input, inv_rms)
+        ctx.length_scale = length_scale
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        input, inv_rms = ctx.saved_tensors
+        grad_input = torch.ops.lsso_mathdx.normalize_basis_backward(
+            grad_output.contiguous(), input, inv_rms, ctx.length_scale
+        )
+        return grad_input, None, None
+
+
+class _NormalizeRankRotaryFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        eps: float,
+        length_scale: float,
+    ):
+        output, inv_rms = torch.ops.lsso_mathdx.normalize_rank_rotary(
+            input, cos, sin, eps, length_scale
+        )
+        ctx.save_for_backward(input, inv_rms, cos, sin)
+        ctx.length_scale = length_scale
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        input, inv_rms, cos, sin = ctx.saved_tensors
+        grad_input = torch.ops.lsso_mathdx.normalize_rank_rotary_backward(
+            grad_output.contiguous(), input, inv_rms, cos, sin, ctx.length_scale
+        )
+        return grad_input, None, None, None, None
+
+
+def try_prepare_basis(
+    input: torch.Tensor,
+    *,
+    eps: float,
+    length_scale: float,
+    cos: torch.Tensor | None = None,
+    sin: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Fuse RMS normalization, length scaling, and optional rank rotation."""
+
+    if torch.compiler.is_compiling():
+        return None
+    eligible = (
+        input.is_cuda
+        and input.is_contiguous()
+        and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and input.ndim == 4
+        and 0 < input.shape[-1] <= 1024
+    )
+    rotary = cos is not None or sin is not None
+    if rotary:
+        eligible = (
+            eligible
+            and cos is not None
+            and sin is not None
+            and cos.is_cuda
+            and sin.is_cuda
+            and cos.is_contiguous()
+            and sin.is_contiguous()
+            and input.dtype == cos.dtype == sin.dtype
+            and input.shape[-1] % 2 == 0
+        )
+    if not eligible or not load_mathdx_backend():
+        return None
+    if rotary:
+        return _NormalizeRankRotaryFunction.apply(
+            input, cos, sin, float(eps), float(length_scale)
+        )
+    return _NormalizeBasisFunction.apply(input, float(eps), float(length_scale))

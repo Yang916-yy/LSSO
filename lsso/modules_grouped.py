@@ -136,7 +136,10 @@ class _GroupedLSSOBase(nn.Module):
                 raise ValueError(
                     f"valid_mask must have shape {(B, N)}, got {tuple(valid_mask.shape)}"
                 )
-            group_mask = valid_mask[:, None, :, None].to(dtype=x.dtype)
+            group_mask = valid_mask[:, None, :, None].to(
+                device=x.device,
+                dtype=x.dtype,
+            )
 
         UC = self.w_uc(x)
         U, C = UC.split((G * r, D), dim=-1)
@@ -147,13 +150,11 @@ class _GroupedLSSOBase(nn.Module):
             U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + self.eps)
         U = self._prepare_relation_basis(U, position_ids)
 
-        if group_mask is not None:
-            U = U * group_mask
-            C = C * group_mask
-
         solve_eye = self._eye
         if self.prune_rank_keep is not None and 0 < self.prune_rank_keep < r:
             keep = int(self.prune_rank_keep)
+            if group_mask is not None:
+                U = U * group_mask
             U = self._prune_relation_basis(U, keep)
             solve_eye = None
 
@@ -205,7 +206,7 @@ class _GroupedLSSOBase(nn.Module):
         Y = Y.transpose(1, 2).contiguous().view(B, N, D)
         Y = self.w_o(Y)
         if valid_mask is not None:
-            Y = Y * valid_mask[:, :, None].to(dtype=Y.dtype)
+            Y = Y * valid_mask[:, :, None].to(device=Y.device, dtype=Y.dtype)
         return Y
 
     def _diagnostics(

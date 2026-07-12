@@ -8,7 +8,11 @@ from lsso.mathdx_backend import (
     mathdx_load_error,
     solve_spd,
     stats_solve_spd,
+    try_masked_stats_solve_spd,
+    try_prepare_basis,
+    try_rank_rotary,
 )
+from lsso.modules_v2 import apply_rank_rotary
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -56,3 +60,104 @@ def test_mathdx_fused_stats_solve_matches_torch(
 
     assert torch.count_nonzero(info).item() == 0
     torch.testing.assert_close(actual, expected, rtol=3e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rank", [16, 32])
+def test_mathdx_masked_stats_skips_padding_and_matches_torch(
+    dtype: torch.dtype, rank: int
+) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+
+    torch.manual_seed(7)
+    B, H, N, dh = 3, 4, 129, 48
+    u = (0.2 * torch.randn(B, H, N, rank, device="cuda")).to(dtype)
+    c = torch.randn(B, H, N, dh, device="cuda").to(dtype)
+    lengths = torch.tensor([129, 67, 13], device="cuda")
+    mask = torch.arange(N, device="cuda")[None] < lengths[:, None]
+    scale = torch.sqrt(129.0 / lengths.float())
+    alpha = (0.05 * torch.rand(B * H, device="cuda")).float()
+
+    actual = try_masked_stats_solve_spd(u, c, mask, scale, alpha)
+    assert actual is not None
+    masked_u = u.float() * mask[:, None, :, None] * scale[:, None, None, None]
+    masked_c = c.float() * mask[:, None, :, None]
+    u_bh = masked_u.flatten(0, 1)
+    c_bh = masked_c.flatten(0, 1)
+    gram = u_bh.transpose(1, 2) @ u_bh
+    rhs = u_bh.transpose(1, 2) @ c_bh
+    system = torch.eye(rank, device="cuda") + alpha[:, None, None] * gram
+    expected = torch.linalg.solve(system, rhs)
+
+    tolerance = 5e-4 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mathdx_rank_rotary_matches_torch_and_backward(dtype: torch.dtype) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+
+    torch.manual_seed(2)
+    u = torch.randn(3, 4, 65, 32, device="cuda", dtype=dtype, requires_grad=True)
+    half = u.shape[-1] // 2
+    inv_freq = 10000.0 ** (
+        -torch.arange(half, device="cuda", dtype=torch.float32) / half
+    )
+    angles = torch.arange(u.shape[2], device="cuda", dtype=torch.float32)[:, None] * inv_freq
+    cos = angles.cos().to(dtype).contiguous()
+    sin = angles.sin().to(dtype).contiguous()
+
+    actual = try_rank_rotary(u, cos, sin)
+    assert actual is not None
+    expected = apply_rank_rotary(u)
+    tolerance = 1e-6 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+    probe = torch.randn_like(actual)
+    actual_grad = torch.autograd.grad((actual * probe).sum(), u, retain_graph=True)[0]
+    expected_grad = torch.autograd.grad((expected * probe).sum(), u)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rotary", [False, True])
+def test_mathdx_fused_basis_preparation_matches_torch(rotary: bool) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+
+    torch.manual_seed(5)
+    u = torch.randn(
+        3, 4, 65, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    eps = 1e-5
+    length_scale = (1.0 / u.shape[2]) ** 0.5
+    normalized = u * torch.rsqrt(torch.mean(u * u, dim=-1, keepdim=True) + eps)
+    expected = normalized * length_scale
+    cos = sin = None
+    if rotary:
+        expected = apply_rank_rotary(expected)
+        half = u.shape[-1] // 2
+        inv_freq = 10000.0 ** (
+            -torch.arange(half, device="cuda", dtype=torch.float32) / half
+        )
+        angles = (
+            torch.arange(u.shape[2], device="cuda", dtype=torch.float32)[:, None]
+            * inv_freq
+        )
+        cos = angles.cos().to(u.dtype).contiguous()
+        sin = angles.sin().to(u.dtype).contiguous()
+
+    actual = try_prepare_basis(
+        u, eps=eps, length_scale=length_scale, cos=cos, sin=sin
+    )
+    assert actual is not None
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    probe = torch.randn_like(actual)
+    actual_grad = torch.autograd.grad((actual * probe).sum(), u, retain_graph=True)[0]
+    expected_grad = torch.autograd.grad((expected * probe).sum(), u)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-2, atol=3e-2)

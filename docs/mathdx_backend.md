@@ -15,6 +15,19 @@ Grouped LSSO/RRLSSO for any relation-group count.
 - `lsso.modules` uses the autograd-aware `solve_spd` path automatically.
   Missing libraries, CPU execution, unsupported
   ranks, and non-FP32 solve tensors fall back to `torch.linalg.solve_ex`.
+- `RRLSSO` uses a fused CUDA rank-rotary kernel for fixed sequential positions.
+  Its custom backward applies the inverse rotation in one kernel. Explicit
+  `position_ids`, missing native libraries, and graph compilation retain the
+  exact PyTorch implementation as a fallback.
+- The standard unmasked encoder path fuses per-token RMS normalization,
+  effective-length scaling, and optional rank rotation into one CUDA pass.
+  Its backward fuses inverse rotation with the RMS-normalization gradient.
+- Woodbury readout scales the compact rank-space solution and uses a GEMM
+  epilogue to write `Y` directly, avoiding an output-sized `U @ K` temporary.
+- CUDA BF16/FP16 Woodbury statistics use `bmm` with direct FP32 output inside
+  the custom LSSO path. This removes reduced-precision statistic writes and
+  follow-up conversion kernels. General autograd and higher-order derivative
+  paths retain the ordinary differentiable `bmm` implementation.
 
 The fully fused one-CTA path is selected conservatively for CV-sized token
 grids when `N <= 512`, systems (`B * G`) are at most 64, and RHS width is at
@@ -86,3 +99,27 @@ RHS 768 at batch sizes 128 and 64, so it has no valid speed ratio. Treat these
 as local development measurements and re-run
 `benchmarks/benchmark_mathdx_backend.py` on the target GPU before reporting
 hardware claims.
+
+## RTX 5070 Ti rotary optimization signal
+
+For the CIFAR ViT token shape `B=128, N=65, D=768, H=12, r=32`, the combined
+rotary, basis-preparation, and readout work reduced eager per-layer RRLSSO
+forward-plus-backward from about `4.06 ms` to `2.87 ms`; forward fell from
+about `1.45 ms` to `0.94 ms`. LSSO reached `2.86 ms` forward-plus-backward and
+`0.91 ms` forward. Per-layer peak allocation fell from about `251 MiB` to
+`233 MiB`.
+
+In a 12-layer ViT-B/4 forward-plus-backward measurement at batch 64, RRLSSO
+fell from `56.39 ms` to `46.77 ms`, with peak allocation falling from about
+`1.84 GiB` to `1.73 GiB`. The matched MHA measurement was `45.70 ms` and
+`1.86 GiB`. These are local optimization measurements, not cross-GPU claims.
+
+An attempted reuse of forward Cholesky factors in backward did not improve
+wall time and increased per-layer peak memory by roughly 66 MiB at this shape,
+so that path is deliberately not retained.
+
+A standalone fused split/transpose and merge/transpose CUDA path was also
+tested. It was about 1.5--2% slower than PyTorch's optimized contiguous
+transposes and did not lower peak memory, so it is not retained. Future layout
+work should place the transform inside a projection or readout GEMM epilogue
+rather than launch another memory-only kernel.

@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .mathdx_backend import solve_spd_autograd, try_stats_solve_spd
+from .mathdx_backend import (
+    solve_spd_autograd,
+    try_masked_stats_solve_spd,
+    try_prepare_basis,
+    try_stats_solve_spd,
+)
 
 
 @dataclass
@@ -97,12 +102,22 @@ def _bmm_accumulate(
 ) -> torch.Tensor:
     """Batched matmul for compact LSSO statistics.
 
-    The default keeps AMP inputs in their native dtype because this is the
-    fastest path on current CUDA kernels. Float64 is preserved for gradcheck and
-    high-precision reference use.
+    CUDA BF16/FP16 statistics are accumulated directly into FP32 output.  This
+    avoids first writing reduced-precision statistics and then launching
+    conversion kernels before the SPD solve. Float64 is preserved for
+    gradcheck and high-precision reference use.
     """
     if dtype == torch.float64:
         return torch.bmm(left.to(torch.float64), right.to(torch.float64))
+    if (
+        dtype == torch.float32
+        and left.is_cuda
+        and right.is_cuda
+        and left.dtype == right.dtype
+        and left.dtype in (torch.float16, torch.bfloat16)
+        and not torch.is_grad_enabled()
+    ):
+        return torch.bmm(left, right, out_dtype=torch.float32)
     if left.dtype == right.dtype:
         return torch.bmm(left, right)
     return torch.bmm(left.to(torch.float32), right.to(torch.float32))
@@ -260,8 +275,8 @@ def _lsso_woodbury_forward(
     K = try_stats_solve_spd(U_bh, C_bh, alpha_bh)
     if K is None:
         Ut_bh = U_bh.transpose(1, 2)
-        UtU = torch.bmm(Ut_bh, U_bh).view(B, H, r, r)
-        UtC = torch.bmm(Ut_bh, C_bh).view(B, H, r, dh)
+        UtU = _bmm_accumulate(Ut_bh, U_bh, dtype=solve_dtype).view(B, H, r, r)
+        UtC = _bmm_accumulate(Ut_bh, C_bh, dtype=solve_dtype).view(B, H, r, dh)
         if eye is None:
             eye = torch.eye(r, device=U.device, dtype=calc_dtype).view(1, 1, r, r)
         G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
@@ -269,10 +284,17 @@ def _lsso_woodbury_forward(
             G.view(B * H, r, r),
             UtC.to(solve_dtype).view(B * H, r, dh),
         ).to(calc_dtype)
-    UK = torch.bmm(U_bh, K).view(B, H, N, dh)
-    UK.mul_(gamma_over_mu2)
-    Y = C_calc.mul(inv_mu)
-    Y.sub_(UK)
+    # Scale the compact rank-space solution, then let the GEMM epilogue write
+    # directly into the output-sized tensor.  This avoids materializing UK and
+    # a separate local C / mu tensor at the same time.
+    alpha_bh = gamma_over_mu.expand(B, H, 1, 1).reshape(B * H, 1, 1)
+    if torch.is_grad_enabled():
+        K_readout = K * alpha_bh.to(K.dtype)
+    else:
+        K.mul_(alpha_bh.to(K.dtype))
+        K_readout = K
+    Y = torch.baddbmm(C_bh, U_bh, K_readout, beta=1.0, alpha=-1.0).view(B, H, N, dh)
+    Y.mul_(inv_mu)
     return Y.to(output_dtype)
 
 
@@ -466,7 +488,9 @@ class _LSSOAutograd(torch.autograd.Function):
         YtU = torch.bmm(Y_m.transpose(1, 2), U_m)
         PtU = torch.bmm(P_m.transpose(1, 2), U_m)
         grad_U_m = torch.bmm(P_m, YtU)
-        grad_U_m.add_(torch.bmm(Y_m, PtU))
+        # Accumulate the symmetric second term in the GEMM epilogue.  This
+        # avoids materializing another [B * H, N, r] tensor in backward.
+        grad_U_m.baddbmm_(Y_m, PtU)
         grad_U_m.mul_(gamma.expand(B, H, 1, 1).to(matmul_dtype).reshape(B * H, 1, 1))
         grad_U = grad_U_m.neg_().view(B, H, N, r).to(U.dtype)
 
@@ -491,6 +515,118 @@ class _LSSOAutograd(torch.autograd.Function):
             grad_gamma = grad_gamma_bh
 
         return grad_U, grad_C, grad_mu.to(mu.dtype), grad_gamma.to(gamma.dtype), None
+
+
+def _masked_length_scale(
+    valid_mask: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    length_normalize: bool,
+    length_reference: float,
+) -> torch.Tensor:
+    if length_reference <= 0:
+        raise ValueError(f"length_reference must be positive, got {length_reference}")
+    if not length_normalize:
+        return torch.ones(valid_mask.shape[0], device=valid_mask.device, dtype=dtype)
+    lengths = valid_mask.sum(dim=-1, dtype=dtype).clamp_min_(1.0)
+    return torch.sqrt(
+        torch.as_tensor(length_reference, device=valid_mask.device, dtype=dtype) / lengths
+    )
+
+
+def _lsso_masked_woodbury_forward(
+    U: torch.Tensor,
+    C: torch.Tensor,
+    mu: torch.Tensor,
+    gamma: torch.Tensor,
+    valid_mask: torch.Tensor,
+    length_scale: torch.Tensor,
+    eye: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Masked solve whose native path predicates padded U/C global loads."""
+    B, H, N, r = U.shape
+    dh = C.shape[-1]
+    inv_mu = mu.reciprocal()
+    alpha = gamma * inv_mu
+    alpha_bh = alpha.expand(B, H, 1, 1).reshape(B * H).float()
+    K = try_masked_stats_solve_spd(
+        U, C, valid_mask, length_scale.float(), alpha_bh
+    )
+    if K is None:
+        mask_u = valid_mask[:, None, :, None].to(dtype=U.dtype)
+        mask_c = mask_u.to(dtype=C.dtype)
+        U_scaled = U * mask_u * length_scale.to(U.dtype).view(B, 1, 1, 1)
+        C_masked = C * mask_c
+        return _lsso_woodbury_forward(U_scaled, C_masked, mu, gamma, eye)
+
+    U_bh = U.flatten(0, 1)
+    C_bh = C.flatten(0, 1)
+    # The compact solve used s*U. The readout therefore needs alpha*s*U*K.
+    readout_scale = (
+        alpha.expand(B, H, 1, 1).reshape(B * H, 1, 1)
+        * length_scale[:, None].expand(B, H).reshape(B * H, 1, 1)
+    )
+    K = K.to(U.dtype).mul_(readout_scale.to(U.dtype))
+    Y = torch.baddbmm(C_bh, U_bh, K, beta=1.0, alpha=-1.0)
+    Y = Y.view(B, H, N, dh).mul_(inv_mu)
+    return Y.mul_(valid_mask[:, None, :, None].to(Y.dtype))
+
+
+class _MaskedLSSOAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, U, C, mu, gamma, eye, valid_mask, length_scale):
+        Y = _lsso_masked_woodbury_forward(
+            U, C, mu, gamma, valid_mask, length_scale, eye
+        )
+        ctx.save_for_backward(U, Y, mu, gamma, valid_mask, length_scale)
+        return Y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        U, Y, mu, gamma, valid_mask, length_scale = ctx.saved_tensors
+        B, H, N, r = U.shape
+        mask = valid_mask[:, None, :, None]
+        grad = grad_output.mul(mask.to(grad_output.dtype)).contiguous()
+        P = _lsso_masked_woodbury_forward(
+            U, grad, mu, gamma, valid_mask, length_scale
+        )
+
+        calc_dtype = torch.float64 if U.dtype == torch.float64 else torch.float32
+        matmul_dtype = U.dtype if U.dtype in (torch.float16, torch.bfloat16) else calc_dtype
+        U_m = U.to(matmul_dtype).flatten(0, 1)
+        Y_m = Y.to(matmul_dtype).flatten(0, 1)
+        P_m = P.to(matmul_dtype).flatten(0, 1)
+        YtU = torch.bmm(Y_m.transpose(1, 2), U_m)
+        PtU = torch.bmm(P_m.transpose(1, 2), U_m)
+        grad_U_m = torch.bmm(P_m, YtU)
+        grad_U_m.baddbmm_(Y_m, PtU)
+        scale2 = length_scale.square()[:, None].expand(B, H).reshape(B * H, 1, 1)
+        coeff = gamma.expand(B, H, 1, 1).reshape(B * H, 1, 1) * scale2
+        grad_U = grad_U_m.mul_(coeff.to(matmul_dtype)).neg_().view(B, H, N, r)
+        grad_U.mul_(mask.to(grad_U.dtype))
+        grad_U = grad_U.to(U.dtype)
+        grad_C = P.to(grad_output.dtype)
+
+        grad_mu_bh = -(P * Y).sum(dim=(2, 3), dtype=calc_dtype).view(B, H, 1, 1)
+        grad_gamma_bh = -(PtU.to(calc_dtype) * YtU.to(calc_dtype)).sum(dim=(1, 2))
+        grad_gamma_bh = grad_gamma_bh.view(B, H)
+        grad_gamma_bh.mul_(scale2.view(B, H).to(calc_dtype))
+        grad_gamma_bh = grad_gamma_bh.view(B, H, 1, 1)
+        grad_mu = grad_mu_bh.sum(dim=0, keepdim=True) if mu.shape[0] == 1 else grad_mu_bh
+        grad_gamma = (
+            grad_gamma_bh.sum(dim=0, keepdim=True)
+            if gamma.shape[0] == 1
+            else grad_gamma_bh
+        )
+        return (
+            grad_U,
+            grad_C,
+            grad_mu.to(mu.dtype),
+            grad_gamma.to(gamma.dtype),
+            None,
+            None,
+            None,
+        )
 
 
 def lsso(
@@ -531,10 +667,36 @@ def lsso(
     B, H, N, r = U.shape
     dh = C.shape[-1]
 
+    if mu.dim() == 1:
+        mu = mu.view(1, H, 1, 1)
+    if gamma.dim() == 1:
+        gamma = gamma.view(1, H, 1, 1)
+
     if valid_mask is not None:
         if valid_mask.shape != (B, N):
             raise ValueError(
                 f"valid_mask must have shape {(B, N)}, got {tuple(valid_mask.shape)}"
+            )
+        valid_mask = valid_mask.to(device=U.device, dtype=torch.bool).contiguous()
+        # The normal masked path lets the CUDA statistics kernel inspect the
+        # mask before loading U/C. Keep the materialized fallback for aux/no-op
+        # diagnostic modes, whose outputs explicitly expose those tensors.
+        if not no_global and not return_aux:
+            scale_dtype = torch.float64 if U.dtype == torch.float64 else torch.float32
+            length_scale = _masked_length_scale(
+                valid_mask,
+                dtype=scale_dtype,
+                length_normalize=length_normalize,
+                length_reference=length_reference,
+            )
+            if torch.is_grad_enabled() and (
+                U.requires_grad or C.requires_grad or mu.requires_grad or gamma.requires_grad
+            ):
+                return _MaskedLSSOAutograd.apply(
+                    U, C, mu, gamma, eye, valid_mask, length_scale
+                )
+            return _lsso_masked_woodbury_forward(
+                U, C, mu, gamma, valid_mask, length_scale, eye
             )
         solve_mask = valid_mask[:, None, :, None].to(device=U.device, dtype=U.dtype)
         U = U * solve_mask
@@ -546,11 +708,6 @@ def lsso(
             valid_mask,
             reference_length=length_reference,
         )
-
-    if mu.dim() == 1:
-        mu = mu.view(1, H, 1, 1)
-    if gamma.dim() == 1:
-        gamma = gamma.view(1, H, 1, 1)
 
     inv_mu = mu.reciprocal()
     gamma_over_mu = gamma * inv_mu
@@ -598,15 +755,23 @@ def lsso(
             UtU = None
             K = K.to(U.dtype)
 
-        UK = torch.bmm(U_bh, K).view(B, H, N, dh)
         if return_aux:
+            UK = torch.bmm(U_bh, K).view(B, H, N, dh)
             local = inv_mu * C
             correction = gamma_over_mu2 * UK
             Y = local - correction
         else:
-            UK.mul_(gamma_over_mu2)
-            Y = C.mul(inv_mu)
-            Y.sub_(UK)
+            # Recompute the compact scaling rather than retaining the
+            # output-sized UK tensor through two pointwise kernels.
+            alpha_bh = gamma_over_mu.expand(B, H, 1, 1).reshape(B * H, 1, 1)
+            if torch.is_grad_enabled():
+                K_readout = K * alpha_bh.to(K.dtype)
+            else:
+                K.mul_(alpha_bh.to(K.dtype))
+                K_readout = K
+            Y = torch.baddbmm(C_bh, U_bh, K_readout, beta=1.0, alpha=-1.0)
+            Y = Y.view(B, H, N, dh)
+            Y.mul_(inv_mu)
 
     if return_aux:
         assert local is not None
@@ -684,24 +849,41 @@ class LSSO(nn.Module):
         r = self.rank
         head_mask = None
         if valid_mask is not None:
-            head_mask = valid_mask[:, None, :, None].to(dtype=x.dtype)
+            head_mask = valid_mask[:, None, :, None].to(
+                device=x.device,
+                dtype=x.dtype,
+            )
 
         UC = self.w_uc(x)
         U, C = UC.split((H * r, D), dim=-1)
-
         U = U.view(B, N, H, r).transpose(1, 2).contiguous()
-
         C = C.view(B, N, H, dh).transpose(1, 2).contiguous()
 
-        if self.normalize_u:
+        pruning_active = self.prune_rank_keep is not None and 0 < self.prune_rank_keep < r
+        fused_basis = False
+        if (
+            self.normalize_u
+            and self.length_normalize
+            and valid_mask is None
+            and not pruning_active
+        ):
+            prepared = try_prepare_basis(
+                U,
+                eps=self.eps,
+                length_scale=(self.length_reference / N) ** 0.5,
+            )
+            if prepared is not None:
+                U = prepared
+                fused_basis = True
+        if self.normalize_u and not fused_basis:
             U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + self.eps)
-        if head_mask is not None:
-            U = U * head_mask
-            C = C * head_mask
-
         solve_eye = self._eye
-        if self.prune_rank_keep is not None and 0 < self.prune_rank_keep < r:
+        if pruning_active:
             keep = int(self.prune_rank_keep)
+            if head_mask is not None:
+                # Rank selection must ignore padding.  The normal solve path
+                # applies the mask once inside lsso(), so avoid masking twice.
+                U = U * head_mask
             scores = U.float().square().mean(dim=-2)
             indices = scores.topk(k=keep, dim=-1, largest=True, sorted=False).indices
             U = U.gather(-1, indices[:, :, None, :].expand(B, H, N, keep))
@@ -723,7 +905,7 @@ class LSSO(nn.Module):
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
                 return_aux=True,
-                length_normalize=self.length_normalize,
+                length_normalize=self.length_normalize and not fused_basis,
                 length_reference=self.length_reference,
                 valid_mask=valid_mask,
             )
@@ -735,7 +917,7 @@ class LSSO(nn.Module):
                 gamma,
                 eye=solve_eye,
                 no_global=self.no_global or self.gamma_max == 0.0,
-                length_normalize=self.length_normalize,
+                length_normalize=self.length_normalize and not fused_basis,
                 length_reference=self.length_reference,
                 valid_mask=valid_mask,
             )
@@ -755,7 +937,7 @@ class LSSO(nn.Module):
         Y = Y.transpose(1, 2).contiguous().view(B, N, D)
         Y = self.w_o(Y)
         if valid_mask is not None:
-            Y = Y * valid_mask[:, :, None].to(dtype=Y.dtype)
+            Y = Y * valid_mask[:, :, None].to(device=Y.device, dtype=Y.dtype)
         return Y
 
     def _diagnostics(

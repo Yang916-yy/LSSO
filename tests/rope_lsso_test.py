@@ -55,6 +55,21 @@ def test_rrlsso_bidirectional_backward_and_diagnostics() -> None:
     assert torch.isfinite(layer.last_diagnostics.effective_rank).all()
 
 
+def test_rrlsso_inference_cache_can_transition_to_training() -> None:
+    torch.manual_seed(3)
+    x = torch.randn(2, 17, 64)
+    layer = RRLSSO(dim=64, num_heads=4, rank=16)
+
+    with torch.inference_mode():
+        inference_output = layer(x)
+    assert torch.isfinite(inference_output).all()
+
+    training_input = x.clone().requires_grad_(True)
+    layer(training_input).square().mean().backward()
+    assert training_input.grad is not None
+    assert torch.isfinite(training_input.grad).all()
+
+
 def test_solve_state_read_matches_bidirectional_rrlsso() -> None:
     torch.manual_seed(7)
     B, H, N, r, dh = 2, 2, 10, 8, 6
