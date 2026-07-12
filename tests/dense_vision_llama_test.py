@@ -30,6 +30,20 @@ def test_window_partition_round_trip_with_padding() -> None:
     torch.testing.assert_close(restored, x)
 
 
+def test_divisible_windows_skip_padding_mask() -> None:
+    x = torch.randn(2, 8 * 16, 32)
+    windows, mask, padded = partition_windows(x, (8, 16), 4)
+    assert mask is None and padded == (8, 16)
+    restored = unpartition_windows(
+        windows,
+        batch=2,
+        spatial_shape=(8, 16),
+        window_size=4,
+        padded_shape=padded,
+    )
+    torch.testing.assert_close(restored, x)
+
+
 @pytest.mark.parametrize("mixer", ["mha", "lsso", "rrlsso"])
 def test_dense_plain_mixers_non_square_forward_backward(mixer: str) -> None:
     model = DenseVisionLLaMA(
@@ -91,6 +105,26 @@ def test_dense_rejects_input_not_divisible_by_patch_size() -> None:
     )
     with pytest.raises(ValueError, match="must be divisible"):
         model(torch.randn(1, 3, 33, 40))
+
+
+def test_edge_window_mask_is_reused() -> None:
+    model = DenseVisionLLaMA(
+        image_size=32,
+        patch_size=8,
+        dim=32,
+        depth=1,
+        num_heads=2,
+        mixer="rrlsso",
+        rank=8,
+        window_size=3,
+        global_block_indices=(),
+    )
+    image = torch.randn(1, 3, 40, 56)
+    model(image)
+    cache = model.blocks[0]._dense_window_mask_cache
+    first_mask = next(iter(cache.values()))
+    model(image)
+    assert len(cache) == 1 and next(iter(cache.values())) is first_mask
 
 
 def test_simple_feature_pyramid_shapes_and_backward() -> None:

@@ -31,7 +31,7 @@ backbone = DenseVisionLLaMA(
     num_heads=12,
     mixer="rrlsso",
     rank=32,
-    window_size=14,
+    window_size=16,
     global_block_indices=(2, 5, 8, 11),
 )
 neck = SimpleFeaturePyramid(in_channels=768, out_channels=256)

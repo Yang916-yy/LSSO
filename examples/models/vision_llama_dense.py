@@ -31,7 +31,7 @@ class DenseVisionLLaMA(VisionLLaMA):
     def __init__(
         self,
         *,
-        window_size: int | None = 14,
+        window_size: int | None = 16,
         global_block_indices: Iterable[int] | None = None,
         out_indices: Iterable[int] | None = None,
         **kwargs,
