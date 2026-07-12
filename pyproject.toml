@@ -46,12 +46,14 @@ experiments = [
     "numpy",
     "tqdm",
     "torchvision",
+    "timm>=1.0.27,<1.1",
 ]
 all = [
     "matplotlib",
     "numpy",
     "tqdm",
     "torchvision",
+    "timm>=1.0.27,<1.1",
 ]
 
 [tool.setuptools.packages.find]

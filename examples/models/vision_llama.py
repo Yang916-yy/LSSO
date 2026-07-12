@@ -111,8 +111,10 @@ class VisionLLaMA(nn.Module):
         self,
         *,
         image_size: int | tuple[int, int] = 224,
+        img_size: int | tuple[int, int] | None = None,
         patch_size: int = 16,
         in_channels: int = 3,
+        in_chans: int | None = None,
         num_classes: int = 1000,
         dim: int = 384,
         depth: int = 12,
@@ -122,13 +124,25 @@ class VisionLLaMA(nn.Module):
         drop_path_rate: float = 0.05,
         layer_scale_init: float = 1e-4,
         learned_position: bool = True,
+        global_pool: str = "token",
+        drop_rate: float = 0.0,
         **mixer_kwargs,
     ) -> None:
         super().__init__()
+        if img_size is not None:
+            image_size = img_size
+        if in_chans is not None:
+            in_channels = in_chans
+        if global_pool not in ("", "token"):
+            raise ValueError("VisionLLaMA supports token pooling only")
+        if drop_rate:
+            raise ValueError("non-zero drop_rate is not implemented for VisionLLaMA")
         image_size = (image_size, image_size) if isinstance(image_size, int) else image_size
         self.image_size = image_size
         self.patch_size = patch_size
         self.dim = dim
+        self.num_features = dim
+        self.num_classes = num_classes
         self.mixer_name = mixer
         self.patch_embed = nn.Conv2d(
             in_channels, dim, kernel_size=patch_size, stride=patch_size
@@ -193,6 +207,22 @@ class VisionLLaMA(nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         return self.head(self.forward_features(image))
 
+    def get_classifier(self) -> nn.Module:
+        return self.head
+
+    def reset_classifier(self, num_classes: int, global_pool: str | None = None) -> None:
+        if global_pool not in (None, "", "token"):
+            raise ValueError("VisionLLaMA supports token pooling only")
+        self.num_classes = int(num_classes)
+        self.head = nn.Linear(self.dim, num_classes) if num_classes > 0 else nn.Identity()
+
+    @torch.jit.ignore
+    def no_weight_decay(self) -> set[str]:
+        names = {"cls_token"}
+        if self.pos_embed is not None:
+            names.add("pos_embed")
+        return names
+
 
 def create_vision_llama(
     scale: str = "small", *, mixer: str = "mha", rank: int = 32, **kwargs
@@ -215,6 +245,16 @@ def load_official_vision_llama_checkpoint(
     if not isinstance(checkpoint, dict):
         checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=True)
     state = checkpoint.get("model", checkpoint)
+    converted = convert_official_vision_llama_state_dict(model, state)
+    incompatible = model.load_state_dict(converted, strict=False)
+    return incompatible.missing_keys, incompatible.unexpected_keys
+
+
+def convert_official_vision_llama_state_dict(
+    model: VisionLLaMA,
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Convert an upstream key layout without mutating or loading the model."""
     converted: dict[str, torch.Tensor] = {}
     for key, value in state.items():
         key = key.removeprefix("module.")
@@ -231,5 +271,4 @@ def load_official_vision_llama_checkpoint(
                 continue
             key = key.replace(".attn.proj.", ".mixer.mixer.proj.")
         converted[key] = value
-    incompatible = model.load_state_dict(converted, strict=False)
-    return incompatible.missing_keys, incompatible.unexpected_keys
+    return converted
