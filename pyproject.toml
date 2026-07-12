@@ -47,6 +47,8 @@ experiments = [
     "tqdm",
     "torchvision",
     "timm>=1.0.27,<1.1",
+    "webdataset>=1.0.2,<1.1",
+    "huggingface-hub>=0.30",
 ]
 all = [
     "matplotlib",
@@ -54,6 +56,8 @@ all = [
     "tqdm",
     "torchvision",
     "timm>=1.0.27,<1.1",
+    "webdataset>=1.0.2,<1.1",
+    "huggingface-hub>=0.30",
 ]
 
 [tool.setuptools.packages.find]

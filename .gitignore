@@ -28,6 +28,9 @@ runs/
 runs_archive/
 release_assets/
 notebooks/
+!notebooks/
+notebooks/*
+!notebooks/imagenet1k_wds_formal_training.ipynb
 scripts/
 train_*.py
 cache_tiny_latents.py
