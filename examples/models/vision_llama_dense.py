@@ -115,15 +115,14 @@ def create_dense_vision_llama(
         config = VISION_LLAMA_CONFIGS[scale]
     except KeyError as exc:
         raise ValueError(f"unknown scale {scale!r}; choose {tuple(VISION_LLAMA_CONFIGS)}") from exc
-    return DenseVisionLLaMA(
+    model_config = dict(
         dim=config.dim,
         depth=config.depth,
         num_heads=config.num_heads,
         drop_path_rate=config.drop_path_rate,
-        mixer=mixer,
-        rank=rank,
-        **kwargs,
     )
+    model_config.update(kwargs)
+    return DenseVisionLLaMA(mixer=mixer, rank=rank, **model_config)
 
 
 def load_dense_vision_llama_checkpoint(
