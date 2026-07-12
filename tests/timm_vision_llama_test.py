@@ -15,12 +15,37 @@ REGISTERED_MODELS = (
     "vision_llama_base_mha",
     "vision_llama_base_lsso_r32",
     "vision_llama_base_rrlsso_r32",
+    "vision_llama_large_mha",
+    "vision_llama_large_lsso_r32",
+    "vision_llama_large_rrlsso_r32",
 )
 
 
 def test_all_plain_vision_llama_models_are_registered() -> None:
     available = set(timm.list_models("vision_llama_*"))
     assert set(REGISTERED_MODELS) <= available
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "vision_llama_large_mha",
+        "vision_llama_large_lsso_r32",
+        "vision_llama_large_rrlsso_r32",
+    ],
+)
+def test_large_registered_factories_build_with_compact_overrides(name: str) -> None:
+    model = timm.create_model(
+        name,
+        img_size=32,
+        patch_size=4,
+        num_classes=5,
+        dim=64,
+        depth=1,
+        num_heads=4,
+    )
+    assert isinstance(model, VisionLLaMA)
+    assert model(torch.randn(1, 3, 32, 32)).shape == (1, 5)
 
 
 @pytest.mark.parametrize(

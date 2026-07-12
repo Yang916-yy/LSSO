@@ -37,6 +37,9 @@ default_cfgs = generate_default_cfgs(
         "vision_llama_base_mha.in1k": _cfg(),
         "vision_llama_base_lsso_r32.in1k": _cfg(),
         "vision_llama_base_rrlsso_r32.in1k": _cfg(),
+        "vision_llama_large_mha.in1k": _cfg(),
+        "vision_llama_large_lsso_r32.in1k": _cfg(),
+        "vision_llama_large_rrlsso_r32.in1k": _cfg(),
     }
 )
 
@@ -69,6 +72,7 @@ def _create_vision_llama(
     configs = {
         "small": dict(dim=384, depth=12, num_heads=6, drop_path_rate=0.05),
         "base": dict(dim=768, depth=12, num_heads=12, drop_path_rate=0.20),
+        "large": dict(dim=1024, depth=24, num_heads=16, drop_path_rate=0.45),
     }
     model_kwargs = {**configs[scale], "mixer": mixer, "rank": rank, **kwargs}
     return build_model_with_cfg(
@@ -125,4 +129,28 @@ def vision_llama_base_rrlsso_r32(pretrained: bool = False, **kwargs: Any) -> Vis
     return _create_vision_llama(
         "vision_llama_base_rrlsso_r32", pretrained=pretrained,
         scale="base", mixer="rrlsso", rank=32, **kwargs,
+    )
+
+
+@register_model
+def vision_llama_large_mha(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
+    return _create_vision_llama(
+        "vision_llama_large_mha", pretrained=pretrained,
+        scale="large", mixer="mha", **kwargs,
+    )
+
+
+@register_model
+def vision_llama_large_lsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
+    return _create_vision_llama(
+        "vision_llama_large_lsso_r32", pretrained=pretrained,
+        scale="large", mixer="lsso", rank=32, **kwargs,
+    )
+
+
+@register_model
+def vision_llama_large_rrlsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
+    return _create_vision_llama(
+        "vision_llama_large_rrlsso_r32", pretrained=pretrained,
+        scale="large", mixer="rrlsso", rank=32, **kwargs,
     )
