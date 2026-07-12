@@ -39,6 +39,7 @@ VAL_SHARDS = 64
 def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
     count = TRAIN_SHARDS if split == "train" else VAL_SHARDS
     prefix = "train" if split == "train" else "validation"
+    digits = 4 if split == "train" else 2
     helper = ROOT / "tools" / "hf_wds_stream.py"
     return [
         "pipe:"
@@ -50,7 +51,7 @@ def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
                 "--repo",
                 repo,
                 "--filename",
-                f"imagenet1k-{prefix}-{index:04d}.tar",
+                f"imagenet1k-{prefix}-{index:0{digits}d}.tar",
                 "--cache-dir",
                 str(cache_dir),
             )
@@ -81,11 +82,16 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
+    train_commands = shard_commands("train", Path(args.cache_dir), args.hf_repo)
+    val_commands = shard_commands("validation", Path(args.cache_dir), args.hf_repo)
+    if args.shard_limit:
+        train_commands = train_commands[:args.shard_limit]
+        val_commands = val_commands[:args.shard_limit]
     train = (
         wds.WebDataset(
-            shard_commands("train", Path(args.cache_dir), args.hf_repo),
+            train_commands,
             resampled=False,
-            shardshuffle=100,
+            shardshuffle=min(100, len(train_commands)) if len(train_commands) > 1 else False,
             seed=args.seed,
         )
         .shuffle(args.shuffle_buffer)
@@ -96,7 +102,7 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     )
     validation = (
         wds.WebDataset(
-            shard_commands("validation", Path(args.cache_dir), args.hf_repo),
+            val_commands,
             shardshuffle=False,
         )
         .decode("pil")
@@ -303,6 +309,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--shuffle-buffer", type=int, default=10000)
+    parser.add_argument("--shard-limit", type=int, default=0, help="Limit each split for smoke tests")
     parser.add_argument("--steps-per-epoch", type=int, default=0)
     parser.add_argument("--max-val-steps", type=int, default=0)
     parser.add_argument(

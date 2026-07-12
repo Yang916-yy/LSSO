@@ -5,6 +5,7 @@ import timm
 import torch
 
 import examples.models  # noqa: F401 - imports registration side effects
+from experiments.imagenet_wds_train import shard_commands
 from examples.models.vision_llama import VisionLLaMA
 
 
@@ -72,6 +73,28 @@ def test_timm_classifier_reset_and_no_weight_decay() -> None:
     model.reset_classifier(3)
     assert model.get_classifier().out_features == 3
     assert model.no_weight_decay() == {"cls_token", "pos_embed"}
+
+
+def test_registered_rank_can_be_passed_explicitly() -> None:
+    model = timm.create_model(
+        "vision_llama_small_rrlsso_r32",
+        rank=32,
+        img_size=32,
+        patch_size=4,
+        dim=64,
+        depth=1,
+        num_heads=4,
+    )
+    assert isinstance(model, VisionLLaMA)
+
+
+def test_imagenet_shard_names_match_repository_layout(tmp_path) -> None:
+    train = shard_commands("train", tmp_path, "timm/imagenet-1k-wds")
+    validation = shard_commands("validation", tmp_path, "timm/imagenet-1k-wds")
+    assert "imagenet1k-train-0000.tar" in train[0]
+    assert "imagenet1k-train-1023.tar" in train[-1]
+    assert "imagenet1k-validation-00.tar" in validation[0]
+    assert "imagenet1k-validation-63.tar" in validation[-1]
 
 
 def test_pretrained_requires_explicit_checkpoint() -> None:

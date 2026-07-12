@@ -96,7 +96,7 @@ def vision_llama_small_mha(pretrained: bool = False, **kwargs: Any) -> VisionLLa
 def vision_llama_small_lsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
     return _create_vision_llama(
         "vision_llama_small_lsso_r32", pretrained=pretrained,
-        scale="small", mixer="lsso", rank=32, **kwargs,
+        scale="small", mixer="lsso", rank=kwargs.pop("rank", 32), **kwargs,
     )
 
 
@@ -104,7 +104,7 @@ def vision_llama_small_lsso_r32(pretrained: bool = False, **kwargs: Any) -> Visi
 def vision_llama_small_rrlsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
     return _create_vision_llama(
         "vision_llama_small_rrlsso_r32", pretrained=pretrained,
-        scale="small", mixer="rrlsso", rank=32, **kwargs,
+        scale="small", mixer="rrlsso", rank=kwargs.pop("rank", 32), **kwargs,
     )
 
 
@@ -120,7 +120,7 @@ def vision_llama_base_mha(pretrained: bool = False, **kwargs: Any) -> VisionLLaM
 def vision_llama_base_lsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
     return _create_vision_llama(
         "vision_llama_base_lsso_r32", pretrained=pretrained,
-        scale="base", mixer="lsso", rank=32, **kwargs,
+        scale="base", mixer="lsso", rank=kwargs.pop("rank", 32), **kwargs,
     )
 
 
@@ -128,7 +128,7 @@ def vision_llama_base_lsso_r32(pretrained: bool = False, **kwargs: Any) -> Visio
 def vision_llama_base_rrlsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
     return _create_vision_llama(
         "vision_llama_base_rrlsso_r32", pretrained=pretrained,
-        scale="base", mixer="rrlsso", rank=32, **kwargs,
+        scale="base", mixer="rrlsso", rank=kwargs.pop("rank", 32), **kwargs,
     )
 
 
@@ -144,7 +144,7 @@ def vision_llama_large_mha(pretrained: bool = False, **kwargs: Any) -> VisionLLa
 def vision_llama_large_lsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
     return _create_vision_llama(
         "vision_llama_large_lsso_r32", pretrained=pretrained,
-        scale="large", mixer="lsso", rank=32, **kwargs,
+        scale="large", mixer="lsso", rank=kwargs.pop("rank", 32), **kwargs,
     )
 
 
@@ -152,5 +152,5 @@ def vision_llama_large_lsso_r32(pretrained: bool = False, **kwargs: Any) -> Visi
 def vision_llama_large_rrlsso_r32(pretrained: bool = False, **kwargs: Any) -> VisionLLaMA:
     return _create_vision_llama(
         "vision_llama_large_rrlsso_r32", pretrained=pretrained,
-        scale="large", mixer="rrlsso", rank=32, **kwargs,
+        scale="large", mixer="rrlsso", rank=kwargs.pop("rank", 32), **kwargs,
     )
