@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import tarfile
 import time
 from pathlib import Path
+import sys
 
 import torch
 import torch.nn as nn
@@ -13,7 +15,12 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.models.vision_transformer import VisionTransformer
 
-from lsso import GroupedRRLSSO, RRLSSO
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from examples.models import create_vision_llama
+from lsso import GroupedRRLSSO, LSSO, RRLSSO
 
 
 class RRLSSOSelfAttention(nn.Module):
@@ -107,6 +114,7 @@ def replace_vit_attention_with_rrlsso(
 def build_model(
     kind: str,
     *,
+    backbone: str = "torchvision-vit-b",
     num_classes: int,
     rank: int,
     image_size: int,
@@ -117,6 +125,24 @@ def build_model(
     length_normalize: bool = True,
     length_reference: float = 1.0,
 ) -> nn.Module:
+    if backbone in {"vision-llama-s", "vision-llama-b"}:
+        if kind not in {"mha", "lsso", "rrlsso"}:
+            raise ValueError(f"VisionLLaMA does not support model kind {kind!r}")
+        return create_vision_llama(
+            "small" if backbone == "vision-llama-s" else "base",
+            mixer=kind,
+            rank=rank,
+            image_size=image_size,
+            patch_size=patch_size,
+            num_classes=num_classes,
+            learned_position=True,
+            gamma_max=gamma_max,
+            theta_gamma_init=theta_gamma_init,
+            length_normalize=length_normalize,
+            length_reference=length_reference,
+        )
+    if backbone != "torchvision-vit-b":
+        raise ValueError(f"unknown backbone {backbone!r}")
     model = VisionTransformer(
         image_size=image_size,
         patch_size=patch_size,
@@ -158,27 +184,83 @@ def build_model(
 
 
 def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
-    mean = (0.5071, 0.4867, 0.4408)
-    std = (0.2675, 0.2565, 0.2761)
-    train_tf = transforms.Compose(
-        [
-            transforms.RandomCrop(args.image_size, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandAugment(num_ops=2, magnitude=9),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-            transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0.0),
-        ]
-    )
-    test_tf = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ]
-    )
     root = Path(args.data_dir)
-    train_set = datasets.CIFAR100(root=root, train=True, transform=train_tf, download=True)
-    test_set = datasets.CIFAR100(root=root, train=False, transform=test_tf, download=True)
+    if args.dataset == "cifar100":
+        dataset_dir = root / "cifar-100-python"
+        if not dataset_dir.is_dir() and args.data_archive:
+            archive = Path(args.data_archive)
+            if not archive.is_file():
+                raise FileNotFoundError(f"CIFAR-100 archive not found: {archive}")
+            root.mkdir(parents=True, exist_ok=True)
+            print(f"extracting_cifar100 archive={archive} destination={root}", flush=True)
+            with tarfile.open(archive, mode="r:gz") as handle:
+                handle.extractall(root, filter="data")
+        mean = (0.5071, 0.4867, 0.4408)
+        std = (0.2675, 0.2565, 0.2761)
+        train_tf = transforms.Compose(
+            [
+                transforms.RandomCrop(args.image_size, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandAugment(num_ops=2, magnitude=9),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0.0),
+            ]
+        )
+        test_tf = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+        train_set = datasets.CIFAR100(root=root, train=True, transform=train_tf, download=False)
+        test_set = datasets.CIFAR100(
+            root=root, train=False, transform=test_tf, download=False
+        )
+    elif args.dataset == "food101":
+        dataset_dir = root / "food-101"
+        if not dataset_dir.is_dir():
+            archive = Path(args.data_archive) if args.data_archive else None
+            if archive is None or not archive.is_file():
+                raise FileNotFoundError(
+                    "Food-101 is missing. Pass --data-archive /path/to/food-101.tar.gz "
+                    "or extract the archive under --data-dir."
+                )
+            root.mkdir(parents=True, exist_ok=True)
+            print(f"extracting_food101 archive={archive} destination={root}", flush=True)
+            with tarfile.open(archive, mode="r:gz") as handle:
+                handle.extractall(root, filter="data")
+        # ImageNet normalization and one identical strong, image-scale-aware
+        # recipe for both MHA and RRLSSO.
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        train_tf = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(
+                    args.image_size, scale=(0.6, 1.0), ratio=(0.75, 4.0 / 3.0)
+                ),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandAugment(num_ops=2, magnitude=9),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+                transforms.RandomErasing(
+                    p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0.0
+                ),
+            ]
+        )
+        resize_size = int(round(args.image_size / 0.875))
+        test_tf = transforms.Compose(
+            [
+                transforms.Resize(resize_size),
+                transforms.CenterCrop(args.image_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+        train_set = datasets.Food101(root=root, split="train", transform=train_tf)
+        test_set = datasets.Food101(root=root, split="test", transform=test_tf)
+    else:
+        raise ValueError(f"unknown dataset {args.dataset!r}")
     train_generator = torch.Generator()
     train_generator.manual_seed(args.seed)
     train_loader = DataLoader(
@@ -220,7 +302,7 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> tuple[int, int]:
 def global_strength_stats(model: nn.Module) -> tuple[float, float, float]:
     ratios: list[torch.Tensor] = []
     for module in model.modules():
-        if isinstance(module, (RRLSSO, GroupedRRLSSO)):
+        if isinstance(module, (LSSO, RRLSSO, GroupedRRLSSO)):
             mu = F.softplus(module.theta_mu.float()) + module.eps
             gamma = module.gamma_max * torch.sigmoid(module.theta_gamma.float())
             ratios.append((gamma / mu).flatten())
@@ -270,9 +352,11 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
         if args.length_reference > 0
         else (args.image_size // args.patch_size) ** 2 + 1
     )
+    num_classes = 101 if args.dataset == "food101" else 100
     model = build_model(
         kind,
-        num_classes=100,
+        backbone=args.backbone,
+        num_classes=num_classes,
         rank=args.rank,
         image_size=args.image_size,
         patch_size=args.patch_size,
@@ -285,7 +369,8 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
     model.train()
     n_params = sum(p.numel() for p in model.parameters())
     print(
-        f"model={kind} params={n_params:,} device={device} dtype={dtype} "
+        f"dataset={args.dataset} backbone={args.backbone} model={kind} "
+        f"params={n_params:,} device={device} dtype={dtype} "
         f"length_normalize={args.length_normalize} "
         f"length_reference={resolved_length_reference}"
     )
@@ -296,8 +381,9 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
-    total_steps = args.epochs * len(train_loader)
-    warmup_steps = max(1, int(args.warmup_epochs * len(train_loader)))
+    updates_per_epoch = (len(train_loader) + args.grad_accum_steps - 1) // args.grad_accum_steps
+    total_steps = args.epochs * updates_per_epoch
+    warmup_steps = max(1, int(args.warmup_epochs * updates_per_epoch))
     out_dir = Path(args.out_dir) / kind
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "config.json").open("w", encoding="utf-8") as f:
@@ -326,7 +412,19 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
         "gamma_over_mu_min",
         "gamma_over_mu_max",
     ]
-    if args.save_checkpoints:
+    resume_path = out_dir / "last.pt"
+    start_epoch = 0
+    global_step = 0
+    best_val_acc = -1.0
+    if args.auto_resume and resume_path.is_file():
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_epoch = int(checkpoint["epoch"])
+        global_step = int(checkpoint.get("global_step", start_epoch * updates_per_epoch))
+        best_val_acc = float(checkpoint.get("metrics", {}).get("val_acc", -1.0))
+        print(f"resumed model={kind} checkpoint={resume_path} epoch={start_epoch}", flush=True)
+    elif args.save_checkpoints:
         torch.save(
             {
                 "kind": kind,
@@ -338,39 +436,51 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
             out_dir / "init.pt",
         )
 
-    global_step = 0
-    best_val_acc = -1.0
-    with metrics_path.open("w", newline="", encoding="utf-8") as f:
+    metrics_mode = "a" if start_epoch > 0 and metrics_path.is_file() else "w"
+    with metrics_path.open(metrics_mode, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for epoch in range(args.epochs):
+        if metrics_mode == "w":
+            writer.writeheader()
+        for epoch in range(start_epoch, args.epochs):
             start = time.time()
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
             loss_sum = 0.0
             correct = 0
             total = 0
+            optimizer.zero_grad(set_to_none=True)
+            micro_steps = min(
+                len(train_loader),
+                args.max_train_steps_per_epoch or len(train_loader),
+            )
             for step, (images, labels) in enumerate(train_loader):
                 if args.max_train_steps_per_epoch and step >= args.max_train_steps_per_epoch:
                     break
-                lr = cosine_lr(global_step, total_steps=total_steps, base_lr=args.lr, warmup_steps=warmup_steps, min_lr=args.min_lr)
-                for group in optimizer.param_groups:
-                    group["lr"] = lr
+                if step % args.grad_accum_steps == 0:
+                    lr = cosine_lr(global_step, total_steps=total_steps, base_lr=args.lr, warmup_steps=warmup_steps, min_lr=args.min_lr)
+                    for group in optimizer.param_groups:
+                        group["lr"] = lr
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda" and dtype != torch.float32)):
                     logits = model(images)
                     loss = F.cross_entropy(logits, labels, label_smoothing=args.label_smoothing)
-                loss.backward()
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+                (loss / args.grad_accum_steps).backward()
+                do_update = (
+                    (step + 1) % args.grad_accum_steps == 0
+                    or step + 1 == micro_steps
+                )
+                if do_update:
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
                 c, n = accuracy(logits, labels)
                 correct += c
                 total += n
                 loss_sum += float(loss.detach().cpu()) * n
-                global_step += 1
             val_loss, val_acc = evaluate(
                 model,
                 test_loader,
@@ -402,6 +512,7 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
                     "epoch": epoch + 1,
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
+                    "global_step": global_step,
                     "args": vars(args),
                     "params": n_params,
                     "metrics": row,
@@ -413,17 +524,29 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Official torchvision ViT-B/4 MHA vs bidirectional RRLSSO on CIFAR-100.")
+    parser = argparse.ArgumentParser(description="Controlled ViT/VisionLLaMA mixer comparison.")
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=["mha", "rrlsso", "grouped-rrlsso"],
+        choices=["mha", "lsso", "rrlsso", "grouped-rrlsso"],
         default=["mha", "rrlsso"],
     )
+    parser.add_argument("--dataset", choices=["cifar100", "food101"], default="cifar100")
+    parser.add_argument(
+        "--backbone",
+        choices=["torchvision-vit-b", "vision-llama-s", "vision-llama-b"],
+        default="torchvision-vit-b",
+    )
     parser.add_argument("--data-dir", default="data/torchvision")
+    parser.add_argument(
+        "--data-archive",
+        default="",
+        help="Optional CIFAR-100 or Food-101 tar.gz archive extracted under --data-dir.",
+    )
     parser.add_argument("--out-dir", default="runs/cv_vit_b4_cifar100_rrlsso")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--image-size", type=int, default=32)
     parser.add_argument("--patch-size", type=int, default=4)
@@ -457,12 +580,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-steps-per-epoch", type=int, default=0)
     parser.add_argument("--max-eval-steps-per-epoch", type=int, default=0)
     parser.add_argument("--save-checkpoints", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cpu", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.grad_accum_steps < 1:
+        raise ValueError("--grad-accum-steps must be at least 1")
     for kind in args.models:
         train_one(args, kind)
 

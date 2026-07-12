@@ -38,6 +38,42 @@ def map_stats(x: torch.Tensor) -> dict[str, float]:
     }
 
 
+def signed_mixer_stats(mix: torch.Tensor) -> dict[str, float]:
+    """Summarize signed token influence without conflating excitation/inhibition."""
+
+    mix = mix.detach().float()
+    positive = mix.clamp_min(0.0)
+    negative = (-mix.clamp_max(0.0))
+    magnitude = positive + negative
+    signed_mean = mix.mean(dim=(0, 1))
+    magnitude_mean = magnitude.mean(dim=(0, 1))
+    N = mix.shape[-1]
+    offdiag = ~torch.eye(N, device=mix.device, dtype=torch.bool)
+    diagonal_magnitude = mix.diagonal(dim1=-2, dim2=-1).abs().sum()
+    return {
+        "positive_l1": float(positive.sum().cpu()),
+        "negative_l1": float(negative.sum().cpu()),
+        "negative_l1_frac": float(
+            (negative.sum() / magnitude.sum().clamp_min(1e-12)).cpu()
+        ),
+        "negative_entry_frac": float((mix < 0).float().mean().cpu()),
+        "offdiag_negative_entry_frac": float(
+            (mix[..., offdiag] < 0).float().mean().cpu()
+        ),
+        "diagonal_l1_frac": float(
+            (diagonal_magnitude / magnitude.sum().clamp_min(1e-12)).cpu()
+        ),
+        "sign_cancellation_ratio": float(
+            (
+                signed_mean.abs().sum()
+                / magnitude_mean.sum().clamp_min(1e-12)
+            ).cpu()
+        ),
+        "signed_row_sum_mean": float(mix.sum(dim=-1).mean().cpu()),
+        "signed_row_sum_std": float(mix.sum(dim=-1).std().cpu()),
+    }
+
+
 def load_checkpoint_model(
     ckpt_path: Path,
     *,
@@ -132,17 +168,25 @@ def encoder_layer_input(model: nn.Module, images: torch.Tensor, layer: int) -> t
 
 
 @torch.no_grad()
-def mixer_matrix(
+def mixer_maps(
     model: nn.Module,
     images: torch.Tensor,
     *,
     kind: str,
     layer: int,
-) -> torch.Tensor:
+) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     block, x = encoder_layer_input(model, images, layer)
     if kind == "mha":
         _out, weights = block.self_attention(x, x, x, need_weights=True, average_attn_weights=False)
-        return weights.detach().float().mean(dim=(0, 1))
+        mix = weights.detach().float()
+        maps = {
+            "signed": mix.mean(dim=(0, 1)),
+            "magnitude": mix.abs().mean(dim=(0, 1)),
+            "negative_fraction": (mix < 0).float().mean(dim=(0, 1)),
+            "relation_signed": mix.mean(dim=(0, 1)),
+            "relation_magnitude": mix.abs().mean(dim=(0, 1)),
+        }
+        return maps, signed_mixer_stats(mix)
 
     rr = block.self_attention.lsso
     B, N, D = x.shape
@@ -154,6 +198,8 @@ def mixer_matrix(
     if rr.normalize_u:
         U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + rr.eps)
     U = apply_rank_rotary(U, None, base=rr.rope_base, scale=rr.rope_scale)
+    if rr.length_normalize:
+        U = U * (rr.length_reference / N) ** 0.5
 
     calc = torch.float32
     U = U.to(calc)
@@ -168,8 +214,91 @@ def mixer_matrix(
     G = eye_r + (gamma / mu) * UtU
     solved_ut = torch.linalg.solve_ex(G.reshape(B * H, r, r), U.transpose(-1, -2).reshape(B * H, r, N), check_errors=False)[0]
     solved_ut = solved_ut.view(B, H, r, N)
-    mix = eye_n / mu - (gamma / (mu * mu)) * (U @ solved_ut)
-    return mix.detach().float().abs().mean(dim=(0, 1))
+    relation = -(gamma / (mu * mu)) * (U @ solved_ut)
+    mix = eye_n / mu + relation
+    mix = mix.detach().float()
+    relation = relation.detach().float()
+    maps = {
+        "signed": mix.mean(dim=(0, 1)),
+        "magnitude": mix.abs().mean(dim=(0, 1)),
+        "negative_fraction": (mix < 0).float().mean(dim=(0, 1)),
+        "relation_signed": relation.mean(dim=(0, 1)),
+        "relation_magnitude": relation.abs().mean(dim=(0, 1)),
+    }
+    stats = signed_mixer_stats(mix)
+    stats.update(
+        {
+            f"relation_{key}": value
+            for key, value in signed_mixer_stats(relation).items()
+        }
+    )
+    return maps, stats
+
+
+def save_signed_heatmap_grid(
+    items: dict[tuple[str, str], torch.Tensor],
+    *,
+    out_path: Path,
+    title: str,
+) -> None:
+    """Render signed matrices with one symmetric scale shared by every panel."""
+
+    kinds = list(dict.fromkeys(k for k, _stage in items))
+    stages = list(dict.fromkeys(stage for _kind, stage in items))
+    vmax = max(float(value.detach().abs().max().cpu()) for value in items.values())
+    vmax = max(vmax, 1e-12)
+    fig, axes = plt.subplots(
+        len(kinds),
+        len(stages),
+        figsize=(4 * len(stages), 3.6 * len(kinds)),
+        squeeze=False,
+    )
+    im = None
+    for row, kind in enumerate(kinds):
+        for col, stage in enumerate(stages):
+            ax = axes[row][col]
+            data = items[(kind, stage)].detach().float().cpu()
+            im = ax.imshow(data, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+            ax.set_title(f"{kind} {stage}")
+            ax.set_xticks([])
+            ax.set_yticks([])
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.026, pad=0.035)
+    fig.suptitle(title)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_fraction_heatmap_grid(
+    items: dict[tuple[str, str], torch.Tensor],
+    *,
+    out_path: Path,
+    title: str,
+) -> None:
+    """Render frequencies on a fixed 0..1 scale shared across panels."""
+
+    kinds = list(dict.fromkeys(k for k, _stage in items))
+    stages = list(dict.fromkeys(stage for _kind, stage in items))
+    fig, axes = plt.subplots(
+        len(kinds),
+        len(stages),
+        figsize=(4 * len(stages), 3.6 * len(kinds)),
+        squeeze=False,
+    )
+    im = None
+    for row, kind in enumerate(kinds):
+        for col, stage in enumerate(stages):
+            ax = axes[row][col]
+            data = items[(kind, stage)].detach().float().cpu()
+            im = ax.imshow(data, cmap="coolwarm", vmin=0.0, vmax=1.0)
+            ax.set_title(f"{kind} {stage}")
+            ax.set_xticks([])
+            ax.set_yticks([])
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.026, pad=0.035)
+    fig.suptitle(title)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def save_heatmap_grid(items: dict[tuple[str, str], torch.Tensor], *, out_path: Path, title: str, cmap: str) -> None:
@@ -271,7 +400,13 @@ def main() -> None:
     mixer_images = mixer_images[: min(args.batch_size, args.max_samples)].to(device)
 
     erf_items: dict[tuple[str, str], torch.Tensor] = {}
-    mixer_items: dict[tuple[str, str], torch.Tensor] = {}
+    mixer_items: dict[str, dict[tuple[str, str], torch.Tensor]] = {
+        "signed": {},
+        "magnitude": {},
+        "negative_fraction": {},
+        "relation_signed": {},
+        "relation_magnitude": {},
+    }
     stats: dict[str, dict[str, float]] = {}
     for kind in args.models:
         for stage in args.stages:
@@ -287,21 +422,21 @@ def main() -> None:
                 device=device,
             )
             erf = input_erf(model, test_loader, device=device, max_samples=args.max_samples, target=args.target)
-            mix = mixer_matrix(model, mixer_images, kind=kind, layer=args.layer)
+            mix_maps, mix_stats = mixer_maps(
+                model, mixer_images, kind=kind, layer=args.layer
+            )
             erf_items[(kind, stage)] = erf
-            mixer_items[(kind, stage)] = mix
+            for map_name, values in mix_maps.items():
+                mixer_items[map_name][(kind, stage)] = values
             key = f"{kind}_{stage}"
             stats[f"{key}_erf"] = map_stats(erf)
-            stats[f"{key}_mixer_abs"] = {
-                **map_stats(mix),
-                "diag_frac": float(mix.diag().sum() / mix.sum().clamp_min(1e-12)),
-                "cls_row_top10_frac": float(
-                    (mix[0].abs() / mix[0].abs().sum().clamp_min(1e-12))
-                    .topk(max(1, int(0.1 * mix.shape[-1])))
-                    .values.sum()
-                ),
-            }
-            print(key, stats[f"{key}_erf"], stats[f"{key}_mixer_abs"], flush=True)
+            stats[f"{key}_mixer_signed"] = mix_stats
+            print(
+                key,
+                stats[f"{key}_erf"],
+                stats[f"{key}_mixer_signed"],
+                flush=True,
+            )
 
     save_heatmap_grid(
         erf_items,
@@ -315,11 +450,26 @@ def main() -> None:
         model_order=args.models,
         stage_order=args.stages,
     )
+    save_signed_heatmap_grid(
+        mixer_items["signed"],
+        out_path=out_dir / f"mixer_layer{args.layer}_signed.png",
+        title=f"Layer {args.layer} signed total mixer",
+    )
+    save_signed_heatmap_grid(
+        mixer_items["relation_signed"],
+        out_path=out_dir / f"mixer_layer{args.layer}_relation_signed.png",
+        title=f"Layer {args.layer} signed relational component",
+    )
     save_heatmap_grid(
-        mixer_items,
-        out_path=out_dir / f"mixer_layer{args.layer}_abs.png",
-        title=f"Layer {args.layer} mixer absolute influence",
+        mixer_items["magnitude"],
+        out_path=out_dir / f"mixer_layer{args.layer}_magnitude_normalized.png",
+        title=f"Layer {args.layer} normalized influence magnitude (secondary)",
         cmap="viridis",
+    )
+    save_fraction_heatmap_grid(
+        mixer_items["negative_fraction"],
+        out_path=out_dir / f"mixer_layer{args.layer}_negative_fraction.png",
+        title=f"Layer {args.layer} fraction of negative influence across samples and heads",
     )
     with (out_dir / "stats.json").open("w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, sort_keys=True)
