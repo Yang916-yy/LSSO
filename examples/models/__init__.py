@@ -8,6 +8,12 @@ from .vision_llama import (
     load_official_vision_llama_checkpoint,
 )
 from .vision_llama_pyramid import PyramidVisionLLaMA, create_pyramid_vision_llama
+from .vision_llama_dense import (
+    DenseVisionLLaMA,
+    create_dense_vision_llama,
+    load_dense_vision_llama_checkpoint,
+)
+from .simple_feature_pyramid import SimpleFeaturePyramid
 
 __all__ = [
     "VisionLLaMA",
@@ -16,6 +22,10 @@ __all__ = [
     "load_official_vision_llama_checkpoint",
     "PyramidVisionLLaMA",
     "create_pyramid_vision_llama",
+    "DenseVisionLLaMA",
+    "create_dense_vision_llama",
+    "load_dense_vision_llama_checkpoint",
+    "SimpleFeaturePyramid",
 ]
 
 # Registration is optional for library users but automatic when timm is
