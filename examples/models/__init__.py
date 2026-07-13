@@ -14,6 +14,7 @@ from .vision_llama_dense import (
     load_dense_vision_llama_checkpoint,
 )
 from .simple_feature_pyramid import SimpleFeaturePyramid
+from .sequence_encoder import ProteinFitnessModel, SequenceMixerEncoder
 
 __all__ = [
     "VisionLLaMA",
@@ -26,6 +27,8 @@ __all__ = [
     "create_dense_vision_llama",
     "load_dense_vision_llama_checkpoint",
     "SimpleFeaturePyramid",
+    "SequenceMixerEncoder",
+    "ProteinFitnessModel",
 ]
 
 # Registration is optional for library users but automatic when timm is

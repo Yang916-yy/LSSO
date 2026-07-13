@@ -55,6 +55,12 @@ openmmlab = [
     "mmdet>=3.3,<4",
     "mmsegmentation>=1.2,<2",
 ]
+auxiliary = [
+    "datasets>=3,<5",
+    "transformers>=4.48,<6",
+    "scipy>=1.11,<2",
+    "sentencepiece>=0.2,<1",
+]
 all = [
     "matplotlib",
     "numpy",
@@ -66,6 +72,10 @@ all = [
     "mmengine>=0.10,<1",
     "mmdet>=3.3,<4",
     "mmsegmentation>=1.2,<2",
+    "datasets>=3,<5",
+    "transformers>=4.48,<6",
+    "scipy>=1.11,<2",
+    "sentencepiece>=0.2,<1",
 ]
 
 [tool.setuptools.packages.find]
