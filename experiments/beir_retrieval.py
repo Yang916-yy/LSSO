@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
 import sys
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -29,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mixer", choices=("mha", "lsso", "rrlsso"), default="rrlsso")
     p.add_argument("--tokenizer", default="google-t5/t5-base")
     p.add_argument("--output", default="runs/auxiliary/beir-scifact-rrlsso-r32")
+    p.add_argument("--cache-dir", default="data/auxiliary_cache")
     p.add_argument("--dim", type=int, default=384)
     p.add_argument("--depth", type=int, default=8)
     p.add_argument("--heads", type=int, default=6)
@@ -106,56 +110,128 @@ def split_train_validation(qrels, seed: int, validation_fraction: float = 0.1):
     return train, validation
 
 
-def tokenize_batch(tokenizer, texts, max_length: int):
-    return tokenizer(
-        list(texts), padding=True, truncation=True, max_length=max_length,
-        return_tensors="pt",
+def token_cache_key(name: str, tokenizer, max_length: int, texts) -> str:
+    identity = f"{name}|{tokenizer.name_or_path}|{max_length}|{len(texts)}"
+    return hashlib.sha1(identity.encode()).hexdigest()[:16]
+
+
+def tokenize_cached(name: str, tokenizer, texts, max_length: int, cache_dir: Path):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{token_cache_key(name, tokenizer, max_length, texts)}.pt"
+    if path.exists():
+        return torch.load(path, map_location="cpu", weights_only=False)
+    encoded = tokenizer(
+        list(texts), padding=False, truncation=True, max_length=max_length,
+        add_special_tokens=True,
+    )["input_ids"]
+    tokens = [torch.tensor(row, dtype=torch.int32) for row in encoded]
+    temporary = path.with_suffix(".pt.tmp")
+    torch.save(tokens, temporary)
+    os.replace(temporary, path)
+    return tokens
+
+
+def pad_token_sequences(rows, pad_token_id: int):
+    ids = pad_sequence(
+        [row.long() for row in rows], batch_first=True, padding_value=pad_token_id
+    )
+    return ids, ids.ne(pad_token_id)
+
+
+class TokenizedPairDataset(Dataset):
+    def __init__(self, queries, documents) -> None:
+        if len(queries) != len(documents):
+            raise ValueError("query/document token counts must match")
+        self.queries, self.documents = queries, documents
+
+    def __len__(self):
+        return len(self.queries)
+
+    def __getitem__(self, index):
+        return self.queries[index], self.documents[index]
+
+
+def collate_token_pairs(rows, pad_token_id: int):
+    queries, documents = zip(*rows)
+    return (
+        *pad_token_sequences(queries, pad_token_id),
+        *pad_token_sequences(documents, pad_token_id),
     )
 
 
 @torch.inference_mode()
-def encode_texts(model, tokenizer, texts, max_length, batch_size, device):
+def encode_tokens(model, tokens, pad_token_id, batch_size, device):
     model.eval()
     outputs = []
-    for start in range(0, len(texts), batch_size):
-        batch = tokenize_batch(tokenizer, texts[start:start + batch_size], max_length)
+    for start in range(0, len(tokens), batch_size):
+        ids, mask = pad_token_sequences(tokens[start:start + batch_size], pad_token_id)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             vectors = model.encode_normalized(
-                batch["input_ids"].to(device), batch["attention_mask"].to(device)
+                ids.to(device, non_blocking=True), mask.to(device, non_blocking=True)
             )
         outputs.append(vectors.float().cpu())
     return torch.cat(outputs) if outputs else torch.empty(0, model.projection.out_features)
 
 
 @torch.inference_mode()
-def evaluate(model, tokenizer, corpus, queries, qrels, args, device):
+def chunked_topk(query_vectors, document_vectors, *, k: int, device: torch.device,
+                 query_chunk: int = 128, document_chunk: int = 8192):
+    if not len(document_vectors):
+        raise ValueError("cannot retrieve from an empty corpus")
+    k = min(k, len(document_vectors))
+    all_indices = []
+    if device.type == "cuda":
+        document_vectors = document_vectors.pin_memory()
+    for query_start in range(0, len(query_vectors), query_chunk):
+        query = query_vectors[query_start:query_start + query_chunk].to(
+            device, non_blocking=True
+        )
+        best_scores = torch.full((len(query), k), -torch.inf, device=device)
+        best_indices = torch.full((len(query), k), -1, dtype=torch.long, device=device)
+        for document_start in range(0, len(document_vectors), document_chunk):
+            document = document_vectors[
+                document_start:document_start + document_chunk
+            ].to(device, non_blocking=True)
+            local_scores, local_indices = (query @ document.T).topk(
+                min(k, len(document)), dim=1
+            )
+            local_indices += document_start
+            scores = torch.cat((best_scores, local_scores), dim=1)
+            indices = torch.cat((best_indices, local_indices), dim=1)
+            best_scores, selected = scores.topk(k, dim=1)
+            best_indices = indices.gather(1, selected)
+        all_indices.append(best_indices.cpu())
+    return torch.cat(all_indices)
+
+
+@torch.inference_mode()
+def evaluate(model, corpus, queries, corpus_tokens, query_tokens, qrels, args, device):
     query_ids = [qid for qid in qrels if qid in queries and qrels[qid]]
     if args.max_eval_queries:
         query_ids = query_ids[: args.max_eval_queries]
     positive_ids = {docid for qid in query_ids for docid in qrels[qid] if docid in corpus}
     doc_ids = list(corpus)
     if args.max_corpus_docs:
-        chosen = list(positive_ids)
+        chosen = sorted(positive_ids)
         chosen.extend(docid for docid in doc_ids if docid not in positive_ids)
         doc_ids = chosen[: max(args.max_corpus_docs, len(positive_ids))]
     doc_index = {docid: index for index, docid in enumerate(doc_ids)}
     query_ids = [qid for qid in query_ids if any(d in doc_index for d in qrels[qid])]
-    q = encode_texts(
-        model, tokenizer, [queries[x] for x in query_ids], args.max_query_length,
+    q = encode_tokens(
+        model, [query_tokens[x] for x in query_ids], args.pad_token_id,
         args.eval_batch_size, device,
     )
-    d = encode_texts(
-        model, tokenizer, [corpus[x] for x in doc_ids], args.max_doc_length,
+    d = encode_tokens(
+        model, [corpus_tokens[x] for x in doc_ids], args.pad_token_id,
         args.eval_batch_size, device,
     )
     recalls = {1: 0.0, 5: 0.0, 10: 0.0, 100: 0.0}
     mrr10 = ndcg10 = 0.0
+    top = chunked_topk(q, d, k=100, device=device)
     for start in range(0, len(query_ids), 128):
-        scores = q[start:start + 128] @ d.T
-        top = scores.topk(k=min(100, len(doc_ids)), dim=1).indices
         for row, qid in enumerate(query_ids[start:start + 128]):
             positives = {doc_index[x] for x in qrels[qid] if x in doc_index}
-            ranked = top[row].tolist()
+            ranked = top[start + row].tolist()
             for k in recalls:
                 recalls[k] += float(any(index in positives for index in ranked[:k]))
             hits = [rank + 1 for rank, index in enumerate(ranked[:10]) if index in positives]
@@ -179,24 +255,55 @@ def atomic_save(state: dict, path: Path) -> None:
 def main() -> None:
     args = parse_args()
     seed_all(args.seed)
+    torch.set_float32_matmul_precision("high")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    args.pad_token_id = tokenizer.pad_token_id
     corpus, queries, train_rows, test_rows = load_beir(args.dataset)
     all_train_qrels, test_qrels = qrels_map(train_rows), qrels_map(test_rows)
     train_qrels, validation_qrels = split_train_validation(all_train_qrels, args.seed)
     pairs = make_pairs(corpus, queries, train_qrels, args.max_train_pairs, args.seed)
+    cache_dir = Path(args.cache_dir)
+    corpus_ids = list(corpus)
+    query_ids = list(queries)
+    corpus_token_rows = tokenize_cached(
+        f"beir-{args.dataset}-corpus", tokenizer, [corpus[x] for x in corpus_ids],
+        args.max_doc_length, cache_dir,
+    )
+    query_token_rows = tokenize_cached(
+        f"beir-{args.dataset}-queries", tokenizer, [queries[x] for x in query_ids],
+        args.max_query_length, cache_dir,
+    )
+    corpus_tokens = dict(zip(corpus_ids, corpus_token_rows))
+    query_tokens = dict(zip(query_ids, query_token_rows))
+    pair_query_tokens = tokenize_cached(
+        f"beir-{args.dataset}-train-q-s{args.seed}-n{len(pairs)}", tokenizer,
+        [query for query, _ in pairs], args.max_query_length, cache_dir,
+    )
+    pair_document_tokens = tokenize_cached(
+        f"beir-{args.dataset}-train-d-s{args.seed}-n{len(pairs)}", tokenizer,
+        [document for _, document in pairs], args.max_doc_length, cache_dir,
+    )
     model = SequenceMixerEncoder(
         len(tokenizer), max_length=max(args.max_query_length, args.max_doc_length),
         pad_token_id=tokenizer.pad_token_id, dim=args.dim, depth=args.depth,
         num_heads=args.heads, mixer=args.mixer, rank=args.rank,
         projection_dim=args.projection_dim,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loader = DataLoader(pairs, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        fused=device.type == "cuda",
+    )
+    loader = DataLoader(
+        TokenizedPairDataset(pair_query_tokens, pair_document_tokens),
+        batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
+        pin_memory=device.type == "cuda", persistent_workers=args.workers > 0,
+        collate_fn=partial(collate_token_pairs, pad_token_id=tokenizer.pad_token_id),
+    )
     total_steps = max(1, len(loader) * args.epochs)
     warmup = int(total_steps * args.warmup_ratio)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -217,13 +324,17 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         model.train()
         loss_sum = 0.0
-        for query_text, doc_text in loader:
-            query = tokenize_batch(tokenizer, query_text, args.max_query_length)
-            doc = tokenize_batch(tokenizer, doc_text, args.max_doc_length)
+        for query_ids_batch, query_mask, doc_ids_batch, doc_mask in loader:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                q = model.encode_normalized(query["input_ids"].to(device), query["attention_mask"].to(device))
-                d = model.encode_normalized(doc["input_ids"].to(device), doc["attention_mask"].to(device))
+                q = model.encode_normalized(
+                    query_ids_batch.to(device, non_blocking=True),
+                    query_mask.to(device, non_blocking=True),
+                )
+                d = model.encode_normalized(
+                    doc_ids_batch.to(device, non_blocking=True),
+                    doc_mask.to(device, non_blocking=True),
+                )
                 logits = q @ d.T / args.temperature
                 labels = torch.arange(logits.shape[0], device=device)
                 loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
@@ -232,7 +343,10 @@ def main() -> None:
             optimizer.step()
             scheduler.step()
             loss_sum += loss.item()
-        metrics = evaluate(model, tokenizer, corpus, queries, validation_qrels, args, device)
+        metrics = evaluate(
+            model, corpus, queries, corpus_tokens, query_tokens,
+            validation_qrels, args, device,
+        )
         metrics.update(epoch=epoch, train_loss=loss_sum / max(1, len(loader)))
         print(json.dumps(metrics, sort_keys=True), flush=True)
         with (output / "metrics.jsonl").open("a") as stream:
@@ -247,7 +361,9 @@ def main() -> None:
             atomic_save(state, output / "best.pt")
     best_state = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best_state["model"])
-    test = evaluate(model, tokenizer, corpus, queries, test_qrels, args, device)
+    test = evaluate(
+        model, corpus, queries, corpus_tokens, query_tokens, test_qrels, args, device
+    )
     (output / "test_metrics.json").write_text(json.dumps(test, indent=2, sort_keys=True))
     print(json.dumps({"test": test}, sort_keys=True))
 

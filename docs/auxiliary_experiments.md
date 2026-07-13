@@ -28,6 +28,10 @@ python experiments/beir_retrieval.py \
   --output runs/auxiliary/beir-scifact-rrlsso-r32
 ```
 
+Tokenization is cached once under `data/auxiliary_cache/`. Evaluation encodes
+the corpus in batches and performs exact top-100 retrieval with a bounded GPU
+score matrix, so it never materializes the full query-by-corpus matrix.
+
 Run the formal grid over `nfcorpus`, `fiqa`, and `scifact`, mixers
 `mha`, `lsso`, and `rrlsso`, and the same seeds. The default tokenizer is the
 T5 SentencePiece vocabulary; no T5/BERT encoder weights or block structure
@@ -40,6 +44,8 @@ its provided train/validation/test split, a character-level amino-acid
 tokenizer, and a scalar regression head. Targets are standardized using only
 the training split. Model selection uses validation Spearman correlation;
 the test split is evaluated once from `best.pt`.
+Protein strings are encoded once at startup. A length-bucket sampler applies
+dynamic per-batch padding so the masked mixers do not read padded tokens.
 
 ```bash
 python experiments/flip_aav.py \
@@ -70,6 +76,10 @@ python experiments/flip_aav.py --dim 32 --depth 1 --heads 4 --rank 8 \
 
 Every run writes `config.json`, `metrics.jsonl`, atomic `last.pt` and
 `best.pt`, and final `test_metrics.json`.
+
+On CUDA, both entries enable BF16 autocast, fused AdamW, pinned DataLoader
+memory, persistent workers, and non-blocking host-to-device copies. These are
+disabled automatically on CPU.
 
 Run the complete matrix sequentially on one GPU and aggregate completed runs:
 
