@@ -101,8 +101,8 @@ python experiments/msmarco_pretrain.py \
   --output runs/auxiliary/msmarco-base-rrlsso-r32
 ```
 
-The local scaling launcher holds both the micro-batch (16) and effective
-batch (96) fixed for all sizes. Keeping the micro-batch fixed is essential:
+The local RTX 5070 Ti scaling launcher holds both the micro-batch and
+effective batch at 96 for all sizes. Keeping the micro-batch fixed is essential:
 gradient accumulation does not enlarge an in-batch contrastive negative pool.
 
 ```bash

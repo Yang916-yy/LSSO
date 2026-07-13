@@ -9,9 +9,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCALES = {
-    "small": dict(dim=256, depth=6, heads=4, batch=16, accum=6),
-    "base": dict(dim=384, depth=8, heads=6, batch=16, accum=6),
-    "large": dict(dim=512, depth=12, heads=8, batch=16, accum=6),
+    "small": dict(dim=256, depth=6, heads=4, batch=96, accum=1),
+    "base": dict(dim=384, depth=8, heads=6, batch=96, accum=1),
+    "large": dict(dim=512, depth=12, heads=8, batch=96, accum=1),
 }
 
 
