@@ -87,3 +87,33 @@ Run the complete matrix sequentially on one GPU and aggregate completed runs:
 python experiments/run_auxiliary_grid.py --task all --seeds 0 1 2
 python experiments/summarize_auxiliary.py
 ```
+
+## MS MARCO scaling pretraining
+
+MS MARCO hard-negative triplets can be streamed without unpacking the full
+corpus. Each query is contrasted against its positive, its mined hard
+negative, and the other passages in the effective batch.
+
+```bash
+python experiments/msmarco_pretrain.py \
+  --mixer rrlsso --dim 384 --depth 8 --heads 6 --rank 32 \
+  --batch-size 16 --grad-accum 6 --max-steps 10000 \
+  --output runs/auxiliary/msmarco-base-rrlsso-r32
+```
+
+The local scaling launcher holds both the micro-batch (16) and effective
+batch (96) fixed for all sizes. Keeping the micro-batch fixed is essential:
+gradient accumulation does not enlarge an in-batch contrastive negative pool.
+
+```bash
+python experiments/run_msmarco_scaling.py \
+  --scales small base large --mixer rrlsso --max-steps 1000
+```
+
+Transfer a resulting checkpoint into BEIR with matching model dimensions:
+
+```bash
+python experiments/beir_retrieval.py --dataset scifact \
+  --dim 384 --depth 8 --heads 6 --mixer rrlsso --rank 32 \
+  --init-checkpoint runs/auxiliary/msmarco-base-rrlsso-r32/last.pt
+```

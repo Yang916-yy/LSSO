@@ -52,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-eval-queries", type=int, default=0)
     p.add_argument("--max-corpus-docs", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--init-checkpoint", default=None)
+    p.add_argument("--eval-only", action="store_true")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
 
@@ -294,6 +296,21 @@ def main() -> None:
         num_heads=args.heads, mixer=args.mixer, rank=args.rank,
         projection_dim=args.projection_dim,
     ).to(device)
+    if args.init_checkpoint:
+        state = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(state.get("model", state))
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "config.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True))
+    if args.eval_only:
+        test = evaluate(
+            model, corpus, queries, corpus_tokens, query_tokens, test_qrels, args, device
+        )
+        (output / "test_metrics.json").write_text(
+            json.dumps(test, indent=2, sort_keys=True)
+        )
+        print(json.dumps({"test": test}, sort_keys=True))
+        return
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
         fused=device.type == "cuda",
@@ -310,9 +327,6 @@ def main() -> None:
         optimizer, lambda step: min((step + 1) / max(1, warmup),
                                     max(0.0, (total_steps - step) / max(1, total_steps - warmup)))
     )
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "config.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True))
     start_epoch, best = 0, -1.0
     last = output / "last.pt"
     if args.resume and last.exists():
