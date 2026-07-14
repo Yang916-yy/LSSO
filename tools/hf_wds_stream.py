@@ -9,13 +9,10 @@ import errno
 import fcntl
 import os
 import random
-import re
 import shutil
 import sys
 import tarfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
@@ -86,71 +83,55 @@ def validate_tar(path: Path, *, expected_bytes: int | None = None) -> None:
 
 
 def _download_validated(
-    url: str,
+    repo: str,
+    filename: str,
     token: str,
-    partial: Path,
+    cache_dir: Path,
     *,
     attempts: int = 0,
-) -> None:
+) -> Path:
+    """Download through the official Hub/Xet client and validate the tar.
+
+    ``local_dir`` is intentional: unlike the versioned Hub cache, it places the
+    shard directly in our WebDataset cache and keeps only lightweight download
+    metadata below ``.cache/huggingface``.  Modern huggingface_hub releases use
+    hf_xet automatically, including its parallel range reconstruction and
+    resumable incomplete-file handling.
+    """
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub>=0.32 with hf_xet is required; install the "
+            "project's experiments dependencies"
+        ) from exc
+
     last_error: BaseException | None = None
-    content_range_pattern = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
     attempt = 0
     while True:
         attempt += 1
-        existing_bytes = partial.stat().st_size if partial.is_file() else 0
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept-Encoding": "identity",
-        }
-        if existing_bytes:
-            headers["Range"] = f"bytes={existing_bytes}-"
-        request = urllib.request.Request(
-            url, headers=headers
-        )
-        expected_bytes: int | None = None
+        downloaded: Path | None = None
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                status = getattr(response, "status", response.getcode())
-                content_length = response.headers.get("Content-Length")
-                content_range = response.headers.get("Content-Range")
-                append = False
-                if existing_bytes and status == 206 and content_range:
-                    match = content_range_pattern.fullmatch(content_range.strip())
-                    if not match or int(match.group(1)) != existing_bytes:
-                        partial.unlink(missing_ok=True)
-                        raise IOError(
-                            f"invalid resume response for {partial.name}: {content_range}"
-                        )
-                    append = True
-                    if match.group(3) != "*":
-                        expected_bytes = int(match.group(3))
-                elif content_length:
-                    # A server may ignore Range and return a complete 200 response.
-                    expected_bytes = int(content_length)
-                mode = "ab" if append else "wb"
-                with partial.open(mode) as sink:
-                    while chunk := response.read(1024 * 1024):
-                        sink.write(chunk)
-            validate_tar(partial, expected_bytes=expected_bytes)
-            return
-        except urllib.error.HTTPError as exc:
-            # A gated-repository 401 is a bad/expired token and 404 is a bad
-            # shard name. Hugging Face CDN redirects can return transient 403
-            # responses under load even after the authenticated resolve
-            # request succeeded, so 403 must refresh the signed URL and retry.
-            if exc.code in {401, 404}:
+            downloaded = Path(
+                hf_hub_download(
+                    repo_id=repo,
+                    filename=filename,
+                    repo_type="dataset",
+                    token=token,
+                    local_dir=cache_dir,
+                )
+            )
+            validate_tar(downloaded)
+            return downloaded
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            if status in {401, 404}:
                 raise IOError(
-                    f"non-retryable HTTP {exc.code} while downloading {url}"
+                    f"non-retryable HTTP {status} while downloading "
+                    f"{repo}/{filename}"
                 ) from exc
-            if exc.code == 416 and partial.is_file():
-                try:
-                    validate_tar(partial)
-                except OSError:
-                    partial.unlink(missing_ok=True)
-                else:
-                    return
-            last_error = exc
-        except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
             if isinstance(exc, OSError) and exc.errno in {
                 errno.EACCES,
                 errno.ENOSPC,
@@ -158,22 +139,21 @@ def _download_validated(
             }:
                 raise
             last_error = exc
-            if (
-                expected_bytes is not None
-                and partial.is_file()
-                and partial.stat().st_size >= expected_bytes
-            ):
-                # A full-size invalid archive is corruption, not a resumable truncation.
-                partial.unlink(missing_ok=True)
+            # If Hub metadata pointed at a complete but corrupt local file,
+            # remove it so the next attempt performs a fresh reconstruction.
+            # In-progress Xet state lives elsewhere and remains resumable.
+            if downloaded is not None:
+                downloaded.unlink(missing_ok=True)
         if attempts > 0 and attempt >= attempts:
             raise IOError(
-                f"failed to download a valid shard after {attempts} attempts: {url}; "
+                f"failed to download a valid shard after {attempts} attempts: "
+                f"{repo}/{filename}; "
                 f"last error: {type(last_error).__name__}: {last_error}"
             ) from last_error
         if attempt == 1 or attempt % 5 == 0:
             limit = "unbounded" if attempts <= 0 else str(attempts)
             print(
-                f"retrying {partial.name}: attempt {attempt + 1}/{limit}; "
+                f"retrying {filename}: attempt {attempt + 1}/{limit}; "
                 f"last error: {type(last_error).__name__}: {last_error}",
                 file=sys.stderr,
                 flush=True,
@@ -222,16 +202,24 @@ def stream_file(
         token = os.environ.get("HF_TOKEN")
         if not token:
             raise RuntimeError("HF_TOKEN is required for gated ImageNet shards")
-        url = f"https://huggingface.co/datasets/{repo}/resolve/main/{filename}"
-        partial = destination.with_suffix(destination.suffix + ".partial")
-        try:
-            with _download_slot(cache_dir, max_downloads):
-                _download_validated(url, token, partial, attempts=download_attempts)
-            partial.replace(destination)
-            verified_path.touch()
-        except BaseException:
-            # Keep a truncated partial so a restarted worker can continue it via Range.
-            raise
+        with _download_slot(cache_dir, max_downloads):
+            downloaded = _download_validated(
+                repo,
+                filename,
+                token,
+                cache_dir,
+                attempts=download_attempts,
+            )
+        if downloaded.resolve() != destination.resolve():
+            raise RuntimeError(
+                f"Hub local_dir returned {downloaded}, expected {destination}"
+            )
+        # Custom urllib versions used this sibling partial.  Xet maintains its
+        # own resumable state in local_dir/.cache/huggingface, so it is obsolete.
+        destination.with_suffix(destination.suffix + ".partial").unlink(
+            missing_ok=True
+        )
+        verified_path.touch()
         if emit:
             _emit_file(destination)
 
