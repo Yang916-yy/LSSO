@@ -41,8 +41,9 @@ def shard_commands(
     split: str,
     cache_dir: Path,
     repo: str,
-    max_downloads: int = 8,
+    max_downloads: int = 4,
     download_attempts: int = 0,
+    download_idle_timeout: float = 30.0,
 ) -> list[str]:
     count = TRAIN_SHARDS if split == "train" else VAL_SHARDS
     prefix = "train" if split == "train" else "validation"
@@ -65,6 +66,8 @@ def shard_commands(
                 str(max_downloads),
                 "--download-attempts",
                 str(download_attempts),
+                "--download-idle-timeout",
+                str(download_idle_timeout),
             )
         )
         for index in range(count)
@@ -95,11 +98,11 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     )
     train_commands = shard_commands(
         "train", Path(args.cache_dir), args.hf_repo,
-        args.max_downloads, args.download_attempts
+        args.max_downloads, args.download_attempts, args.download_idle_timeout
     )
     val_commands = shard_commands(
         "validation", Path(args.cache_dir), args.hf_repo,
-        args.max_downloads, args.download_attempts
+        args.max_downloads, args.download_attempts, args.download_idle_timeout
     )
     if args.shard_limit:
         train_commands = train_commands[:args.shard_limit]
@@ -346,7 +349,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-downloads",
         type=int,
-        default=8,
+        default=4,
         help="Maximum concurrent Hugging Face shard downloads across data workers.",
     )
     parser.add_argument(
@@ -354,6 +357,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Attempts per shard; 0 retries transient network errors indefinitely.",
+    )
+    parser.add_argument(
+        "--download-idle-timeout",
+        type=float,
+        default=30.0,
+        help="Restart a shard request after this many seconds without receiving bytes.",
     )
     parser.add_argument("--shard-limit", type=int, default=0, help="Limit each split for smoke tests")
     parser.add_argument("--steps-per-epoch", type=int, default=0)

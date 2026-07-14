@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -179,3 +181,27 @@ def test_download_retries_transient_forbidden_response(tmp_path, monkeypatch) ->
             attempts=2,
         )
     assert len(calls) == 2
+
+
+def test_download_restarts_a_connection_that_delivers_no_bytes(tmp_path, monkeypatch) -> None:
+    real_popen = subprocess.Popen
+
+    def popen(*args, **kwargs):
+        return real_popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdin=kwargs.get("stdin"),
+            stdout=kwargs.get("stdout"),
+            stderr=kwargs.get("stderr"),
+        )
+
+    monkeypatch.setattr("subprocess.Popen", popen)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    with pytest.raises(OSError, match="after 1 attempts"):
+        _stream_download(
+            "https://example.test/shard.tar",
+            "token",
+            tmp_path / "shard.tar.partial",
+            output=io.BytesIO(),
+            attempts=1,
+            idle_timeout=0.05,
+        )

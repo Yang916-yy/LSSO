@@ -9,6 +9,7 @@ import errno
 import fcntl
 import os
 import random
+import selectors
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-downloads",
         type=int,
-        default=int(os.environ.get("LSSO_HF_MAX_DOWNLOADS", "8")),
+        default=int(os.environ.get("LSSO_HF_MAX_DOWNLOADS", "4")),
         help="Maximum concurrent streaming shard requests across loader workers.",
     )
     parser.add_argument(
@@ -39,6 +40,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("LSSO_HF_DOWNLOAD_ATTEMPTS", "0")),
         help="Attempts per shard; 0 retries transient network errors indefinitely.",
+    )
+    parser.add_argument(
+        "--download-idle-timeout",
+        type=float,
+        default=float(os.environ.get("LSSO_HF_DOWNLOAD_IDLE_TIMEOUT", "30")),
+        help="Restart a shard request after this many seconds without receiving bytes.",
     )
     return parser.parse_args()
 
@@ -104,6 +111,7 @@ def _stream_download(
     *,
     output: BinaryIO | None,
     attempts: int = 0,
+    idle_timeout: float = 30.0,
 ) -> None:
     """Forward bytes immediately while persisting a resumable local copy."""
 
@@ -153,8 +161,10 @@ def _stream_download(
             )
             process.stdin.close()
             received = 0
+            stalled = False
             with partial.open("ab" if existing_bytes else "wb") as sink:
-                while chunk := process.stdout.read(1024 * 1024):
+                def forward(chunk: bytes) -> None:
+                    nonlocal emitted_bytes, received
                     if existing_bytes and emitted_bytes == 0:
                         # curl only produces a body after --continue-at has
                         # successfully negotiated the ranged response.
@@ -166,11 +176,39 @@ def _stream_download(
                         output.write(chunk)
                         output.flush()
                         emitted_bytes += len(chunk)
+
+                try:
+                    stdout_fd = process.stdout.fileno()
+                except (AttributeError, OSError, ValueError):
+                    # In-memory process doubles used by unit tests have no fd.
+                    while chunk := process.stdout.read(1024 * 1024):
+                        forward(chunk)
+                else:
+                    selector = selectors.DefaultSelector()
+                    try:
+                        selector.register(stdout_fd, selectors.EVENT_READ)
+                        while True:
+                            if not selector.select(timeout=idle_timeout):
+                                stalled = True
+                                process.terminate()
+                                break
+                            chunk = os.read(stdout_fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            forward(chunk)
+                    finally:
+                        selector.close()
             stderr = process.stderr.read().decode(errors="replace").strip()
             returncode = process.wait()
-            if returncode == 0:
+            if stalled:
+                last_error = TimeoutError(
+                    f"no shard bytes received for {idle_timeout:g} seconds"
+                )
+            elif returncode == 0:
                 validate_tar(partial)
                 return
+            else:
+                last_error = IOError(f"curl exit {returncode}: {stderr}")
             # A complete partial from a killed process needs no remote request.
             if received == 0 and partial.is_file():
                 try:
@@ -182,8 +220,9 @@ def _stream_download(
                         with partial.open("rb") as prefix:
                             _copy_to_output(prefix, output)
                     return
-            last_error = IOError(f"curl exit {returncode}: {stderr}")
-            if "error: 401" in stderr.lower() or "error: 404" in stderr.lower():
+            if not stalled and (
+                "error: 401" in stderr.lower() or "error: 404" in stderr.lower()
+            ):
                 raise NonRetryableDownloadError(
                     f"non-retryable download error: {stderr}"
                 )
@@ -240,8 +279,9 @@ def stream_file(
     cache_dir: Path,
     *,
     emit: bool = True,
-    max_downloads: int = 8,
+    max_downloads: int = 4,
     download_attempts: int = 0,
+    download_idle_timeout: float = 30.0,
     output: BinaryIO | None = None,
 ) -> None:
     destination = cache_dir / filename
@@ -276,6 +316,7 @@ def stream_file(
                 partial,
                 output=output,
                 attempts=download_attempts,
+                idle_timeout=download_idle_timeout,
             )
         partial.replace(destination)
         verified_path.touch()
@@ -291,6 +332,7 @@ def main() -> None:
             emit=not args.quiet,
             max_downloads=args.max_downloads,
             download_attempts=args.download_attempts,
+            download_idle_timeout=args.download_idle_timeout,
         )
     except BrokenPipeError:
         # Bounded smoke/eval consumers intentionally stop before shard EOF.
