@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import io
 import tarfile
-import urllib.error
-from email.message import Message
 
 import pytest
 
@@ -57,25 +55,21 @@ def _archive_bytes() -> bytes:
     return archive.getvalue()
 
 
-class Response(io.BytesIO):
-    def __init__(self, content: bytes, status: int, headers: dict[str, str]):
-        super().__init__(content)
-        self.status = status
-        self.headers = Message()
-        for key, value in headers.items():
-            self.headers[key] = value
+class FakeProcess:
+    def __init__(self, content: bytes, returncode: int = 0, error: str = ""):
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(content)
+        self.stderr = io.BytesIO(error.encode())
+        self.returncode = returncode
 
-    def getcode(self) -> int:
-        return self.status
+    def wait(self) -> int:
+        return self.returncode
 
 
 def test_download_forwards_bytes_while_writing_partial(tmp_path, monkeypatch) -> None:
     complete = _archive_bytes()
 
-    def urlopen(request, timeout):
-        return Response(complete, 200, {"Content-Length": str(len(complete))})
-
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: FakeProcess(complete))
     partial = tmp_path / "shard.tar.partial"
     output = io.BytesIO()
     _stream_download("https://example.test/shard.tar", "token", partial, output=output)
@@ -88,24 +82,17 @@ def test_download_emits_cached_prefix_then_resumes_range(tmp_path, monkeypatch) 
     cutoff = len(complete) // 2
     partial = tmp_path / "shard.tar.partial"
     partial.write_bytes(complete[:cutoff])
-    requests = []
+    commands = []
 
-    def urlopen(request, timeout):
-        requests.append(request)
-        assert request.get_header("Range") == f"bytes={cutoff}-"
-        return Response(
-            complete[cutoff:],
-            206,
-            {
-                "Content-Length": str(len(complete) - cutoff),
-                "Content-Range": f"bytes {cutoff}-{len(complete) - 1}/{len(complete)}",
-            },
-        )
+    def popen(command, **kwargs):
+        commands.append(command)
+        return FakeProcess(complete[cutoff:])
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("subprocess.Popen", popen)
     output = io.BytesIO()
     _stream_download("https://example.test/shard.tar", "token", partial, output=output)
-    assert len(requests) == 1
+    assert len(commands) == 1
+    assert commands[0][commands[0].index("--continue-at") + 1] == str(cutoff)
     assert output.getvalue() == complete
     assert partial.read_bytes() == complete
 
@@ -115,39 +102,23 @@ def test_network_retry_continues_one_tar_stream_without_duplicate_bytes(
 ) -> None:
     complete = _archive_bytes()
     cutoff = len(complete) // 2
-    requests = []
+    commands = []
+    processes = [
+        FakeProcess(complete[:cutoff], 56, "connection reset"),
+        FakeProcess(complete[cutoff:]),
+    ]
 
-    class FlakyResponse(Response):
-        def __init__(self):
-            super().__init__(complete, 200, {"Content-Length": str(len(complete))})
-            self.reads = 0
+    def popen(command, **kwargs):
+        commands.append(command)
+        return processes.pop(0)
 
-        def read(self, size=-1):
-            self.reads += 1
-            if self.reads == 1:
-                return super().read(cutoff)
-            raise urllib.error.URLError("connection reset")
-
-    def urlopen(request, timeout):
-        requests.append(request)
-        if len(requests) == 1:
-            return FlakyResponse()
-        assert request.get_header("Range") == f"bytes={cutoff}-"
-        return Response(
-            complete[cutoff:],
-            206,
-            {
-                "Content-Length": str(len(complete) - cutoff),
-                "Content-Range": f"bytes {cutoff}-{len(complete) - 1}/{len(complete)}",
-            },
-        )
-
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("subprocess.Popen", popen)
     monkeypatch.setattr("time.sleep", lambda _: None)
     partial = tmp_path / "shard.tar.partial"
     output = io.BytesIO()
     _stream_download("https://example.test/shard.tar", "token", partial, output=output)
-    assert len(requests) == 2
+    assert len(commands) == 2
+    assert commands[1][commands[1].index("--continue-at") + 1] == str(cutoff)
     assert output.getvalue() == complete
     assert partial.read_bytes() == complete
 
@@ -155,11 +126,11 @@ def test_network_retry_continues_one_tar_stream_without_duplicate_bytes(
 def test_download_honors_finite_attempt_limit(tmp_path, monkeypatch) -> None:
     calls = []
 
-    def urlopen(request, timeout):
-        calls.append(request)
-        raise urllib.error.URLError("temporary outage")
+    def popen(command, **kwargs):
+        calls.append(command)
+        return FakeProcess(b"", 56, "temporary outage")
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("subprocess.Popen", popen)
     monkeypatch.setattr("time.sleep", lambda _: None)
     with pytest.raises(OSError, match="after 2 attempts"):
         _stream_download(
@@ -175,12 +146,12 @@ def test_download_honors_finite_attempt_limit(tmp_path, monkeypatch) -> None:
 def test_download_does_not_retry_authentication_error(tmp_path, monkeypatch) -> None:
     calls = []
 
-    def urlopen(request, timeout):
-        calls.append(request)
-        raise urllib.error.HTTPError(request.full_url, 401, "unauthorized", {}, None)
+    def popen(command, **kwargs):
+        calls.append(command)
+        return FakeProcess(b"", 22, "The requested URL returned error: 401")
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-    with pytest.raises(OSError, match="non-retryable HTTP 401"):
+    monkeypatch.setattr("subprocess.Popen", popen)
+    with pytest.raises(OSError, match="non-retryable download error"):
         _stream_download(
             "https://example.test/shard.tar",
             "token",
@@ -193,13 +164,11 @@ def test_download_does_not_retry_authentication_error(tmp_path, monkeypatch) -> 
 def test_download_retries_transient_forbidden_response(tmp_path, monkeypatch) -> None:
     calls = []
 
-    def urlopen(request, timeout):
-        calls.append(request)
-        raise urllib.error.HTTPError(
-            request.full_url, 403, "temporary CDN rejection", {}, None
-        )
+    def popen(command, **kwargs):
+        calls.append(command)
+        return FakeProcess(b"", 22, "The requested URL returned error: 403")
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("subprocess.Popen", popen)
     monkeypatch.setattr("time.sleep", lambda _: None)
     with pytest.raises(OSError, match="after 2 attempts"):
         _stream_download(

@@ -9,15 +9,17 @@ import errno
 import fcntl
 import os
 import random
-import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import BinaryIO
+
+
+class NonRetryableDownloadError(IOError):
+    pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,80 +107,103 @@ def _stream_download(
 ) -> None:
     """Forward bytes immediately while persisting a resumable local copy."""
 
-    content_range_pattern = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
     emitted_bytes = 0
-    expected_bytes: int | None = None
     last_error: BaseException | None = None
     attempt = 0
 
     while True:
         attempt += 1
         existing_bytes = partial.stat().st_size if partial.is_file() else 0
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept-Encoding": "identity",
-        }
+        process: subprocess.Popen[bytes] | None = None
+        command = [
+            "curl",
+            "--location",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "30",
+            "--speed-time",
+            "60",
+            "--speed-limit",
+            "1024",
+            "--config",
+            "-",
+        ]
         if existing_bytes:
-            headers["Range"] = f"bytes={existing_bytes}-"
-        request = urllib.request.Request(url, headers=headers)
+            command.extend(("--continue-at", str(existing_bytes)))
+        command.append(url)
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                status = getattr(response, "status", response.getcode())
-                content_length = response.headers.get("Content-Length")
-                content_range = response.headers.get("Content-Range")
-                append = False
-                if existing_bytes and status == 206 and content_range:
-                    match = content_range_pattern.fullmatch(content_range.strip())
-                    if not match or int(match.group(1)) != existing_bytes:
-                        raise IOError(
-                            f"invalid resume response for {partial.name}: {content_range}"
-                        )
-                    append = True
-                    if match.group(3) != "*":
-                        expected_bytes = int(match.group(3))
-                    # A new WebDataset reader needs the cached prefix first.
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            # Supplying credentials through stdin keeps HF_TOKEN out of ps and
+            # notebook tracebacks while matching Hugging Face's curl recipe.
+            process.stdin.write(
+                (
+                    f'header = "Authorization: Bearer {token}"\n'
+                    'header = "Accept-Encoding: identity"\n'
+                ).encode()
+            )
+            process.stdin.close()
+            received = 0
+            with partial.open("ab" if existing_bytes else "wb") as sink:
+                while chunk := process.stdout.read(1024 * 1024):
+                    if existing_bytes and emitted_bytes == 0:
+                        # curl only produces a body after --continue-at has
+                        # successfully negotiated the ranged response.
+                        with partial.open("rb") as prefix:
+                            emitted_bytes += _copy_to_output(prefix, output) if output is not None else 0
+                    sink.write(chunk)
+                    received += len(chunk)
+                    if output is not None:
+                        output.write(chunk)
+                        output.flush()
+                        emitted_bytes += len(chunk)
+            stderr = process.stderr.read().decode(errors="replace").strip()
+            returncode = process.wait()
+            if returncode == 0:
+                validate_tar(partial)
+                return
+            # A complete partial from a killed process needs no remote request.
+            if received == 0 and partial.is_file():
+                try:
+                    validate_tar(partial)
+                except OSError:
+                    pass
+                else:
                     if output is not None and emitted_bytes == 0:
                         with partial.open("rb") as prefix:
-                            emitted_bytes += _copy_to_output(prefix, output)
-                elif existing_bytes:
-                    # The server ignored Range. This is recoverable only before
-                    # any prefix has entered the current tar stream.
-                    if emitted_bytes:
-                        raise IOError("server ignored Range after streaming began")
-                    partial.unlink(missing_ok=True)
-                    existing_bytes = 0
-                if expected_bytes is None and content_length:
-                    expected_bytes = existing_bytes + int(content_length)
-
-                with partial.open("ab" if append else "wb") as sink:
-                    while chunk := response.read(1024 * 1024):
-                        sink.write(chunk)
-                        if output is not None:
-                            output.write(chunk)
-                            output.flush()
-                            emitted_bytes += len(chunk)
-
-            validate_tar(partial, expected_bytes=expected_bytes)
-            return
-        except urllib.error.HTTPError as exc:
-            if exc.code in {401, 404}:
-                raise IOError(
-                    f"non-retryable HTTP {exc.code} while downloading {url}"
-                ) from exc
-            if exc.code == 416 and partial.is_file():
-                validate_tar(partial, expected_bytes=expected_bytes)
-                if output is not None and emitted_bytes == 0:
-                    with partial.open("rb") as prefix:
-                        _copy_to_output(prefix, output)
-                return
-            last_error = exc
+                            _copy_to_output(prefix, output)
+                    return
+            last_error = IOError(f"curl exit {returncode}: {stderr}")
+            if "error: 401" in stderr.lower() or "error: 404" in stderr.lower():
+                raise NonRetryableDownloadError(
+                    f"non-retryable download error: {stderr}"
+                )
         except BrokenPipeError:
             # The training consumer exited. Keep the partial for the next run.
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
             raise
-        except (OSError, urllib.error.URLError) as exc:
+        except NonRetryableDownloadError:
+            raise
+        except OSError as exc:
             if isinstance(exc, OSError) and exc.errno in {
                 errno.EACCES,
                 errno.ENOSPC,
+                errno.ENOENT,
                 errno.EROFS,
             }:
                 raise
@@ -203,7 +228,10 @@ def _stream_download(
 
 def _emit_file(path: Path, output: BinaryIO) -> None:
     with path.open("rb") as source:
-        _copy_to_output(source, output)
+        try:
+            _copy_to_output(source, output)
+        except BrokenPipeError:
+            pass
 
 
 def stream_file(
@@ -255,14 +283,18 @@ def stream_file(
 
 def main() -> None:
     args = parse_args()
-    stream_file(
-        args.repo,
-        args.filename,
-        Path(args.cache_dir),
-        emit=not args.quiet,
-        max_downloads=args.max_downloads,
-        download_attempts=args.download_attempts,
-    )
+    try:
+        stream_file(
+            args.repo,
+            args.filename,
+            Path(args.cache_dir),
+            emit=not args.quiet,
+            max_downloads=args.max_downloads,
+            download_attempts=args.download_attempts,
+        )
+    except BrokenPipeError:
+        # Bounded smoke/eval consumers intentionally stop before shard EOF.
+        pass
 
 
 if __name__ == "__main__":
