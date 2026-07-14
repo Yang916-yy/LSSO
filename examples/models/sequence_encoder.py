@@ -65,12 +65,24 @@ class SequenceMixerEncoder(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         projection_dim: int | None = None,
+        position_rank: int = 0,
+        pooling: str = "mean",
     ) -> None:
         super().__init__()
+        if pooling not in {"mean", "max", "meanmax"}:
+            raise ValueError(f"unsupported sequence pooling: {pooling}")
         self.max_length = int(max_length)
         self.pad_token_id = int(pad_token_id)
+        self.pooling = pooling
         self.token_embedding = nn.Embedding(vocab_size, dim, padding_idx=pad_token_id)
-        self.position_embedding = nn.Parameter(torch.zeros(1, max_length, dim))
+        self.position_rank = (
+            int(position_rank) if 0 < position_rank < min(max_length, dim) else 0
+        )
+        position_dim = self.position_rank or dim
+        self.position_embedding = nn.Parameter(torch.zeros(1, max_length, position_dim))
+        self.position_projection = (
+            nn.Linear(position_dim, dim, bias=False) if self.position_rank else None
+        )
         self.embedding_dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
             SequenceMixerBlock(
@@ -84,9 +96,31 @@ class SequenceMixerEncoder(nn.Module):
             for _ in range(depth)
         )
         self.norm = nn.LayerNorm(dim)
+        self.pool_projection = (
+            nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU())
+            if pooling == "meanmax"
+            else None
+        )
         output_dim = projection_dim or dim
         self.projection = nn.Linear(dim, output_dim, bias=False)
         nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        if self.position_projection is not None:
+            nn.init.trunc_normal_(self.position_projection.weight, std=0.02)
+
+    def _positions(self, length: int) -> torch.Tensor:
+        positions = self.position_embedding[:, :length]
+        return self.position_projection(positions) if self.position_projection is not None else positions
+
+    def _pool(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        weights = valid.unsqueeze(-1).to(x.dtype)
+        mean = (x * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        if self.pooling == "mean":
+            return mean
+        maximum = x.masked_fill(~valid.unsqueeze(-1), torch.finfo(x.dtype).min).amax(dim=1)
+        maximum = torch.where(valid.any(dim=1, keepdim=True), maximum, torch.zeros_like(maximum))
+        if self.pooling == "max":
+            return maximum
+        return self.pool_projection(torch.cat((mean, maximum), dim=-1))
 
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
@@ -99,14 +133,12 @@ class SequenceMixerEncoder(nn.Module):
             )
         valid = input_ids.ne(self.pad_token_id) if attention_mask is None else attention_mask.bool()
         x = self.token_embedding(input_ids)
-        x = self.embedding_dropout(x + self.position_embedding[:, : input_ids.shape[1]])
+        x = self.embedding_dropout(x + self._positions(input_ids.shape[1]))
         x = x * valid.unsqueeze(-1).to(x.dtype)
         for block in self.blocks:
             x = block(x, valid)
         x = self.norm(x)
-        weights = valid.unsqueeze(-1).to(x.dtype)
-        pooled = (x * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-        return self.projection(pooled)
+        return self.projection(self._pool(x, valid))
 
     def encode_normalized(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
@@ -124,3 +156,211 @@ class ProteinFitnessModel(nn.Module):
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.head(self.encoder(input_ids, attention_mask)).squeeze(-1)
+
+
+class SequenceValueEncoder(nn.Module):
+    """Bidirectional sequence encoder for continuous per-timestep features."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        max_length: int,
+        dim: int = 128,
+        depth: int = 4,
+        num_heads: int = 4,
+        mixer: str = "rrlsso",
+        rank: int = 16,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        projection_dim: int | None = None,
+        position_rank: int = 0,
+        pooling: str = "mean",
+    ) -> None:
+        super().__init__()
+        if pooling not in {"mean", "max", "meanmax"}:
+            raise ValueError(f"unsupported sequence pooling: {pooling}")
+        self.max_length = int(max_length)
+        self.pooling = pooling
+        self.input_projection = nn.Linear(input_dim, dim)
+        self.position_rank = (
+            int(position_rank) if 0 < position_rank < min(max_length, dim) else 0
+        )
+        position_dim = self.position_rank or dim
+        self.position_embedding = nn.Parameter(torch.zeros(1, max_length, position_dim))
+        self.position_projection = (
+            nn.Linear(position_dim, dim, bias=False) if self.position_rank else None
+        )
+        self.embedding_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            SequenceMixerBlock(
+                dim,
+                num_heads,
+                mixer=mixer,
+                rank=rank,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+            )
+            for _ in range(depth)
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.pool_projection = (
+            nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU())
+            if pooling == "meanmax"
+            else None
+        )
+        output_dim = projection_dim or dim
+        self.projection = nn.Linear(dim, output_dim, bias=False)
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        if self.position_projection is not None:
+            nn.init.trunc_normal_(self.position_projection.weight, std=0.02)
+
+    def _positions(self, length: int) -> torch.Tensor:
+        positions = self.position_embedding[:, :length]
+        return self.position_projection(positions) if self.position_projection is not None else positions
+
+    def _pool(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        weights = valid.unsqueeze(-1).to(x.dtype)
+        mean = (x * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        if self.pooling == "mean":
+            return mean
+        maximum = x.masked_fill(~valid.unsqueeze(-1), torch.finfo(x.dtype).min).amax(dim=1)
+        maximum = torch.where(valid.any(dim=1, keepdim=True), maximum, torch.zeros_like(maximum))
+        if self.pooling == "max":
+            return maximum
+        return self.pool_projection(torch.cat((mean, maximum), dim=-1))
+
+    def forward(
+        self, values: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if values.ndim != 3:
+            raise ValueError("values must have shape [batch, length, channels]")
+        if values.shape[1] > self.max_length:
+            raise ValueError(
+                f"sequence length {values.shape[1]} exceeds max_length={self.max_length}"
+            )
+        if attention_mask is None:
+            valid = torch.ones(values.shape[:2], dtype=torch.bool, device=values.device)
+        else:
+            valid = attention_mask.bool()
+            if valid.shape != values.shape[:2]:
+                raise ValueError("attention_mask must have shape [batch, length]")
+        x = self.input_projection(values)
+        x = self.embedding_dropout(x + self._positions(values.shape[1]))
+        x = x * valid.unsqueeze(-1).to(x.dtype)
+        for block in self.blocks:
+            x = block(x, valid)
+        x = self.norm(x)
+        return self.projection(self._pool(x, valid))
+
+
+class SequenceClassifier(nn.Module):
+    """Classification head shared by token and continuous sequence encoders."""
+
+    def __init__(self, encoder: nn.Module, num_classes: int) -> None:
+        super().__init__()
+        self.encoder = encoder
+        output_dim = encoder.projection.out_features
+        self.head = nn.Linear(output_dim, num_classes)
+
+    def forward(
+        self, inputs: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.head(self.encoder(inputs, attention_mask))
+
+
+class ReverseComplementSequenceClassifier(SequenceClassifier):
+    """DNA classifier with reproducible on-device reverse-complement handling.
+
+    Training augmentation draws from PyTorch's checkpointed RNG. Evaluation can
+    optionally average the original and reverse-complement logits. Right padding
+    remains on the right, so absolute position indices retain their semantics.
+    """
+
+    def __init__(
+        self,
+        encoder: SequenceMixerEncoder,
+        num_classes: int,
+        *,
+        complement_ids: torch.Tensor,
+        reverse_complement_probability: float = 0.0,
+        reverse_complement_eval: bool = False,
+    ) -> None:
+        super().__init__(encoder, num_classes)
+        if not 0.0 <= reverse_complement_probability <= 1.0:
+            raise ValueError("reverse_complement_probability must be in [0, 1]")
+        if complement_ids.ndim != 1:
+            raise ValueError("complement_ids must be a one-dimensional lookup table")
+        self.reverse_complement_probability = float(reverse_complement_probability)
+        self.reverse_complement_eval = bool(reverse_complement_eval)
+        self.register_buffer("complement_ids", complement_ids.long(), persistent=True)
+
+    def reverse_complement(
+        self, inputs: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = inputs.ne(self.encoder.pad_token_id) if attention_mask is None else attention_mask.bool()
+        length = inputs.shape[1]
+        positions = torch.arange(length, device=inputs.device).unsqueeze(0)
+        lengths = valid.sum(dim=1, keepdim=True)
+        reversed_positions = (lengths - 1 - positions).clamp_min(0)
+        source = torch.where(valid, reversed_positions, positions).long()
+        reversed_inputs = inputs.gather(1, source)
+        complemented = self.complement_ids[reversed_inputs.long()]
+        complemented = torch.where(valid, complemented, inputs.long())
+        return complemented.to(inputs.dtype), valid
+
+    def _classify(self, inputs: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        return self.head(self.encoder(inputs, attention_mask))
+
+    def forward(
+        self, inputs: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        valid = inputs.ne(self.encoder.pad_token_id) if attention_mask is None else attention_mask.bool()
+        reverse_inputs, reverse_mask = self.reverse_complement(inputs, valid)
+        if self.training and self.reverse_complement_probability > 0.0:
+            selected = torch.rand(inputs.shape[0], device=inputs.device) < self.reverse_complement_probability
+            inputs = torch.where(selected.unsqueeze(1), reverse_inputs, inputs)
+            return self._classify(inputs, valid)
+        logits = self._classify(inputs, valid)
+        if not self.training and self.reverse_complement_eval:
+            reverse_logits = self._classify(reverse_inputs, reverse_mask)
+            logits = 0.5 * (logits + reverse_logits)
+        return logits
+
+
+class SequencePairClassifier(nn.Module):
+    """Symmetric shared-encoder head used by LRA document matching."""
+
+    def __init__(
+        self, encoder: SequenceMixerEncoder, num_classes: int = 2,
+        hidden_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        dim = encoder.projection.out_features
+        hidden_dim = hidden_dim or dim
+        self.head = nn.Sequential(
+            nn.Linear(4 * dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(
+        self,
+        first: torch.Tensor,
+        first_mask: torch.Tensor,
+        second: torch.Tensor,
+        second_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        first_embedding = self.encoder(first, first_mask)
+        second_embedding = self.encoder(second, second_mask)
+        features = torch.cat(
+            [
+                first_embedding,
+                second_embedding,
+                first_embedding - second_embedding,
+                first_embedding * second_embedding,
+            ],
+            dim=-1,
+        )
+        return self.head(features)

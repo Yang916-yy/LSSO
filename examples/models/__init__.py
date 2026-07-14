@@ -14,7 +14,14 @@ from .vision_llama_dense import (
     load_dense_vision_llama_checkpoint,
 )
 from .simple_feature_pyramid import SimpleFeaturePyramid
-from .sequence_encoder import ProteinFitnessModel, SequenceMixerEncoder
+from .sequence_encoder import (
+    ProteinFitnessModel,
+    ReverseComplementSequenceClassifier,
+    SequenceClassifier,
+    SequenceMixerEncoder,
+    SequencePairClassifier,
+    SequenceValueEncoder,
+)
 
 __all__ = [
     "VisionLLaMA",
@@ -29,6 +36,10 @@ __all__ = [
     "SimpleFeaturePyramid",
     "SequenceMixerEncoder",
     "ProteinFitnessModel",
+    "ReverseComplementSequenceClassifier",
+    "SequenceClassifier",
+    "SequencePairClassifier",
+    "SequenceValueEncoder",
 ]
 
 # Registration is optional for library users but automatic when timm is

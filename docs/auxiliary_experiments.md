@@ -1,119 +1,279 @@
-# Auxiliary sequence experiments
+# Auxiliary experiments
 
-The auxiliary suite tests the same bidirectional MHA/LSSO/RRLSSO replacement
-outside vision without inheriting a BERT encoder. Both tasks use
-`SequenceMixerEncoder`: token embeddings, learned absolute position
-embeddings, pre-norm residual mixer blocks, MLPs, and masked mean pooling.
-RRLSSO additionally applies its fixed 1-D rank rotary transform inside the
-relation solve. Padding is passed to the masked operator and excluded from
-pooling.
+The formal auxiliary suite is deliberately based on public benchmarks with
+stable splits and dense published baseline tables. Its purpose is to test
+whether RRLSSO transfers beyond vision without requiring the project to
+reproduce every competing operator.
+
+The previous MS MARCO/BEIR retrieval and FLIP AAV protein experiments are no
+longer part of the paper plan. Their implementations remain in `experiments/`
+as archived prototypes; they must not be included in the formal experiment
+matrix or GPU budget unless the plan is explicitly revised.
+
+## Formal suite
+
+### 1. GenomicBenchmarks (8 tasks)
+
+Run all eight official sequence-classification datasets and retain their
+provided train/test split:
+
+- `dummy_mouse_enhancers_ensembl`
+- `demo_coding_vs_intergenomic_seqs`
+- `demo_human_or_worm`
+- `human_enhancers_cohn`
+- `human_enhancers_ensembl`
+- `human_ensembl_regulatory`
+- `human_nontata_promoters`
+- `human_ocr_ensembl`
+
+The benchmark has no official validation split. Following Caduceus, construct
+a deterministic stratified 90/10 train/validation split from the official
+training data and leave the test split untouched. Use a single-nucleotide
+vocabulary, learned absolute position embeddings, masked pooling, and the same
+small bidirectional encoder family for every dataset. The primary metric is
+test accuracy; also retain macro F1 and Matthews correlation coefficient for
+imbalanced datasets. Report the mean
+and standard deviation over three fixed seeds and the mean rank across all
+eight tasks.
+
+The main external references are the supervised CNN/Transformer results and
+the published HyenaDNA, Caduceus, and later genomic-model tables. Results from
+models with genomic pretraining must be placed in a separate **pretrained**
+block; a randomly initialized RRLSSO must not be described as an
+apples-to-apples comparison with those models.
+
+### 2. Long Range Arena (4 tasks)
+
+Use the official LRA data splits and fixed model configurations for:
+
+- ListOps
+- byte-level Text classification
+- AAN document Retrieval
+- Pathfinder
+
+Sequential CIFAR-10 is omitted because the main paper already contains a much
+stronger vision suite. Path-X is omitted because failure-heavy results do not
+justify its additional cost.
+
+The implemented default is a modern wide-and-shallow PyTorch protocol: width
+256, depth 2, 8 heads, RRLSSO rank 32, AdamW, learned absolute position
+embeddings, and the long sequence
+lengths commonly used by later PyTorch LRA repositories (2048/4096/4000/1024).
+It is deliberately labelled `native-pytorch-reported-baseline`, not an exact
+reproduction of Google's archived JAX/Flax recipe. The original recipe varies
+width and schedule by task (for example, ListOps uses width 512 while AAN uses
+width 128) and uses a different optimizer schedule. The runners expose every
+model and optimizer argument, so an exact-width controlled rerun can be made,
+but numbers from the compact default must not be presented as belonging to the
+official LRA apples-to-apples track.
+
+When sample limits are used for smoke tests or scale probes, all three runners
+take deterministic stratified subsets rather than the first rows in dataset
+order. The requested limits, actual split sizes, batch sizes, and worker count
+are persisted in `config.json`.
+
+Published Transformer and efficient-attention results from the official LRA
+table, together with S4/S5 and MEGA results, may be cited rather than rerun only
+when the official configuration is matched exactly. LRA is retained as a
+standardized operator comparison, not treated as conclusive proof of genuine
+long-range reasoning.
+
+### 3. UEA-30 multivariate time-series classification
+
+Run the complete 30-dataset UEA multivariate archive using the official
+training and test splits. Do not select datasets after observing results.
+Each input channel is projected to the shared model width; padding masks must
+exclude missing/padded timesteps from both the structured solve and pooling.
+
+Use accuracy per dataset and report:
+
+- mean rank over all 30 datasets;
+- average accuracy as a secondary summary;
+- wins/ties/losses against each reference method;
+- a critical-difference diagram when the number of complete methods permits;
+- peak memory and throughput on representative short, medium, and long series.
+
+The reference table should include standard published results for DTW,
+ROCKET-family methods, InceptionTime, ConvTran, and a Transformer baseline.
+Published numbers using the same archive version, official split, and metric
+may appear in a clearly labelled **reported baselines** block even when their
+method-specific preprocessing differs. They are not controlled reproductions.
+Results based on resampled or altered splits are contextual references only.
+
+## Minimum self-run policy
+
+The main CV experiments remain the controlled MHA/LSSO/RRLSSO comparison.
+The auxiliary suite minimizes new training as follows:
+
+1. Run RRLSSO on every task in the three formal suites.
+2. Use published baselines wherever the protocol is exactly compatible.
+3. Run one internal MHA anchor per suite only if needed to validate that the
+   local data pipeline reproduces the published protocol. Do not run the full
+   three-mixer grid by default.
+4. Run LSSO auxiliary baselines only when a reviewer-facing question cannot be
+   answered by the main CV ablation.
+
+This policy supports a claim of cross-domain applicability. It does not by
+itself support a claim that RRLSSO is state of the art in genomics, language,
+or time-series classification.
+
+## Reporting and citation rules
+
+- Mark locally reproduced results normally and imported results with a dagger
+  (`†`) plus the source paper in the table caption.
+- Separate locally controlled results, reported standard-split baselines, and
+  pretrained baselines into distinct table blocks.
+- Never mix pretrained and from-scratch models in one rank calculation.
+- Record dataset version, split, preprocessing, model parameters, seed,
+  training steps, selected checkpoint, wall-clock time, and GPU-hours.
+- Select checkpoints using validation data only; never tune on the official
+  test split.
+- Report all planned tasks and seeds, including failures and OOMs.
+- The paper's generality statement is based on coverage across discrete DNA,
+  byte-level language/retrieval/reasoning, and continuous multivariate signals,
+  not on cherry-picked individual wins.
 
 ## Installation
 
-```bash
-python -m pip install -e ".[auxiliary]"
-```
-
-## BEIR text retrieval
-
-The entry point downloads the official Hugging Face BEIR corpus, query, and
-qrels tables. It trains a shared dual encoder with symmetric in-batch
-contrastive loss. Ten percent of training queries form a deterministic
-validation set; the test qrels are evaluated only after selecting `best.pt`.
-Reported metrics are NDCG@10, MRR@10, and Recall@1/5/10/100.
+From the repository root:
 
 ```bash
-python experiments/beir_retrieval.py \
-  --dataset scifact --mixer rrlsso --rank 32 \
-  --output runs/auxiliary/beir-scifact-rrlsso-r32
+pip install -e ".[sequence]"
 ```
 
-Tokenization is cached once under `data/auxiliary_cache/`. Evaluation encodes
-the corpus in batches and performs exact top-100 retrieval with a bounded GPU
-score matrix, so it never materializes the full query-by-corpus matrix.
+`datasets` loads the GenomicBenchmarks author mirrors and IMDB, `aeon`
+downloads the official UEA train/test archives, and Pillow reads Pathfinder.
+The optional `genomic-benchmarks` package is only a fallback and is not needed
+when the Hugging Face mirrors are available.
 
-Run the formal grid over `nfcorpus`, `fiqa`, and `scifact`, mixers
-`mha`, `lsso`, and `rrlsso`, and the same seeds. The default tokenizer is the
-T5 SentencePiece vocabulary; no T5/BERT encoder weights or block structure
-are loaded.
+## Runnable entry points
 
-## FLIP AAV protein fitness
+Each task runner saves `last.pt` and `best.pt` atomically, resumes by default,
+uses only a validation split for checkpoint selection, and writes
+`config.json`, `metrics.jsonl`, and `test_metrics.json`.
 
-The protein route uses the public `AI4Protein/FLIP_AAV_two-vs-rest` dataset,
-its provided train/validation/test split, a character-level amino-acid
-tokenizer, and a scalar regression head. Targets are standardized using only
-the training split. Model selection uses validation Spearman correlation;
-the test split is evaluated once from `best.pt`.
-Protein strings are encoded once at startup. A length-bucket sampler applies
-dynamic per-batch padding so the masked mixers do not read padded tokens.
+### RRLSSO-DNA competitive-model program
+
+`run_rrlsso_dna_program.py` enforces a validation-gated three-stage protocol:
+
+1. screen reverse-complement augmentation/evaluation and mean, max, or
+   mean-max pooling on Human-vs-Worm, Non-TATA, OCR, and Cohn;
+2. freeze the selected recipe and compare Tiny (128x2, rank 16), Small
+   (192x2, rank 32), and Base (256x2, rank 32) on validation data only;
+3. write an immutable `frozen_config.json`, then evaluate RRLSSO-DNA-Base on
+   all eight test splits for seeds 0/1/2.
+
+The next GenomicBenchmarks validation gates are deliberately single-seed:
+
+1. complete the existing Tiny/Small/Base validation scale curves with seed 0
+   only;
+2. using seed 0 only, evaluate a 256x4 RRLSSO candidate and a lightweight local
+   motif stem (token embedding followed by a residual depthwise 1-D convolution
+   and pointwise projection);
+3. select and freeze the architecture using validation results only. Do not
+   inspect the official test split and do not add repeated seeds during these
+   two exploratory gates;
+4. spend the multi-seed budget only after the final model and recipe have been
+   frozen for the eight-task formal run.
+
+The local motif stem is an architecture candidate, not an RRLSSO replacement.
+If retained, controlled mixer comparisons must give the identical stem to MHA,
+LSSO, and RRLSSO.
+
+The first two stages pass `--validation-only`; those run directories contain
+`validation_metrics.json` and cannot contain `test_metrics.json`. The launcher
+runs one child at a time and resumes completed stages automatically:
 
 ```bash
-python experiments/flip_aav.py \
-  --mixer rrlsso --rank 32 \
-  --output runs/auxiliary/flip-aav-rrlsso-r32
+python experiments/run_rrlsso_dna_program.py \
+  --output-root runs/rrlsso_dna_program \
+  --scale-seeds 0 1 --formal-seeds 0 1 2 --workers 4
 ```
 
-Formal comparisons use identical dimensions, depth, learned position
-embeddings, optimizer, split, and seeds for all three mixers. The primary
-metric is Spearman correlation and MSE is retained as a secondary metric.
+Checkpoint state includes Python, NumPy, PyTorch, CUDA, DataLoader-generator,
+and length-bucket sampler state. Pathfinder uses a fixed `--split-seed`
+(default 0) independent of the model `--seed`, so repeated model seeds always
+share the same train/validation/test partition. Use `--max-parameters` to make a
+paper protocol fail early when a model exceeds its declared parameter budget.
 
-## Smoke tests
-
-Use small limits to validate a new machine without claiming the resulting
-numbers:
+Smoke one dataset from each suite:
 
 ```bash
-python experiments/beir_retrieval.py --dataset scifact --dim 32 --depth 1 \
-  --heads 4 --rank 8 --epochs 1 --batch-size 4 --workers 0 \
-  --max-train-pairs 8 --max-eval-queries 4 --max-corpus-docs 16 \
-  --output /tmp/lsso-beir-smoke --no-resume
+python experiments/genomic_benchmarks.py \
+  --dataset dummy_mouse_enhancers_ensembl --epochs 1 \
+  --max-train-samples 64 --max-eval-samples 64 --max-train-batches 2
 
-python experiments/flip_aav.py --dim 32 --depth 1 --heads 4 --rank 8 \
-  --max-length 64 --epochs 1 --batch-size 4 --workers 0 \
-  --max-train-samples 8 --max-eval-samples 8 \
-  --output /tmp/lsso-flip-smoke --no-resume
+python experiments/lra_benchmark.py --task listops --epochs 1 \
+  --max-train-samples 64 --max-eval-samples 64 --max-train-batches 2
+
+python experiments/uea_benchmark.py --dataset BasicMotions --epochs 1 \
+  --max-train-batches 2 --workers 0
 ```
 
-Every run writes `config.json`, `metrics.jsonl`, atomic `last.pt` and
-`best.pt`, and final `test_metrics.json`.
-
-On CUDA, both entries enable BF16 autocast, fused AdamW, pinned DataLoader
-memory, persistent workers, and non-blocking host-to-device copies. These are
-disabled automatically on CPU.
-
-Run the complete matrix sequentially on one GPU and aggregate completed runs:
+Run the complete RRLSSO matrix sequentially for seeds 0/1/2:
 
 ```bash
-python experiments/run_auxiliary_grid.py --task all --seeds 0 1 2
-python experiments/summarize_auxiliary.py
+python experiments/run_sequence_benchmarks.py \
+  --suite all --mixer rrlsso --seeds 0 1 2 --workers 4
 ```
 
-## MS MARCO scaling pretraining
+The launcher never runs two jobs simultaneously. A directory containing
+`test_metrics.json` is skipped; an incomplete directory resumes from
+`last.pt`. A failed child writes `failed.json` and the remaining matrix
+continues; add `--fail-fast` for interactive debugging. Add arguments after
+`--` to forward them to every child, for
+example `-- --dim 192 --depth 6`.
 
-MS MARCO hard-negative triplets can be streamed without unpacking the full
-corpus. Each query is contrasted against its positive, its mined hard
-negative, and the other passages in the effective batch.
+To preview commands without training:
 
 ```bash
-python experiments/msmarco_pretrain.py \
-  --mixer rrlsso --dim 384 --depth 8 --heads 6 --rank 32 \
-  --batch-size 16 --grad-accum 6 --max-steps 10000 \
-  --output runs/auxiliary/msmarco-base-rrlsso-r32
+python experiments/run_sequence_benchmarks.py --suite genomic --dry-run
 ```
 
-The local RTX 5070 Ti scaling launcher holds both the micro-batch and
-effective batch at 96 for all sizes. Keeping the micro-batch fixed is essential:
-gradient accumulation does not enlarge an in-batch contrastive negative pool.
+## LRA data layout
+
+The original Google Cloud `lra_release.gz` link currently returns HTTP 403,
+so the code does not silently substitute a different dataset. Put the official
+or S4-compatible extracted data under `data/lra`:
+
+```text
+data/lra/
+  listops/basic_train.tsv
+  listops/basic_val.tsv
+  listops/basic_test.tsv
+  aan/new_aan_pairs.train.tsv
+  aan/new_aan_pairs.eval.tsv
+  aan/new_aan_pairs.test.tsv
+  pathfinder/pathfinder32/curv_contour_length_14/
+    metadata/*.npy
+    imgs/**.png
+```
+
+IMDB is downloaded automatically. AAN may be fetched from the OpenNLPLab
+mirror with `--download-aan`; ListOps and Pathfinder remain explicit local
+inputs so their provenance stays auditable. Tokenized ListOps, IMDB, and AAN
+are written once as memory-mapped `uint16` caches under `data/lra_cache`.
+Every cache has a manifest containing its source identity, split, vocabulary
+fingerprint, preprocessing schema, and maximum length. A mismatch invalidates
+and rebuilds the cache instead of silently reusing stale token IDs.
+
+## Aggregation and reported baselines
 
 ```bash
-python experiments/run_msmarco_scaling.py \
-  --scales small base large --mixer rrlsso --max-steps 1000
+python experiments/summarize_sequence_benchmarks.py \
+  --root runs/sequence --output runs/sequence/summary
 ```
 
-Transfer a resulting checkpoint into BEIR with matching model dimensions:
+This produces seed-level `runs.csv`, dataset-level `datasets.csv`, and
+`mean_ranks.csv`, plus seed completeness, wins/ties/losses, and Nemenyi
+critical-difference figures. Runtime, peak memory, throughput, and parameter
+counts are retained in the CSV outputs. An optional reported-baseline CSV can be supplied with
+`--reported-baselines`; use
+`experiments/sequence_benchmarks/reported_baselines.example.csv` as the schema.
+Ranks use only the intersection of datasets completed by every included model,
+so missing results cannot improve a model's rank.
 
-```bash
-python experiments/beir_retrieval.py --dataset scifact \
-  --dim 384 --depth 8 --heads 6 --mixer rrlsso --rank 32 \
-  --init-checkpoint runs/auxiliary/msmarco-base-rrlsso-r32/last.pt
-```
+UEA defaults to a rank-16 factorized learned absolute position table. This is
+still a trainable absolute position embedding, but its parameter cost is
+`length * 16 + 16 * model_dim` instead of `length * model_dim`. Passing
+`--position-rank 0` restores the full learned table.

@@ -1,0 +1,394 @@
+"""Modern PyTorch runner for four Long Range Arena tasks."""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import random
+import sys
+from itertools import chain
+from pathlib import Path
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from examples.models import (
+    SequenceClassifier,
+    SequenceMixerEncoder,
+    SequencePairClassifier,
+    SequenceValueEncoder,
+)
+from experiments.sequence_benchmarks.common import (
+    IndexDataset,
+    TrainingConfig,
+    collate_token_pairs,
+    collate_tokens,
+    collate_values,
+    make_loader,
+    seed_all,
+    stratified_split_indices,
+    stratified_subset_indices,
+    train_classifier,
+)
+from experiments.sequence_benchmarks.lra_data import (
+    CharacterVocabulary,
+    PathfinderDataset,
+    build_packed_pairs,
+    build_packed_tokens,
+    iter_aan,
+    iter_listops,
+    source_signature,
+)
+
+
+TASK_DEFAULTS = {
+    "listops": {"max_length": 2048, "epochs": 40, "batch_size": 50, "classes": 10},
+    "text": {"max_length": 4096, "epochs": 32, "batch_size": 32, "classes": 2},
+    "retrieval": {"max_length": 4000, "epochs": 20, "batch_size": 64, "classes": 2},
+    "pathfinder": {"max_length": 1024, "epochs": 200, "batch_size": 64, "classes": 2},
+}
+
+
+def _limit(dataset, count: int, seed: int):
+    if not count or len(dataset) <= count:
+        return dataset
+    labels = getattr(dataset, "labels", None)
+    if labels is None:
+        indices = list(range(len(dataset)))
+        random.Random(seed).shuffle(indices)
+        indices = indices[:count]
+    else:
+        indices = stratified_subset_indices(labels, count, seed)
+    return IndexDataset(dataset, indices)
+
+
+def _find_directory(root: Path, alternatives: tuple[str, ...]) -> Path:
+    for relative in alternatives:
+        candidate = root / relative
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"none of {[str(root / item) for item in alternatives]} exists"
+    )
+
+
+def _load_or_build_vocab(path: Path, builder) -> CharacterVocabulary:
+    if path.exists():
+        return CharacterVocabulary.load(path)
+    vocabulary = builder()
+    vocabulary.save(path)
+    return vocabulary
+
+
+def prepare_listops(data_root: Path, cache_root: Path, max_length: int):
+    source = _find_directory(data_root, ("listops", "listops-1000"))
+    files = {split: source / f"basic_{split}.tsv" for split in ("train", "val", "test")}
+    for path in files.values():
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    vocab_path = cache_root / "listops" / "vocab.json"
+    vocabulary = _load_or_build_vocab(
+        vocab_path,
+        lambda: CharacterVocabulary.from_listops(text for text, _ in iter_listops(files["train"])),
+    )
+    datasets = {}
+    for split, path in files.items():
+        prefix = cache_root / "listops" / f"{split}-l{max_length}"
+        datasets[split] = build_packed_tokens(
+            prefix,
+            iter_listops(path),
+            lambda text: vocabulary.encode_listops(text, max_length),
+            manifest={
+                "schema": 1,
+                "task": "listops",
+                "split": split,
+                "max_length": max_length,
+                "vocabulary": vocabulary.fingerprint,
+                "source": source_signature(path),
+            },
+        )
+    return datasets["train"], datasets["val"], datasets["test"], vocabulary
+
+
+def prepare_text(cache_root: Path, max_length: int, seed: int, validation_fraction: float):
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise RuntimeError("install the auxiliary extra to load LRA Text") from error
+    rows = load_dataset("stanfordnlp/imdb", cache_dir=str(cache_root / "hf"))
+    vocab_path = cache_root / "text" / "vocab.json"
+    vocabulary = _load_or_build_vocab(
+        vocab_path,
+        lambda: CharacterVocabulary.from_texts(rows["train"]["text"], min_frequency=15),
+    )
+    full_train = build_packed_tokens(
+        cache_root / "text" / f"train-l{max_length}",
+        ((row["text"], int(row["label"])) for row in rows["train"]),
+        lambda text: vocabulary.encode_chars(text, max_length),
+        manifest={
+            "schema": 1,
+            "task": "text",
+            "split": "train",
+            "max_length": max_length,
+            "vocabulary": vocabulary.fingerprint,
+            "source_fingerprint": rows["train"]._fingerprint,
+        },
+    )
+    test = build_packed_tokens(
+        cache_root / "text" / f"test-l{max_length}",
+        ((row["text"], int(row["label"])) for row in rows["test"]),
+        lambda text: vocabulary.encode_chars(text, max_length),
+        manifest={
+            "schema": 1,
+            "task": "text",
+            "split": "test",
+            "max_length": max_length,
+            "vocabulary": vocabulary.fingerprint,
+            "source_fingerprint": rows["test"]._fingerprint,
+        },
+    )
+    train_indices, validation_indices = stratified_split_indices(
+        full_train.labels, validation_fraction, seed
+    )
+    return (
+        IndexDataset(full_train, train_indices),
+        IndexDataset(full_train, validation_indices),
+        test,
+        vocabulary,
+    )
+
+
+def _download_aan(data_root: Path) -> Path:
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as error:
+        raise RuntimeError("install huggingface-hub to download the OpenNLPLab AAN mirror") from error
+    local = data_root / "opennlplab"
+    snapshot_download(
+        repo_id="OpenNLPLab/lra",
+        repo_type="dataset",
+        local_dir=local,
+        allow_patterns=["data/aan/new_aan_pairs.*.tsv"],
+    )
+    return local / "data" / "aan"
+
+
+def prepare_retrieval(
+    data_root: Path, cache_root: Path, max_length: int, download: bool
+):
+    try:
+        source = _find_directory(data_root, ("aan", "tsv_data", "opennlplab/data/aan"))
+    except FileNotFoundError:
+        if not download:
+            raise FileNotFoundError(
+                "AAN data is missing; pass --download-aan to fetch the OpenNLPLab HF mirror"
+            )
+        source = _download_aan(data_root)
+    files = {
+        "train": source / "new_aan_pairs.train.tsv",
+        "val": source / "new_aan_pairs.eval.tsv",
+        "test": source / "new_aan_pairs.test.tsv",
+    }
+    for path in files.values():
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    vocab_path = cache_root / "retrieval" / "vocab.json"
+
+    def build_vocabulary():
+        texts = chain.from_iterable((first, second) for first, second, _ in iter_aan(files["train"]))
+        return CharacterVocabulary.from_texts(texts)
+
+    vocabulary = _load_or_build_vocab(vocab_path, build_vocabulary)
+    datasets = {}
+    for split, path in files.items():
+        datasets[split] = build_packed_pairs(
+            cache_root / "retrieval" / f"{split}-l{max_length}",
+            iter_aan(path),
+            lambda text: vocabulary.encode_chars(text, max_length),
+            manifest={
+                "schema": 1,
+                "task": "retrieval",
+                "split": split,
+                "max_length": max_length,
+                "vocabulary": vocabulary.fingerprint,
+                "source": source_signature(path),
+            },
+        )
+    return datasets["train"], datasets["val"], datasets["test"], vocabulary
+
+
+def prepare_pathfinder(data_root: Path, resolution: int, seed: int):
+    source = _find_directory(
+        data_root,
+        (f"pathfinder/pathfinder{resolution}", f"pathfinder{resolution}"),
+    )
+    full = PathfinderDataset(source)
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(len(full), generator=generator).tolist()
+    validation_count = int(0.1 * len(full))
+    test_count = int(0.1 * len(full))
+    validation = IndexDataset(full, order[:validation_count])
+    test = IndexDataset(full, order[validation_count : validation_count + test_count])
+    train = IndexDataset(full, order[validation_count + test_count :])
+    return train, validation, test
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=tuple(TASK_DEFAULTS), default="listops")
+    parser.add_argument("--data-root", default="data/lra")
+    parser.add_argument("--cache-dir", default="data/lra_cache")
+    parser.add_argument("--download-aan", action="store_true")
+    parser.add_argument("--pathfinder-resolution", type=int, default=32)
+    parser.add_argument(
+        "--split-seed", type=int, default=0,
+        help="fixed data-partition seed; independent of model initialization seed",
+    )
+    parser.add_argument("--output", default="")
+    parser.add_argument("--mixer", choices=("mha", "lsso", "rrlsso"), default="rrlsso")
+    parser.add_argument("--max-length", type=int, default=0)
+    parser.add_argument("--dim", type=int, default=256)
+    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--rank", type=int, default=32)
+    parser.add_argument("--position-rank", type=int, default=0)
+    parser.add_argument("--mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--epochs", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=0)
+    parser.add_argument("--eval-batch-size", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--max-eval-samples", type=int, default=0)
+    parser.add_argument("--max-train-batches", type=int, default=0)
+    parser.add_argument("--max-eval-batches", type=int, default=0)
+    parser.add_argument("--max-parameters", type=int, default=0)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    seed_all(args.seed)
+    defaults = TASK_DEFAULTS[args.task]
+    max_length = args.max_length or defaults["max_length"]
+    epochs = args.epochs or defaults["epochs"]
+    batch_size = args.batch_size or defaults["batch_size"]
+    eval_batch_size = args.eval_batch_size or batch_size
+    output = args.output or f"runs/sequence/lra-{args.task}-{args.mixer}-s{args.seed}"
+    data_root, cache_root = Path(args.data_root), Path(args.cache_dir)
+    pair_task = False
+    if args.task == "listops":
+        train, validation, test, vocabulary = prepare_listops(data_root, cache_root, max_length)
+        collate = functools.partial(collate_tokens, pad_token_id=vocabulary.pad_token_id)
+    elif args.task == "text":
+        train, validation, test, vocabulary = prepare_text(
+            cache_root, max_length, args.seed, args.validation_fraction
+        )
+        collate = functools.partial(collate_tokens, pad_token_id=vocabulary.pad_token_id)
+    elif args.task == "retrieval":
+        train, validation, test, vocabulary = prepare_retrieval(
+            data_root, cache_root, max_length, args.download_aan
+        )
+        collate = functools.partial(collate_token_pairs, pad_token_id=vocabulary.pad_token_id)
+        pair_task = True
+    else:
+        train, validation, test = prepare_pathfinder(
+            data_root, args.pathfinder_resolution, args.split_seed
+        )
+        max_length = args.pathfinder_resolution**2
+        vocabulary = None
+        collate = collate_values
+    train = _limit(train, args.max_train_samples, args.seed + 1)
+    validation = _limit(validation, args.max_eval_samples, args.seed + 2)
+    test = _limit(test, args.max_eval_samples, args.seed + 3)
+    if args.task == "pathfinder":
+        encoder = SequenceValueEncoder(
+            1, max_length=max_length, dim=args.dim, depth=args.depth,
+            num_heads=args.heads, mixer=args.mixer, rank=args.rank,
+            mlp_ratio=args.mlp_ratio, dropout=args.dropout,
+            position_rank=args.position_rank,
+        )
+        model = SequenceClassifier(encoder, defaults["classes"])
+    else:
+        encoder = SequenceMixerEncoder(
+            vocabulary.vocab_size, max_length=max_length,
+            pad_token_id=vocabulary.pad_token_id, dim=args.dim, depth=args.depth,
+            num_heads=args.heads, mixer=args.mixer, rank=args.rank,
+            mlp_ratio=args.mlp_ratio, dropout=args.dropout,
+            position_rank=args.position_rank,
+        )
+        model = (
+            SequencePairClassifier(encoder, defaults["classes"])
+            if pair_task
+            else SequenceClassifier(encoder, defaults["classes"])
+        )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    loaders = [
+        make_loader(
+            dataset,
+            batch_size=batch_size if index == 0 else eval_batch_size,
+            workers=args.workers,
+            device=device,
+            collate_fn=collate,
+            train=index == 0,
+            seed=args.seed,
+        )
+        for index, dataset in enumerate((train, validation, test))
+    ]
+    train_classifier(
+        model,
+        *loaders,
+        num_classes=defaults["classes"],
+        config=TrainingConfig(
+            output=output,
+            epochs=epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            warmup_ratio=args.warmup_ratio,
+            patience=args.patience,
+            seed=args.seed,
+            resume=args.resume,
+            max_train_batches=args.max_train_batches,
+            max_eval_batches=args.max_eval_batches,
+            max_parameters=args.max_parameters,
+        ),
+        metadata={
+            "suite": "lra",
+            "dataset": args.task,
+            "mixer": args.mixer,
+            "rank": args.rank,
+            "dim": args.dim,
+            "depth": args.depth,
+            "heads": args.heads,
+            "max_length": max_length,
+            "position_rank": args.position_rank,
+            "validation_fraction": args.validation_fraction,
+            "batch_size": batch_size,
+            "eval_batch_size": eval_batch_size,
+            "workers": args.workers,
+            "max_train_samples": args.max_train_samples,
+            "max_eval_samples": args.max_eval_samples,
+            "split_sizes": {
+                "train": len(train),
+                "validation": len(validation),
+                "test": len(test),
+            },
+            "protocol": "native-pytorch-reported-baseline",
+            "data_definition": "google-research/long-range-arena@cd31e5c6",
+            "split_seed": args.split_seed,
+        },
+    )
+
+
+if __name__ == "__main__":
+    main()
