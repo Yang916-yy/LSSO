@@ -5,7 +5,7 @@ import timm
 import torch
 
 import examples.models  # noqa: F401 - imports registration side effects
-from experiments.imagenet_wds_train import shard_cache_name, shard_commands
+from experiments.imagenet_wds_train import shard_commands
 from examples.models.vision_llama import VisionLLaMA
 
 
@@ -96,10 +96,10 @@ def test_imagenet_shard_names_match_repository_layout(tmp_path) -> None:
     assert "imagenet1k-validation-00.tar" in validation[0]
     assert "imagenet1k-validation-63.tar" in validation[-1]
     assert train[0].startswith("pipe:")
-    assert "hf_wds_pipe.py" in train[0]
+    assert "hf_wds_stream.py" in train[0]
     assert "--repo timm/imagenet-1k-wds" in train[0]
+    assert f"--cache-dir {tmp_path}" in train[0]
     assert "HF_TOKEN" not in train[0]
-    assert shard_cache_name(train[0]) == "imagenet1k-train-0000.tar"
 
 
 def test_pretrained_requires_explicit_checkpoint() -> None:

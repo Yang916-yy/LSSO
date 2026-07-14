@@ -8,7 +8,6 @@ import json
 import math
 import os
 import random
-import re
 import shlex
 import sys
 import time
@@ -18,8 +17,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import webdataset as wds
-from webdataset.filters import pipelinefilter
-from webdataset.tariterators import group_by_keys, tar_file_expander
 from timm.data import Mixup, create_transform
 from timm.loss import SoftTargetCrossEntropy
 from torch.utils.data import DataLoader
@@ -51,10 +48,7 @@ def shard_commands(
     commands = []
     for index in range(count):
         filename = f"imagenet1k-{prefix}-{index:0{digits}d}.tar"
-        helper = ROOT / "tools" / "hf_wds_pipe.py"
-        # FileCache still owns the validated on-disk cache.  The small wrapper
-        # only makes the documented pipe transport tolerate transient Xet 403
-        # responses without risking concatenated partial tar streams.
+        helper = ROOT / "tools" / "hf_wds_stream.py"
         commands.append(
             "pipe:"
             + " ".join(
@@ -65,47 +59,12 @@ def shard_commands(
                     shlex.quote(repo),
                     "--filename",
                     shlex.quote(filename),
+                    "--cache-dir",
+                    shlex.quote(str(cache_dir)),
                 )
             )
         )
     return commands
-
-
-_SHARD_NAME = re.compile(r"(imagenet1k-(?:train|validation)-\d+\.tar)")
-
-
-def shard_cache_name(url: str) -> str:
-    """Keep WebDataset's native cache compatible with existing tar files."""
-
-    match = _SHARD_NAME.search(url)
-    if not match:
-        raise ValueError(f"cannot derive ImageNet shard name from {url!r}")
-    return match.group(1)
-
-
-def cached_webdataset(
-    commands: list[str], cache_dir: Path, *, shardshuffle: int | bool, seed: int
-) -> wds.DataPipeline:
-    """Official WebDataset pipeline with its built-in validated file cache."""
-
-    pipeline: list[object] = [wds.SimpleShardList(commands, seed=seed), wds.split_by_worker]
-    if shardshuffle:
-        pipeline.append(wds.shuffle(int(shardshuffle), seed=seed))
-    expand = pipelinefilter(tar_file_expander)
-    group = pipelinefilter(group_by_keys)
-    pipeline.extend(
-        [
-            wds.cache.FileCache(
-                cache_dir=str(cache_dir),
-                cache_size=-1,
-                url_to_name=shard_cache_name,
-                handler=wds.reraise_exception,
-            ),
-            expand(handler=wds.reraise_exception),
-            group(handler=wds.reraise_exception),
-        ]
-    )
-    return wds.DataPipeline(*pipeline)
 
 
 def local_webdataset(
@@ -170,9 +129,14 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         cache_dir = Path(args.cache_dir)
         train_commands = shard_commands("train", cache_dir, args.hf_repo)
         val_commands = shard_commands("validation", cache_dir, args.hf_repo)
+
         def dataset_factory(commands, *, shardshuffle, seed):
-            return cached_webdataset(
-                commands, cache_dir, shardshuffle=shardshuffle, seed=seed
+            return wds.WebDataset(
+                commands,
+                resampled=False,
+                shardshuffle=shardshuffle,
+                seed=seed,
+                handler=wds.reraise_exception,
             )
     if args.shard_limit:
         train_commands = train_commands[:args.shard_limit]
