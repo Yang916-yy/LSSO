@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-downloads",
         type=int,
-        default=int(os.environ.get("LSSO_HF_MAX_DOWNLOADS", "2")),
+        default=int(os.environ.get("LSSO_HF_MAX_DOWNLOADS", "8")),
         help="Maximum concurrent HTTP shard downloads across loader workers.",
     )
     parser.add_argument(
@@ -177,7 +177,7 @@ def stream_file(
     cache_dir: Path,
     *,
     emit: bool = True,
-    max_downloads: int = 2,
+    max_downloads: int = 8,
     download_attempts: int = 0,
 ) -> None:
     destination = cache_dir / filename

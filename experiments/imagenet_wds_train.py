@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import json
 import math
 import os
 import random
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -37,11 +39,53 @@ TRAIN_SHARDS = 1024
 VAL_SHARDS = 64
 
 
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def start_prefetcher(args: argparse.Namespace) -> subprocess.Popen[bytes] | None:
+    if args.prefetch_workers <= 0:
+        return None
+    helper = ROOT / "tools" / "hf_wds_prefetch.py"
+    command = [
+        sys.executable,
+        str(helper),
+        "--repo",
+        args.hf_repo,
+        "--cache-dir",
+        args.cache_dir,
+        "--workers",
+        str(args.prefetch_workers),
+        "--download-attempts",
+        str(args.download_attempts),
+        "--shard-limit",
+        str(args.shard_limit),
+        "--seed",
+        str(args.seed),
+        "--parent-pid",
+        str(os.getpid()),
+    ]
+    process = subprocess.Popen(command, env=os.environ.copy())
+    atexit.register(_terminate_process, process)
+    print(
+        f"Xet prefetcher pid={process.pid} workers={args.prefetch_workers}",
+        flush=True,
+    )
+    return process
+
+
 def shard_commands(
     split: str,
     cache_dir: Path,
     repo: str,
-    max_downloads: int = 2,
+    max_downloads: int = 8,
     download_attempts: int = 0,
 ) -> list[str]:
     count = TRAIN_SHARDS if split == "train" else VAL_SHARDS
@@ -208,6 +252,7 @@ def train(args: argparse.Namespace) -> None:
             "reference=4e-3@4096",
             flush=True,
         )
+    prefetcher = start_prefetcher(args)
     train_loader, val_loader = make_loaders(args)
     model = create_model(
         args.model,
@@ -321,6 +366,9 @@ def train(args: argparse.Namespace) -> None:
             torch.save(state, last)
             if is_best:
                 torch.save(state, output / "best.pt")
+    if prefetcher is not None:
+        _terminate_process(prefetcher)
+        atexit.unregister(_terminate_process)
 
 
 def parse_args() -> argparse.Namespace:
@@ -346,8 +394,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-downloads",
         type=int,
-        default=2,
+        default=8,
         help="Maximum concurrent Hugging Face shard downloads across data workers.",
+    )
+    parser.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=7,
+        help=(
+            "Background shard prefetch threads; 0 disables prefetching. The default "
+            "reserves one of eight download slots for an on-demand data worker."
+        ),
     )
     parser.add_argument(
         "--download-attempts",
