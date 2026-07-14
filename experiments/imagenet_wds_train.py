@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import re
 import shlex
 import sys
 import time
@@ -17,6 +18,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import webdataset as wds
+from webdataset.filters import pipelinefilter
+from webdataset.tariterators import group_by_keys, tar_file_expander
 from timm.data import Mixup, create_transform
 from timm.loss import SoftTargetCrossEntropy
 from torch.utils.data import DataLoader
@@ -41,37 +44,61 @@ def shard_commands(
     split: str,
     cache_dir: Path,
     repo: str,
-    max_downloads: int = 4,
-    download_attempts: int = 0,
-    download_idle_timeout: float = 30.0,
 ) -> list[str]:
     count = TRAIN_SHARDS if split == "train" else VAL_SHARDS
     prefix = "train" if split == "train" else "validation"
     digits = 4 if split == "train" else 2
-    helper = ROOT / "tools" / "hf_wds_stream.py"
-    return [
-        "pipe:"
-        + " ".join(
-            shlex.quote(value)
-            for value in (
-                sys.executable,
-                str(helper),
-                "--repo",
-                repo,
-                "--filename",
-                f"imagenet1k-{prefix}-{index:0{digits}d}.tar",
-                "--cache-dir",
-                str(cache_dir),
-                "--max-downloads",
-                str(max_downloads),
-                "--download-attempts",
-                str(download_attempts),
-                "--download-idle-timeout",
-                str(download_idle_timeout),
-            )
+    commands = []
+    for index in range(count):
+        filename = f"imagenet1k-{prefix}-{index:0{digits}d}.tar"
+        url = f"https://huggingface.co/datasets/{repo}/resolve/main/{filename}"
+        # This is Hugging Face's documented WebDataset transport.  The shell
+        # expands HF_TOKEN at runtime; the token is not embedded in configs.
+        commands.append(
+            "pipe:curl --location --fail --silent --show-error "
+            "--retry 10 --retry-connrefused --retry-delay 2 "
+            "--connect-timeout 30 "
+            ' --header "Authorization: Bearer ${HF_TOKEN}" '
+            + shlex.quote(url)
         )
-        for index in range(count)
-    ]
+    return commands
+
+
+_SHARD_NAME = re.compile(r"(imagenet1k-(?:train|validation)-\d+\.tar)")
+
+
+def shard_cache_name(url: str) -> str:
+    """Keep WebDataset's native cache compatible with existing tar files."""
+
+    match = _SHARD_NAME.search(url)
+    if not match:
+        raise ValueError(f"cannot derive ImageNet shard name from {url!r}")
+    return match.group(1)
+
+
+def cached_webdataset(
+    commands: list[str], cache_dir: Path, *, shardshuffle: int | bool, seed: int
+) -> wds.DataPipeline:
+    """Official WebDataset pipeline with its built-in validated file cache."""
+
+    pipeline: list[object] = [wds.SimpleShardList(commands, seed=seed), wds.split_by_worker]
+    if shardshuffle:
+        pipeline.append(wds.shuffle(int(shardshuffle), seed=seed))
+    expand = pipelinefilter(tar_file_expander)
+    group = pipelinefilter(group_by_keys)
+    pipeline.extend(
+        [
+            wds.cache.FileCache(
+                cache_dir=str(cache_dir),
+                cache_size=-1,
+                url_to_name=shard_cache_name,
+                handler=wds.reraise_exception,
+            ),
+            expand(handler=wds.reraise_exception),
+            group(handler=wds.reraise_exception),
+        ]
+    )
+    return wds.DataPipeline(*pipeline)
 
 
 def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
@@ -96,39 +123,31 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
-    train_commands = shard_commands(
-        "train", Path(args.cache_dir), args.hf_repo,
-        args.max_downloads, args.download_attempts, args.download_idle_timeout
-    )
-    val_commands = shard_commands(
-        "validation", Path(args.cache_dir), args.hf_repo,
-        args.max_downloads, args.download_attempts, args.download_idle_timeout
-    )
+    cache_dir = Path(args.cache_dir)
+    train_commands = shard_commands("train", cache_dir, args.hf_repo)
+    val_commands = shard_commands("validation", cache_dir, args.hf_repo)
     if args.shard_limit:
         train_commands = train_commands[:args.shard_limit]
         val_commands = val_commands[:args.shard_limit]
-    train = (
-        wds.WebDataset(
+    train = cached_webdataset(
             train_commands,
-            resampled=False,
+            cache_dir,
             shardshuffle=min(100, len(train_commands)) if len(train_commands) > 1 else False,
             seed=args.seed,
-        )
-        .shuffle(args.shuffle_buffer)
-        .decode("pil")
-        .to_tuple("jpg;jpeg;png", "cls")
-        .map_tuple(train_transform, int)
-        .batched(args.batch_size, partial=False)
+        ).compose(
+        wds.shuffle(args.shuffle_buffer),
+        wds.decode("pil"),
+        wds.to_tuple("jpg;jpeg;png", "cls"),
+        wds.map_tuple(train_transform, int),
+        wds.batched(args.batch_size, partial=False),
     )
-    validation = (
-        wds.WebDataset(
-            val_commands,
-            shardshuffle=False,
-        )
-        .decode("pil")
-        .to_tuple("jpg;jpeg;png", "cls")
-        .map_tuple(val_transform, int)
-        .batched(args.eval_batch_size, partial=True)
+    validation = cached_webdataset(
+        val_commands, cache_dir, shardshuffle=False, seed=args.seed
+    ).compose(
+        wds.decode("pil"),
+        wds.to_tuple("jpg;jpeg;png", "cls"),
+        wds.map_tuple(val_transform, int),
+        wds.batched(args.eval_batch_size, partial=True),
     )
     steps = args.steps_per_epoch or TRAIN_SAMPLES // args.batch_size
     train_loader = wds.WebLoader(
@@ -346,24 +365,6 @@ def parse_args() -> argparse.Namespace:
         help="Validation loader workers, independent of --workers; workers exit after each evaluation.",
     )
     parser.add_argument("--shuffle-buffer", type=int, default=10000)
-    parser.add_argument(
-        "--max-downloads",
-        type=int,
-        default=4,
-        help="Maximum concurrent Hugging Face shard downloads across data workers.",
-    )
-    parser.add_argument(
-        "--download-attempts",
-        type=int,
-        default=0,
-        help="Attempts per shard; 0 retries transient network errors indefinitely.",
-    )
-    parser.add_argument(
-        "--download-idle-timeout",
-        type=float,
-        default=30.0,
-        help="Restart a shard request after this many seconds without receiving bytes.",
-    )
     parser.add_argument("--shard-limit", type=int, default=0, help="Limit each split for smoke tests")
     parser.add_argument("--steps-per-epoch", type=int, default=0)
     parser.add_argument("--max-val-steps", type=int, default=0)

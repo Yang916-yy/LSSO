@@ -5,7 +5,7 @@ import timm
 import torch
 
 import examples.models  # noqa: F401 - imports registration side effects
-from experiments.imagenet_wds_train import parse_args, shard_commands
+from experiments.imagenet_wds_train import shard_cache_name, shard_commands
 from examples.models.vision_llama import VisionLLaMA
 
 
@@ -89,26 +89,16 @@ def test_registered_rank_can_be_passed_explicitly() -> None:
 
 
 def test_imagenet_shard_names_match_repository_layout(tmp_path) -> None:
-    train = shard_commands(
-        "train", tmp_path, "timm/imagenet-1k-wds",
-        max_downloads=3, download_attempts=7,
-    )
+    train = shard_commands("train", tmp_path, "timm/imagenet-1k-wds")
     validation = shard_commands("validation", tmp_path, "timm/imagenet-1k-wds")
     assert "imagenet1k-train-0000.tar" in train[0]
     assert "imagenet1k-train-1023.tar" in train[-1]
     assert "imagenet1k-validation-00.tar" in validation[0]
     assert "imagenet1k-validation-63.tar" in validation[-1]
-    assert "--max-downloads 3" in train[0]
-    assert "--download-attempts 7" in train[0]
-    assert "--download-idle-timeout 30.0" in train[0]
-    assert "--max-downloads 4" in validation[0]
-    assert "--download-attempts 0" in validation[0]
-
-
-def test_imagenet_download_default_uses_stable_four_streams(monkeypatch) -> None:
-    monkeypatch.setattr("sys.argv", ["imagenet_wds_train.py"])
-    args = parse_args()
-    assert args.max_downloads == 4
+    assert train[0].startswith("pipe:curl ")
+    assert "--retry 10 --retry-connrefused" in train[0]
+    assert "${HF_TOKEN}" in train[0]
+    assert shard_cache_name(train[0]) == "imagenet1k-train-0000.tar"
 
 
 def test_pretrained_requires_explicit_checkpoint() -> None:
