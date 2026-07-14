@@ -95,9 +95,10 @@ def test_imagenet_shard_names_match_repository_layout(tmp_path) -> None:
     assert "imagenet1k-train-1023.tar" in train[-1]
     assert "imagenet1k-validation-00.tar" in validation[0]
     assert "imagenet1k-validation-63.tar" in validation[-1]
-    assert train[0].startswith("pipe:curl ")
-    assert "--retry 10 --retry-connrefused" in train[0]
-    assert "${HF_TOKEN}" in train[0]
+    assert train[0].startswith("pipe:")
+    assert "hf_wds_pipe.py" in train[0]
+    assert "--repo timm/imagenet-1k-wds" in train[0]
+    assert "HF_TOKEN" not in train[0]
     assert shard_cache_name(train[0]) == "imagenet1k-train-0000.tar"
 
 

@@ -51,15 +51,22 @@ def shard_commands(
     commands = []
     for index in range(count):
         filename = f"imagenet1k-{prefix}-{index:0{digits}d}.tar"
-        url = f"https://huggingface.co/datasets/{repo}/resolve/main/{filename}"
-        # This is Hugging Face's documented WebDataset transport.  The shell
-        # expands HF_TOKEN at runtime; the token is not embedded in configs.
+        helper = ROOT / "tools" / "hf_wds_pipe.py"
+        # FileCache still owns the validated on-disk cache.  The small wrapper
+        # only makes the documented pipe transport tolerate transient Xet 403
+        # responses without risking concatenated partial tar streams.
         commands.append(
-            "pipe:curl --location --fail --silent --show-error "
-            "--retry 10 --retry-connrefused --retry-delay 2 "
-            "--connect-timeout 30 "
-            ' --header "Authorization: Bearer ${HF_TOKEN}" '
-            + shlex.quote(url)
+            "pipe:"
+            + " ".join(
+                (
+                    shlex.quote(sys.executable),
+                    shlex.quote(str(helper)),
+                    "--repo",
+                    shlex.quote(repo),
+                    "--filename",
+                    shlex.quote(filename),
+                )
+            )
         )
     return commands
 
