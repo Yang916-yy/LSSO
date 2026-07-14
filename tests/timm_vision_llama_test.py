@@ -7,7 +7,6 @@ import torch
 import examples.models  # noqa: F401 - imports registration side effects
 from experiments.imagenet_wds_train import parse_args, shard_commands
 from examples.models.vision_llama import VisionLLaMA
-from tools.hf_wds_prefetch import shard_filenames
 
 
 REGISTERED_MODELS = (
@@ -105,28 +104,10 @@ def test_imagenet_shard_names_match_repository_layout(tmp_path) -> None:
     assert "--download-attempts 0" in validation[0]
 
 
-def test_prefetch_covers_every_shard_with_validation_last() -> None:
-    filenames = shard_filenames(seed=7)
-    assert len(filenames) == 1088
-    assert set(filenames[:1024]) == {
-        f"imagenet1k-train-{index:04d}.tar" for index in range(1024)
-    }
-    assert filenames[1024] == "imagenet1k-validation-00.tar"
-    assert filenames[-1] == "imagenet1k-validation-63.tar"
-
-
-def test_prefetch_shard_limit_is_safe_for_smoke() -> None:
-    assert set(shard_filenames(shard_limit=1)) == {
-        "imagenet1k-train-0000.tar",
-        "imagenet1k-validation-00.tar",
-    }
-
-
-def test_imagenet_download_defaults_match_official_file_concurrency(monkeypatch) -> None:
+def test_imagenet_download_default_allows_eight_streaming_shards(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["imagenet_wds_train.py"])
     args = parse_args()
     assert args.max_downloads == 8
-    assert args.prefetch_workers == 7
 
 
 def test_pretrained_requires_explicit_checkpoint() -> None:

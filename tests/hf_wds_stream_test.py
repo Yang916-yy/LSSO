@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import io
-import sys
 import tarfile
-from types import SimpleNamespace
+import urllib.error
+from email.message import Message
 
 import pytest
 
-from tools.hf_wds_stream import _download_slot, _download_validated, validate_tar
+from tools.hf_wds_stream import _download_slot, _stream_download, validate_tar
 
 
 def test_download_slot_rejects_nonpositive_limit(tmp_path) -> None:
@@ -57,46 +57,116 @@ def _archive_bytes() -> bytes:
     return archive.getvalue()
 
 
-def test_download_uses_official_hub_local_dir(tmp_path, monkeypatch) -> None:
+class Response(io.BytesIO):
+    def __init__(self, content: bytes, status: int, headers: dict[str, str]):
+        super().__init__(content)
+        self.status = status
+        self.headers = Message()
+        for key, value in headers.items():
+            self.headers[key] = value
+
+    def getcode(self) -> int:
+        return self.status
+
+
+def test_download_forwards_bytes_while_writing_partial(tmp_path, monkeypatch) -> None:
+    complete = _archive_bytes()
+
+    def urlopen(request, timeout):
+        return Response(complete, 200, {"Content-Length": str(len(complete))})
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    partial = tmp_path / "shard.tar.partial"
+    output = io.BytesIO()
+    _stream_download("https://example.test/shard.tar", "token", partial, output=output)
+    assert output.getvalue() == complete
+    assert partial.read_bytes() == complete
+
+
+def test_download_emits_cached_prefix_then_resumes_range(tmp_path, monkeypatch) -> None:
+    complete = _archive_bytes()
+    cutoff = len(complete) // 2
+    partial = tmp_path / "shard.tar.partial"
+    partial.write_bytes(complete[:cutoff])
     requests = []
 
-    def download(**kwargs):
-        requests.append(kwargs)
-        destination = kwargs["local_dir"] / kwargs["filename"]
-        destination.write_bytes(_archive_bytes())
-        return str(destination)
+    def urlopen(request, timeout):
+        requests.append(request)
+        assert request.get_header("Range") == f"bytes={cutoff}-"
+        return Response(
+            complete[cutoff:],
+            206,
+            {
+                "Content-Length": str(len(complete) - cutoff),
+                "Content-Range": f"bytes {cutoff}-{len(complete) - 1}/{len(complete)}",
+            },
+        )
 
-    monkeypatch.setitem(
-        sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=download)
-    )
-    result = _download_validated("owner/dataset", "shard.tar", "token", tmp_path)
-    assert result == tmp_path / "shard.tar"
-    assert requests == [{
-        "repo_id": "owner/dataset",
-        "filename": "shard.tar",
-        "repo_type": "dataset",
-        "token": "token",
-        "local_dir": tmp_path,
-    }]
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    output = io.BytesIO()
+    _stream_download("https://example.test/shard.tar", "token", partial, output=output)
+    assert len(requests) == 1
+    assert output.getvalue() == complete
+    assert partial.read_bytes() == complete
+
+
+def test_network_retry_continues_one_tar_stream_without_duplicate_bytes(
+    tmp_path, monkeypatch
+) -> None:
+    complete = _archive_bytes()
+    cutoff = len(complete) // 2
+    requests = []
+
+    class FlakyResponse(Response):
+        def __init__(self):
+            super().__init__(complete, 200, {"Content-Length": str(len(complete))})
+            self.reads = 0
+
+        def read(self, size=-1):
+            self.reads += 1
+            if self.reads == 1:
+                return super().read(cutoff)
+            raise urllib.error.URLError("connection reset")
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        if len(requests) == 1:
+            return FlakyResponse()
+        assert request.get_header("Range") == f"bytes={cutoff}-"
+        return Response(
+            complete[cutoff:],
+            206,
+            {
+                "Content-Length": str(len(complete) - cutoff),
+                "Content-Range": f"bytes {cutoff}-{len(complete) - 1}/{len(complete)}",
+            },
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    partial = tmp_path / "shard.tar.partial"
+    output = io.BytesIO()
+    _stream_download("https://example.test/shard.tar", "token", partial, output=output)
+    assert len(requests) == 2
+    assert output.getvalue() == complete
+    assert partial.read_bytes() == complete
 
 
 def test_download_honors_finite_attempt_limit(tmp_path, monkeypatch) -> None:
     calls = []
 
-    def download(**kwargs):
-        calls.append(kwargs)
-        raise ConnectionError("temporary outage")
+    def urlopen(request, timeout):
+        calls.append(request)
+        raise urllib.error.URLError("temporary outage")
 
-    monkeypatch.setitem(
-        sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=download)
-    )
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
     monkeypatch.setattr("time.sleep", lambda _: None)
     with pytest.raises(OSError, match="after 2 attempts"):
-        _download_validated(
-            "owner/dataset",
-            "shard.tar",
+        _stream_download(
+            "https://example.test/shard.tar",
             "token",
-            tmp_path,
+            tmp_path / "shard.tar.partial",
+            output=io.BytesIO(),
             attempts=2,
         )
     assert len(calls) == 2
@@ -105,21 +175,17 @@ def test_download_honors_finite_attempt_limit(tmp_path, monkeypatch) -> None:
 def test_download_does_not_retry_authentication_error(tmp_path, monkeypatch) -> None:
     calls = []
 
-    def download(**kwargs):
-        calls.append(kwargs)
-        error = RuntimeError("unauthorized")
-        error.response = SimpleNamespace(status_code=401)
-        raise error
+    def urlopen(request, timeout):
+        calls.append(request)
+        raise urllib.error.HTTPError(request.full_url, 401, "unauthorized", {}, None)
 
-    monkeypatch.setitem(
-        sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=download)
-    )
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
     with pytest.raises(OSError, match="non-retryable HTTP 401"):
-        _download_validated(
-            "owner/dataset",
-            "shard.tar",
+        _stream_download(
+            "https://example.test/shard.tar",
             "token",
-            tmp_path,
+            tmp_path / "shard.tar.partial",
+            output=io.BytesIO(),
         )
     assert len(calls) == 1
 
@@ -127,22 +193,20 @@ def test_download_does_not_retry_authentication_error(tmp_path, monkeypatch) -> 
 def test_download_retries_transient_forbidden_response(tmp_path, monkeypatch) -> None:
     calls = []
 
-    def download(**kwargs):
-        calls.append(kwargs)
-        error = RuntimeError("temporary CDN rejection")
-        error.response = SimpleNamespace(status_code=403)
-        raise error
+    def urlopen(request, timeout):
+        calls.append(request)
+        raise urllib.error.HTTPError(
+            request.full_url, 403, "temporary CDN rejection", {}, None
+        )
 
-    monkeypatch.setitem(
-        sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=download)
-    )
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
     monkeypatch.setattr("time.sleep", lambda _: None)
     with pytest.raises(OSError, match="after 2 attempts"):
-        _download_validated(
-            "owner/dataset",
-            "shard.tar",
+        _stream_download(
+            "https://example.test/shard.tar",
             "token",
-            tmp_path,
+            tmp_path / "shard.tar.partial",
+            output=io.BytesIO(),
             attempts=2,
         )
     assert len(calls) == 2
