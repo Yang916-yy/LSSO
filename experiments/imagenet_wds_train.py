@@ -108,6 +108,37 @@ def cached_webdataset(
     return wds.DataPipeline(*pipeline)
 
 
+def local_webdataset(
+    shards: list[str], *, shardshuffle: int | bool, seed: int
+) -> wds.DataPipeline:
+    """Read already-local shards without the network/cache stages."""
+
+    pipeline: list[object] = [wds.SimpleShardList(shards, seed=seed)]
+    if shardshuffle:
+        pipeline.append(wds.shuffle(int(shardshuffle), seed=seed))
+    pipeline.extend(
+        [
+            wds.split_by_worker,
+            wds.tarfile_to_samples(handler=wds.reraise_exception),
+        ]
+    )
+    return wds.DataPipeline(*pipeline)
+
+
+def local_shards(root: Path, split: str) -> list[str]:
+    manifest = root / "dataset.json"
+    if not manifest.is_file():
+        raise RuntimeError(f"local WebDataset is incomplete; missing {manifest}")
+    state = json.loads(manifest.read_text(encoding="utf-8"))
+    expected = TRAIN_SAMPLES if split == "train" else VAL_SAMPLES
+    if int(state[f"{split}_samples"]) != expected:
+        raise RuntimeError(f"invalid {split} sample count in {manifest}")
+    shards = sorted(str(path) for path in root.glob(f"imagenet1k-{split}-*.tar"))
+    if not shards:
+        raise RuntimeError(f"no local {split} shards under {root}")
+    return shards
+
+
 def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     train_transform = create_transform(
         input_size=args.image_size,
@@ -130,26 +161,35 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
-    cache_dir = Path(args.cache_dir)
-    train_commands = shard_commands("train", cache_dir, args.hf_repo)
-    val_commands = shard_commands("validation", cache_dir, args.hf_repo)
+    if args.local_wds_dir:
+        local_root = Path(args.local_wds_dir)
+        train_commands = local_shards(local_root, "train")
+        val_commands = local_shards(local_root, "validation")
+        dataset_factory = local_webdataset
+    else:
+        cache_dir = Path(args.cache_dir)
+        train_commands = shard_commands("train", cache_dir, args.hf_repo)
+        val_commands = shard_commands("validation", cache_dir, args.hf_repo)
+        def dataset_factory(commands, *, shardshuffle, seed):
+            return cached_webdataset(
+                commands, cache_dir, shardshuffle=shardshuffle, seed=seed
+            )
     if args.shard_limit:
         train_commands = train_commands[:args.shard_limit]
         val_commands = val_commands[:args.shard_limit]
-    train = cached_webdataset(
-            train_commands,
-            cache_dir,
-            shardshuffle=min(100, len(train_commands)) if len(train_commands) > 1 else False,
-            seed=args.seed,
-        ).compose(
+    train = dataset_factory(
+        train_commands,
+        shardshuffle=min(100, len(train_commands)) if len(train_commands) > 1 else False,
+        seed=args.seed,
+    ).compose(
         wds.shuffle(args.shuffle_buffer),
         wds.decode("pil"),
         wds.to_tuple("jpg;jpeg;png", "cls"),
         wds.map_tuple(train_transform, int),
         wds.batched(args.batch_size, partial=False),
     )
-    validation = cached_webdataset(
-        val_commands, cache_dir, shardshuffle=False, seed=args.seed
+    validation = dataset_factory(
+        val_commands, shardshuffle=False, seed=args.seed
     ).compose(
         wds.decode("pil"),
         wds.to_tuple("jpg;jpeg;png", "cls"),
@@ -216,7 +256,7 @@ def evaluate(
 def train(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("formal ImageNet training requires CUDA")
-    if not os.environ.get("HF_TOKEN"):
+    if not args.local_wds_dir and not os.environ.get("HF_TOKEN"):
         raise RuntimeError("set HF_TOKEN after accepting timm/imagenet-1k-wds access")
     set_seed(args.seed)
     torch.set_float32_matmul_precision("high")
@@ -295,6 +335,8 @@ def train(args: argparse.Namespace) -> None:
             loss_sum = 0.0
             observed_steps = 0
             for step, (images, labels) in enumerate(train_loader):
+                if step >= steps_per_epoch:
+                    break
                 observed_steps = step + 1
                 images, labels = mixup(images, labels)
                 images = images.to(device, non_blocking=True)
@@ -358,6 +400,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--hf-repo", default="timm/imagenet-1k-wds")
     parser.add_argument("--cache-dir", default="/local_nvme/imagenet-wds")
+    parser.add_argument(
+        "--local-wds-dir",
+        default="",
+        help="Local ImageNet shards made by tools/kaggle_imagenet_to_wds.py.",
+    )
     parser.add_argument("--output", default="runs/imagenet1k/vision_llama_base_rrlsso_r32")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=256)
