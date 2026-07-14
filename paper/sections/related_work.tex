@@ -1,0 +1,29 @@
+\section{Related Work}
+
+\paragraph{Efficient attention.}
+Linformer projects attention along the sequence dimension~\cite{wang2020linformer}; Performer uses random-feature kernelization~\cite{choromanski2021performer}; and Nystr\"omformer uses landmark-based approximation~\cite{xiong2021nystromformer}. These methods reduce the cost of the attention computation while retaining attention as the underlying interaction rule. FlashAttention instead computes exact attention with an IO-aware schedule~\cite{dao2022flashattention}. \LSSO\ differs in objective: it does not approximate the softmax routing matrix, but defines another input-conditioned global operator whose exact computation is low-rank.
+
+\paragraph{Token mixers beyond attention.}
+MLP-Mixer learns static token-mixing matrices~\cite{tolstikhin2021mlpmixer}, while FNet uses Fourier transforms~\cite{lee-thorp2022fnet}. These architectures demonstrate that global interaction need not use attention, but their mixing transforms are not generated as a structured function of the current sample. Recent dynamic-MLP interpretations write attention itself as a network with context-instantiated weights~\cite{lu2026hypermlp,he2026weightformer}. \LSSO\ shares the principle of dynamic parameterization but compresses the dynamic interaction into a fixed-rank subspace and constrains the induced operator through a positive-definite inverse.
+
+\paragraph{Test-time training and fast weights.}
+TTT layers treat the current context as a temporary training set and update a
+compact inner model before reading from it~\cite{sun2024ttt}. This makes the
+hidden state itself an expressive learned model, generalizing the associative
+state of linear attention. ViT$^3$ systematically studies this paradigm in
+vision and finds that a single full-batch inner epoch works well, increasing
+inner width improves accuracy, and deeper inner architectures suffer from both
+outer- and inner-loop optimization difficulties~\cite{han2026vit3}. \LSSO\ is
+complementary rather than an implementation of the ViT$^3$ block: its inner
+model is a shared linear ridge learner, its initialization is fixed at the
+regularizer center, and its optimum is computed analytically instead of by a
+finite unrolled update. Moreover, \LSSO\ reads out a regularized residual from
+the same sample rather than evaluating a generic adapted network on a separate
+query. We use ``closed-form test-time learning'' in this precise per-sample
+inner-optimization sense.
+
+\paragraph{Implicit and optimization layers.}
+Deep equilibrium models represent an infinite-depth weight-tied network through a fixed point and differentiate implicitly through the solution~\cite{bai2019deq}. OptNet and differentiable convex optimization layers place structured optimization problems inside neural networks~\cite{amos2017optnet,agrawal2019cvxpylayers}. \LSSO\ belongs to this broad family but is deliberately narrower: its equilibrium map is linear for fixed input-generated features, its energy is an unconstrained strongly convex quadratic, and its low-rank Hessian admits an exact Woodbury solve rather than a generic iterative optimizer.
+
+\paragraph{Rotary position structure.}
+Rotary position embeddings encode relative displacement through products of position-dependent orthogonal rotations~\cite{su2024roformer}. \RRLSSO\ applies the rotary transform to the relation basis rather than to queries and keys. Relative position therefore enters the Gram matrix that defines the solve, while positive definiteness follows automatically from its factorized form.

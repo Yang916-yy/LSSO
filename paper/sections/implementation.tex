@@ -1,0 +1,70 @@
+\section{Implementation and Complexity}
+\label{sec:implementation}
+
+\subsection{Forward Computation}
+
+The implementation never materializes $UU^\top\in\R^{N\times N}$. For every batch element and head, it accumulates
+\begin{equation}
+  S=U^\top U\in\R^{r\times r},
+  \qquad
+  T=U^\top C\in\R^{r\times d_h},
+\end{equation}
+forms $G=\I_r+\alpha S$, and solves
+\begin{equation}
+  GK=T.
+\end{equation}
+The final output is computed as
+\begin{equation}
+  Y=\mu^{-1}(C-\alpha UK).
+\end{equation}
+Because $G$ is symmetric positive definite, it can be factorized with Cholesky. The statistics and small solve are accumulated in float32 under half-precision or bfloat16 autocast, while projection and readout remain in the activation dtype. The $U$ and $C$ projections are fused into one linear map. In the optimized path, RMS normalization, length scaling, and rank rotation are fused when their standard unmasked layout is used, and the final rank-space scaling is folded into the readout matrix multiplication.
+
+\subsection{Implicit Backward}
+
+Let $\mathcal L$ be a scalar loss and $G_Y=\partial\mathcal L/\partial Y$. Differentiating $AY=C$ gives
+\begin{equation}
+  dY=A^{-1}(dC-dA\,Y).
+\end{equation}
+Since $A$ is symmetric, define the adjoint state
+\begin{equation}
+  P=A^{-1}G_Y.
+  \label{eq:adjoint}
+\end{equation}
+The backward pass therefore uses the same positive-definite Woodbury solve as the forward pass. The principal derivatives are
+\begin{align}
+  \frac{\partial\mathcal L}{\partial C}&=P,\\
+  \frac{\partial\mathcal L}{\partial U}
+  &=-\gamma(PY^\top+YP^\top)U,\\
+  \frac{\partial\mathcal L}{\partial\mu}
+  &=-\langle P,Y\rangle,\\
+  \frac{\partial\mathcal L}{\partial\gamma}
+  &=-\langle U^\top P,U^\top Y\rangle.
+\end{align}
+This avoids differentiating through a dense token-space inverse and makes the algebraic structure of forward and backward consistent.
+
+\subsection{Arithmetic and Memory Complexity}
+
+For one layer, the fused input projection costs
+\[
+  ND(Hr+D),
+\]
+and the output projection costs $ND^2$. Across all heads, the solve path costs
+\begin{equation}
+  O\!\left(
+    HNr^2+2HNrd_h+Hr^3+Hr^2d_h
+  \right).
+  \label{eq:solve_complexity}
+\end{equation}
+Using $Hd_h=D$, the total mixer cost is
+\begin{align}
+  O\!\big(&ND(Hr+D)+ND^2+HNr^2\notag\\
+           &+2NrD+Hr^3+Dr^2\big).
+  \label{eq:total_complexity}
+\end{align}
+For fixed rank and width, the solve-specific terms are linear in $N$. The principal solve intermediates are $U$, $C$, the $r\times r$ statistics, and the $r\times d_h$ right-hand side; no $N\times N$ tensor is required. In contrast, standard attention includes the score and value-routing arithmetic $O(N^2D)$, even when a fused kernel reduces materialized memory.
+
+The rank $r$ is therefore both a capacity control and a systems parameter. Increasing it expands the dynamic relation subspace but raises projection cost linearly, statistics cost quadratically, and factorization cost cubically. The intended regime is $r\ll N$ and typically $r\leq d_h$.
+
+\subsection{Scope of the Formulation}
+
+The operator studied here is bidirectional: a single solve uses statistics from all valid tokens. We do not derive or claim a causal decoding recurrence. We also distinguish the mathematical inverse from a generic Sylvester equation solver: although the module name is retained, the implemented primitive is a positive-shifted low-rank linear system with multiple right-hand sides. This narrower description exposes the exact assumptions used by the theory and implementation.

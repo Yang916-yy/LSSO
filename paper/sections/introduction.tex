@@ -1,0 +1,120 @@
+\section{Introduction}
+
+Self-attention is the dominant global token mixer in modern sequence and
+vision encoders~\cite{vaswani2017attention,dosovitskiy2021vit}. For a single
+head, it applies
+\begin{equation}
+  \operatorname{Attn}(Q,K,V)
+  =\softmax\!\left(\frac{QK^\top}{\sqrt{d_h}}\right)V.
+  \label{eq:attention}
+\end{equation}
+Its global, content-dependent routing is expressive, but the interaction space
+grows with sequence length and the arithmetic remains quadratic in the token
+count, even when IO-aware kernels avoid materializing the complete score
+matrix~\cite{dao2022flashattention}.
+
+A broader view treats sequence mixing as learning from the current context.
+Attention itself can be written as a context-instantiated two-layer network,
+\begin{equation}
+  q_i \longmapsto Kq_i
+  \longmapsto \softmax(Kq_i)
+  \longmapsto V^\top\softmax(Kq_i),
+  \label{eq:attention_dynamic_mlp}
+\end{equation}
+whose hidden width is the number of tokens. Test-time training (TTT) makes this
+learning interpretation explicit: key--value pairs form a temporary dataset,
+a compact inner model is updated on that dataset, and its adapted weights are
+used to process the current context~\cite{sun2024ttt}. Recent visual evidence
+shows that full-batch inner learning is effective for bidirectional vision and
+that increasing inner-model capacity helps; it also reveals a central obstacle:
+deeper inner models and additional inner epochs become difficult to optimize
+and expensive to unroll~\cite{han2026vit3}.
+
+This raises a different question from how to design a deeper inner network:
+can the useful per-sample learning problem be structured so that its optimum is
+obtained exactly, without choosing or unrolling a finite number of adaptation
+steps? We answer affirmatively for a strongly convex low-rank learner. Given
+$X\in\R^{N\times D}$, each head predicts
+\[
+  U(X)\in\R^{N\times r},
+  \qquad
+  C(X)\in\R^{N\times d_h},
+\]
+and returns
+\begin{equation}
+  Y=(\mu\I+\gamma UU^\top)^{-1}C,
+  \qquad \mu>0,\quad \gamma\geq0.
+  \label{eq:lsso_intro}
+\end{equation}
+We call this module the Learnable Structured Solve Operator (\LSSO).
+
+The key to its interpretation is the rank-space variable
+\begin{equation}
+  Z^\star
+  =(\I+\alpha U^\top U)^{-1}\alpha U^\top C,
+  \qquad \alpha=\gamma/\mu.
+  \label{eq:fast_weights_intro}
+\end{equation}
+It is not merely a Woodbury intermediate. It is exactly the unique minimizer
+of the per-sample inner problem
+\begin{equation}
+  Z^\star
+  =\arg\min_Z
+  \left[
+    \frac12\lVert Z\rVert_F^2
+    +\frac{\alpha}{2}\lVert UZ-C\rVert_F^2
+  \right].
+  \label{eq:inner_intro}
+\end{equation}
+Thus $Z^\star(X)$ is a set of temporary fast weights learned from the current
+sample. The token output is their regularized residual readout,
+\begin{equation}
+  Y=\mu^{-1}(C-UZ^\star).
+  \label{eq:residual_intro}
+\end{equation}
+The token-space equilibrium and rank-space learner are an exact primal--dual
+pair, connected by $\mu Y=C-UZ^\star$ and
+$Z^\star=\gamma U^\top Y$.
+
+This perspective subsumes our other interpretations. Gradient descent on the
+inner objective converges to $Z^\star$ for every safe step size; \LSSO\ computes
+that infinite-step limit directly through an $r\times r$ symmetric
+positive-definite solve. The Neumann series is recovered as the special
+unit-step iteration under its stronger spectral condition. In token space the
+same solution is the unique minimizer of a strongly convex energy and a
+rational spectral filter that suppresses modes strongly predictable from the
+sample-specific relation subspace. \LSSO\ therefore eliminates
+\emph{optimization depth} for this shared linear inner learner. It does not
+claim a closed-form solution for an arbitrary deep nonlinear inner network.
+
+For spatial inputs, we introduce Rank-Rotary LSSO (\RRLSSO). It applies a
+token-dependent orthogonal rotation $R(p_i)$ to each rank feature. The resulting
+inner feature kernel is
+\[
+  u_i^\top R(p_i)^\top R(p_j)u_j
+  =u_i^\top R(p_j-p_i)u_j.
+\]
+Beyond injecting relative displacement, the rotation changes the covariance,
+conditioning, and effective rank of the per-sample regression design. It
+therefore reshapes the geometry and effective adaptation directions of the
+inner learner while preserving row norms, total relation energy, and the
+positive-semidefinite Gram form.
+
+Our contributions are:
+\begin{itemize}
+  \item We formulate global token mixing as closed-form per-sample inner
+  learning: the outer network constructs a low-rank ridge problem and an exact
+  structured solve obtains its temporary fast weights.
+  \item We prove an exact primal--dual equivalence between the token-space
+  equilibrium and rank-space ridge learner, and identify the output as a
+  regularized sample-conditioned residual.
+  \item We show that the solve is the exact limit of convergent inner gradient
+  descent, with Neumann expansion as a unit-step special case, thereby
+  analytically eliminating finite-step inner optimization depth.
+  \item We derive well-posedness, spectral, norm, conditioning, and energy
+  guarantees, together with an exact Woodbury implementation that never forms
+  an $N\times N$ matrix.
+  \item We interpret rank rotation as inner-feature geometric augmentation and
+  characterize how stable-rank redistribution changes adaptation directions
+  and the convergence margin without changing total relation energy.
+\end{itemize}

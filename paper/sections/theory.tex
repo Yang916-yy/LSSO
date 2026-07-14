@@ -1,0 +1,399 @@
+\section{Theoretical Analysis}
+\label{sec:theory}
+
+We analyze one head and suppress batch and head indices. Let
+\begin{equation}
+  A=\mu\I_N+\gamma UU^\top,
+  \qquad \mu>0,\quad\gamma\geq0.
+\end{equation}
+The same statements apply to \RRLSSO\ after replacing $U$ by $\widetilde U$.
+
+\subsection{Well-Posedness and Exact Rank-Space Solution}
+
+\begin{proposition}[Existence and uniqueness]
+\label{prop:spd}
+$A$ is symmetric positive definite. Hence $AY=C$ has a unique solution for every $C$.
+\end{proposition}
+\begin{proof}
+For every nonzero $z\in\R^N$,
+\[
+  z^\top Az
+  =\mu\lVert z\rVert_2^2
+  +\gamma\lVert U^\top z\rVert_2^2
+  \geq\mu\lVert z\rVert_2^2>0.
+\]
+\end{proof}
+
+\begin{proposition}[Exact Woodbury reduction]
+\label{prop:woodbury}
+The unique solution is given by \cref{eq:woodbury}, including at $\gamma=0$.
+\end{proposition}
+\begin{proof}
+For $\gamma>0$, apply the Woodbury identity to $\mu\I_N+U(\gamma\I_r)U^\top$:
+\[
+  A^{-1}
+  =\mu^{-1}\I_N
+  -\mu^{-1}U
+  (\gamma^{-1}\I_r+\mu^{-1}U^\top U)^{-1}
+  U^\top\mu^{-1}.
+\]
+Multiplying the inner inverse by $\gamma$ gives \cref{eq:woodbury}. The resulting expression is continuous at $\gamma=0$ and then reduces to $Y=\mu^{-1}C$.
+\end{proof}
+
+The proposition separates two notions that are sometimes conflated. The induced correction is low-rank, but the rank-space computation is not an approximation: it evaluates the full inverse operator exactly.
+
+\subsection{Spectral Response, Stability, and Signed Mixing}
+
+Let $UU^\top=Q\Lambda Q^\top$ over its $k$ nonzero eigen-directions, where $Q^\top Q=\I_k$ and $\Lambda=\diag(\lambda_1,\ldots,\lambda_k)$ with $\lambda_i>0$. Define $P_\perp=\I_N-QQ^\top$.
+
+\begin{proposition}[Input-conditioned inverse filter]
+\label{prop:spectrum}
+For fixed $U$,
+\begin{equation}
+  A^{-1}
+  =Q\diag\!\left(\frac{1}{\mu+\gamma\lambda_i}\right)Q^\top
+  +\mu^{-1}P_\perp.
+  \label{eq:spectral_filter}
+\end{equation}
+Thus \LSSO\ applies selective shrinkage on the relation subspace and isotropic scale $\mu^{-1}$ on its orthogonal complement.
+\end{proposition}
+\begin{proof}
+On $\operatorname{span}(Q)$, $A$ has eigenvalues $\mu+\gamma\lambda_i$. On its orthogonal complement, $UU^\top$ vanishes and $A$ acts as $\mu\I$.
+\end{proof}
+
+\begin{proposition}[Norm and conditioning bounds]
+\label{prop:bounds}
+For fixed $U$,
+\begin{align}
+  \lVert Y\rVert_F&\leq\mu^{-1}\lVert C\rVert_F,\label{eq:norm_bound}\\
+  \kappa_2(A)&\leq1+\frac{\gamma}{\mu}\lVert U\rVert_2^2.
+  \label{eq:condition_bound}
+\end{align}
+For multiple heads followed by $W_O$,
+\begin{equation}
+  \lVert Y_{\mathrm{cat}}W_O\rVert_F
+  \leq\mu_{\min}^{-1}
+  \lVert C_{\mathrm{cat}}\rVert_F\lVert W_O\rVert_2.
+\end{equation}
+\end{proposition}
+\begin{proof}
+Since $A\succeq\mu\I$, $\lVert A^{-1}\rVert_2\leq\mu^{-1}$, proving \cref{eq:norm_bound}. Moreover,
+\[
+  \lambda_{\min}(A)\geq\mu,
+  \qquad
+  \lambda_{\max}(A)\leq\mu+\gamma\lVert U\rVert_2^2,
+\]
+which gives \cref{eq:condition_bound}. The multi-head result follows by summing squared head-wise bounds and applying submultiplicativity to $W_O$.
+\end{proof}
+
+These are conditional bounds for the linear map at fixed $U$; because both $U$ and $C$ depend on $X$, they are not by themselves a global Lipschitz bound for the complete nonlinear layer. Row-wise RMS normalization controls individual relation-vector scale, while \cref{eq:length_norm} controls the accumulation scale of $U^\top U$. Neither should be confused with a hard dimension-free bound on $\lVert U\rVert_2$.
+
+Although $UU^\top$ and $A^{-1}$ are positive semidefinite and positive definite respectively, their off-diagonal entries need not be nonnegative. For example, with two tokens and rank one, $U=[1,1]^\top$ yields a negative off-diagonal entry in $A^{-1}$, whereas $U=[1,-1]^\top$ yields a positive one. Thus the effective mixing operator supports signed cross-token coefficients and is not constrained to be a row-stochastic nonnegative matrix. Positive definiteness constrains the global quadratic form, not the sign of every pairwise interaction.
+
+\subsection{Strongly Convex Energy}
+
+\begin{theorem}[Variational characterization]
+\label{thm:energy}
+The \LSSO\ output is the unique minimizer
+\begin{equation}
+  Y^\star
+  =\arg\min_Y
+  \left[
+    \frac{\mu}{2}\lVert Y\rVert_F^2
+    +\frac{\gamma}{2}\lVert U^\top Y\rVert_F^2
+    -\langle C,Y\rangle
+  \right].
+  \label{eq:energy}
+\end{equation}
+Equivalently, up to a constant independent of $Y$,
+\begin{equation}
+  Y^\star
+  =\arg\min_Y
+  \left[
+    \frac{\mu}{2}\left\lVert Y-\mu^{-1}C\right\rVert_F^2
+    +\frac{\gamma}{2}\lVert U^\top Y\rVert_F^2
+  \right].
+  \label{eq:energy_centered}
+\end{equation}
+\end{theorem}
+\begin{proof}
+The Hessian with respect to each output channel is $A$, which is positive definite by \cref{prop:spd}; the objective is therefore strongly convex. Its first-order condition is
+\[
+  \mu Y+\gamma UU^\top Y-C=0,
+\]
+which is exactly \cref{eq:lsso}. Completing the square gives \cref{eq:energy_centered}.
+\end{proof}
+
+The content projection supplies the unconstrained state $\mu^{-1}C$. The second term imposes an input-conditioned low-rank penalty, and the solve returns the unique balance between content fidelity and relation-space suppression. Unlike the Neumann interpretation below, this result requires no contraction condition.
+
+\subsection{Rank-Space Inner Learning and Primal--Dual Equivalence}
+
+The Woodbury variable is the solution of a sample-conditioned learning
+problem, not merely an algebraic intermediate.
+
+\begin{theorem}[Closed-form inner learner]
+\label{thm:inner_learner}
+Let $\alpha=\gamma/\mu$. The objective
+\begin{equation}
+  \mathcal J(Z)
+  =\frac12\lVert Z\rVert_F^2
+  +\frac{\alpha}{2}\lVert UZ-C\rVert_F^2
+  \label{eq:rank_ridge}
+\end{equation}
+is strongly convex and has the unique minimizer
+\begin{equation}
+  Z^\star
+  =(\I_r+\alpha U^\top U)^{-1}\alpha U^\top C.
+  \label{eq:z_star}
+\end{equation}
+The corresponding \LSSO\ output satisfies
+\begin{equation}
+  \mu Y^\star=C-UZ^\star,
+  \qquad
+  Z^\star=\gamma U^\top Y^\star.
+  \label{eq:primal_dual_links}
+\end{equation}
+Consequently, the token-space energy in \cref{eq:energy} and rank-space ridge
+problem in \cref{eq:rank_ridge} are an exact primal--dual pair.
+\end{theorem}
+\begin{proof}
+The Hessian of $\mathcal J$ is
+$\I_r+\alpha U^\top U\succ0$. Its first-order condition is
+\[
+  (\I_r+\alpha U^\top U)Z=\alpha U^\top C,
+\]
+which gives \cref{eq:z_star}. Substitution into the Woodbury formula gives the
+first identity in \cref{eq:primal_dual_links}. Left-multiplying it by
+$\gamma U^\top$ and using the normal equation gives the second identity.
+For $\gamma>0$, equivalently introducing a Fenchel variable for
+$(\gamma/2)\lVert U^\top Y\rVert_F^2$ in \cref{eq:energy} produces the dual
+minimization
+\[
+  \min_Z
+  \left[
+    \frac{1}{2\gamma}\lVert Z\rVert_F^2
+    +\frac{1}{2\mu}\lVert UZ-C\rVert_F^2
+  \right],
+\]
+which differs from \cref{eq:rank_ridge} only by the positive factor $\gamma$.
+At $\gamma=0$, both formulations reduce continuously to $Z^\star=0$ and
+$Y^\star=\mu^{-1}C$.
+\end{proof}
+
+For each input, the outer network generates $U(X)$ and $C(X)$ and thereby
+constructs a new ridge problem. Its optimum $Z^\star(X)$ is a matrix of
+per-sample fast weights. The relation is exact for the shared linear learner in
+\cref{eq:rank_ridge}; it is not an equivalence to arbitrary multilayer,
+untied, or nonlinear inner networks.
+
+\subsection{Regularized Residual Readout}
+
+The fitted component of the inner learner is $\widehat C=UZ^\star$, whereas
+\LSSO\ returns
+\begin{equation}
+  Y^\star=\mu^{-1}(C-\widehat C).
+  \label{eq:ridge_residual}
+\end{equation}
+For $\alpha>0$, this is a ridge residual, not an orthogonal least-squares
+residual: the normal equation implies
+\begin{equation}
+  U^\top(C-UZ^\star)=\alpha^{-1}Z^\star,
+\end{equation}
+which is generally nonzero. At $\alpha=0$, $Z^\star=0$ and the residual is
+simply $C$. Nevertheless, \cref{eq:spectral_filter} gives an
+exact interpretation. Modes with large relation singular values are strongly
+suppressed, weakly represented modes are suppressed less, and components
+orthogonal to the relation subspace retain scale $\mu^{-1}$. Thus the operator
+removes sample-predictable shared structure through a regularized shrinkage
+path while preserving weakly explained and orthogonal information.
+
+\subsection{Inner Optimization Limit and Neumann Special Case}
+
+Let
+\begin{equation}
+  H=\I_r+\alpha U^\top U,
+  \qquad b=\alpha U^\top C.
+\end{equation}
+Gradient descent on \cref{eq:rank_ridge} is the Richardson iteration
+\begin{equation}
+  Z^{(t+1)}=Z^{(t)}-\eta(HZ^{(t)}-b).
+  \label{eq:inner_iteration}
+\end{equation}
+
+\begin{proposition}[Exact infinite-step inner-training limit]
+\label{prop:inner_limit}
+For every initialization $Z^{(0)}$, if
+\begin{equation}
+  0<\eta<\frac{2}{\lambda_{\max}(H)},
+  \label{eq:richardson_condition}
+\end{equation}
+then \cref{eq:inner_iteration} converges to $Z^\star$. Hence the structured
+solve evaluates exactly the infinite-step limit of any such convergent inner
+training process.
+\end{proposition}
+\begin{proof}
+Subtracting $Z^\star=H^{-1}b$ from the iteration gives
+\[
+  Z^{(t+1)}-Z^\star
+  =(\I_r-\eta H)(Z^{(t)}-Z^\star).
+\]
+Because $H\succ0$, condition \cref{eq:richardson_condition} implies
+$\rho(\I_r-\eta H)<1$.
+\end{proof}
+
+This result removes the inner update count, learning-rate choice, activation
+storage, and truncation error for the convex learner. It eliminates
+\emph{optimization depth}; it does not make a deeper nonlinear inner
+architecture analytically solvable.
+
+When $\eta=1$ and $Z^{(0)}=0$, \cref{eq:inner_iteration} becomes
+\begin{equation}
+  Z^{(t+1)}
+  =\alpha U^\top C-\alpha U^\top UZ^{(t)}.
+  \label{eq:unit_inner_iteration}
+\end{equation}
+
+\begin{proposition}[Neumann as unit-step inner adaptation]
+\label{prop:neumann}
+If
+\begin{equation}
+  \alpha\lambda_{\max}(U^\top U)<1,
+  \label{eq:neumann_condition}
+\end{equation}
+then the unit-step iteration converges and
+\begin{align}
+  Z^\star
+  &=\alpha\sum_{k=0}^{\infty}
+    (-\alpha U^\top U)^kU^\top C,
+    \label{eq:rank_neumann}\\
+  Y^\star
+  &=\frac{1}{\mu}
+    \sum_{k=0}^{\infty}(-\alpha UU^\top)^kC.
+    \label{eq:neumann}
+\end{align}
+\end{proposition}
+\begin{proof}
+Condition \cref{eq:neumann_condition} makes
+$-\alpha U^\top U$ contractive. Unrolling
+\cref{eq:unit_inner_iteration} gives \cref{eq:rank_neumann}; substitution into
+$Y^\star=\mu^{-1}(C-UZ^\star)$ yields \cref{eq:neumann}.
+\end{proof}
+
+Neumann is therefore one particular inner optimizer: zero initialization,
+unit step size, and a stronger spectral condition. General Richardson
+iteration admits any safe step in \cref{eq:richardson_condition}, while the
+positive-definite solve bypasses iteration altogether and remains defined for
+every $\mu>0$ and $\gamma\geq0$. A depth-$K$ Neumann truncation realizes a
+polynomial response; \LSSO\ directly realizes the rational response
+$g(\lambda)=(\mu+\gamma\lambda)^{-1}$.
+
+\subsection{Guarantees for Rank-Rotary LSSO}
+
+The preceding results guarantee that rank rotation does not destroy the
+positive-definite solve. We next characterize what position-dependent
+row-wise rotation preserves and what it can change. Let the $i$-th row be
+represented as a column vector $u_i\in\R^r$, and define
+\begin{equation}
+  \widetilde u_i=R_i u_i,
+  \qquad R_i^\top R_i=\I_r.
+  \label{eq:rowwise_rotation}
+\end{equation}
+
+\begin{lemma}[Spectral-energy preservation under row-wise rotation]
+\label{lem:rotation_energy}
+For arbitrary token-dependent orthogonal matrices $R_i$,
+\begin{align}
+  \lVert\widetilde U\rVert_F^2
+  &=\lVert U\rVert_F^2,\label{eq:frobenius_preserved}\\
+  \tr(\widetilde U\widetilde U^\top)
+  &=\tr(UU^\top).\label{eq:trace_preserved}
+\end{align}
+Consequently, row-wise rotation preserves the total relation spectral energy,
+although it need not preserve the individual singular values.
+\end{lemma}
+\begin{proof}
+Orthogonality preserves every row norm:
+\[
+  \lVert\widetilde u_i\rVert_2^2
+  =u_i^\top R_i^\top R_i u_i
+  =\lVert u_i\rVert_2^2.
+\]
+Summing over tokens gives \cref{eq:frobenius_preserved}. The trace identity
+follows from
+$\tr(\widetilde U\widetilde U^\top)=\lVert\widetilde U\rVert_F^2$
+and the corresponding identity for $U$.
+\end{proof}
+
+The preservation is global rather than directional. For example, take two
+identical unit rows in $\R^2$. Before rotation the singular values are
+$(\sqrt{2},0)$. Rotating only the second row to the orthogonal coordinate gives
+singular values $(1,1)$. Both bases have squared Frobenius norm $2$, but their
+spectral concentration differs.
+
+Define the spectral factor governing the rank-rotary fixed-point iteration by
+\begin{equation}
+  q_{\max}^{R}
+  =\rho(\alpha\widetilde U\widetilde U^\top)
+  =\frac{\gamma}{\mu}
+   \lambda_{\max}(\widetilde U\widetilde U^\top)
+  =\frac{\gamma}{\mu}\lVert\widetilde U\rVert_2^2.
+  \label{eq:qmax_rotary}
+\end{equation}
+For a nonzero matrix, let its stable rank be
+\begin{equation}
+  r_s(\widetilde U)
+  =\frac{\lVert\widetilde U\rVert_F^2}
+  {\lVert\widetilde U\rVert_2^2}.
+  \label{eq:stable_rank}
+\end{equation}
+Combining \cref{eq:frobenius_preserved,eq:qmax_rotary,eq:stable_rank} yields
+\begin{equation}
+  q_{\max}^{R}
+  =\frac{\gamma}{\mu}
+   \frac{\lVert U\rVert_F^2}{r_s(\widetilde U)}.
+  \label{eq:qmax_stable_rank}
+\end{equation}
+
+\begin{corollary}[Conditional convergence-margin enlargement]
+\label{cor:rotation_margin}
+Let $q_{\max}=({\gamma}/{\mu})\lVert U\rVert_2^2$ denote the corresponding
+unrotated spectral factor. For nonzero $U$ and $\widetilde U$,
+\begin{equation}
+  \frac{q_{\max}^{R}}{q_{\max}}
+  =\frac{r_s(U)}{r_s(\widetilde U)}.
+  \label{eq:qmax_ratio}
+\end{equation}
+Hence, if row-wise position rotation increases stable rank, then it strictly
+decreases the spectral factor. Whenever the rotated iteration is contractive,
+this increases its Neumann convergence margin $1-q_{\max}^{R}$; it may also
+move a previously non-contractive iteration into the contractive regime.
+\end{corollary}
+\begin{proof}
+Apply \cref{eq:qmax_stable_rank} to the rotated and unrotated bases and use
+\cref{eq:frobenius_preserved}. The remaining claims follow directly from the
+Neumann condition in \cref{eq:neumann_condition}.
+\end{proof}
+
+The corollary does not claim that position rotation must increase stable rank.
+It isolates a precise consequence if the position-dependent rotation
+redistributes a fixed amount of relation energy more evenly across singular
+directions. In the inner-learning view, the nonzero singular directions of
+$\widetilde U$ are the directions available to the sample-specific regression.
+A larger stable rank therefore corresponds to a less concentrated effective
+adaptation geometry, but not automatically to better task performance. This
+conditional mechanism is testable through layer-wise stable rank, condition
+number, fast-weight norm, ridge residual, and $q_{\max}^{R}$ diagnostics.
+
+\begin{corollary}[Structure preservation under rank rotation]
+\label{cor:rrlsso}
+All results in
+\cref{prop:spd,prop:woodbury,prop:spectrum,prop:bounds,thm:energy,thm:inner_learner,prop:inner_limit}
+hold for \RRLSSO\ with $U$ replaced by $\widetilde U$. The Neumann result
+additionally holds whenever
+$\alpha\lambda_{\max}(\widetilde U\widetilde U^\top)<1$.
+\end{corollary}
+\begin{proof}
+Position-dependent rotation changes the entries of the basis but not its factorized Gram form: $\widetilde U\widetilde U^\top\succeq0$. The preceding arguments apply unchanged.
+\end{proof}
+
+Together, \cref{eq:relative_kernel,cor:rrlsso} show that relative position changes the learned relation geometry without sacrificing well-posedness. The rotation is not a similarity transform of the full token-space operator, because different rows generally use different rotations; it is instead a structured reparameterization of both the Gram factors and the design matrix of the per-sample inner problem. In short, the solve removes inner optimization depth, whereas rank rotation reshapes inner adaptation geometry.

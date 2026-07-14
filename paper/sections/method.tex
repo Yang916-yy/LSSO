@@ -1,0 +1,148 @@
+\section{Method}
+\label{sec:method}
+
+\subsection{Encoder Block}
+
+\LSSO\ occupies the token-mixer slot of a standard pre-normalized encoder block:
+\begin{align}
+  X' &= X + \LSSO(\operatorname{LN}(X)),\\
+  X_{\mathrm{out}} &= X' + \operatorname{MLP}(\operatorname{LN}(X')).
+\end{align}
+Its input and output shapes match multi-head self-attention, so normalization, residual paths, feed-forward layers, and task heads are unchanged.
+
+Let $X\in\R^{B\times N\times D}$, with $H$ heads and head width $d_h=D/H$. A fused projection produces a rank-$r$ relation feature and a content feature for every head:
+\begin{equation}
+  [\bar U,C]=XW_{UC},
+  \qquad
+  W_{UC}\in\R^{D\times(Hr+D)}.
+\end{equation}
+After reshaping, $\bar U\in\R^{B\times H\times N\times r}$ and $C\in\R^{B\times H\times N\times d_h}$. The heads are solved independently, concatenated, and mapped through $W_O\in\R^{D\times D}$.
+
+\subsection{Relation-Basis Normalization}
+
+For each token and head, we normalize the raw relation vector along its rank dimension:
+\begin{equation}
+  \widehat u_i
+  =\frac{\bar u_i}
+  {\sqrt{r^{-1}\lVert\bar u_i\rVert_2^2+\varepsilon}}.
+  \label{eq:rms_norm}
+\end{equation}
+We then remove sequence-length drift by using mean-scaled rather than sum-scaled relation statistics:
+\begin{equation}
+  u_i=\sqrt{\frac{L_{\mathrm{ref}}}{L_{\mathrm{eff}}}}\,\widehat u_i,
+  \label{eq:length_norm}
+\end{equation}
+where $L_{\mathrm{eff}}$ is the number of valid tokens and $L_{\mathrm{ref}}>0$ is a fixed compatibility scale. Consequently,
+\[
+  U^\top U
+  =\frac{L_{\mathrm{ref}}}{L_{\mathrm{eff}}}
+  \sum_{i\,\mathrm{valid}}\widehat u_i\widehat u_i^\top.
+\]
+This prevents a duplicated or padded sequence from strengthening the global correction merely by increasing the number of terms. Invalid rows of both $U$ and $C$ are zeroed before the solve.
+
+\subsection{Learnable Structured Solve Operator}
+
+For each head, \LSSO\ defines $Y\in\R^{N\times d_h}$ by
+\begin{equation}
+  (\mu\I_N+\gamma UU^\top)Y=C.
+  \label{eq:lsso}
+\end{equation}
+The two nonnegative solve scales are learned independently per head:
+\begin{equation}
+  \mu=\operatorname{softplus}(\theta_\mu)+\varepsilon,
+  \qquad
+  \gamma=\gamma_{\max}\sigma(\theta_\gamma).
+  \label{eq:scales}
+\end{equation}
+Thus $\mu$ remains strictly positive and $\gamma$ remains bounded and nonnegative throughout training.
+
+Applying the Woodbury identity~\cite{woodbury1950identity} yields
+\begin{align}
+  Y
+  &=\mu^{-1}C
+  -\mu^{-1}U
+  \left(\I_r+\alpha U^\top U\right)^{-1}
+  \left(\alpha U^\top C\right),
+  \label{eq:woodbury}\\
+  \alpha&=\gamma/\mu.
+\end{align}
+Equation~\eqref{eq:woodbury} is exactly equal to the token-space solve in \cref{eq:lsso}; it is not a low-rank approximation of that operator. Only the factorization of the input-conditioned matrix is low-rank.
+
+The computation can be read as a residual dynamic bottleneck:
+\begin{align}
+  T &= U^\top C, & &\text{dynamic analysis},\\
+  Z &= (\I_r+\alpha U^\top U)^{-1}(\alpha T),
+      & &\text{rank-space transform},\\
+  Y &= \mu^{-1}(C-UZ), & &\text{dynamic synthesis}.
+  \label{eq:bottleneck}
+\end{align}
+Because $U=U(X)$, both $U^\top$ and $U$ are instantiated from the current sample. Unlike a generic dynamic MLP, the two maps are transpose-coupled and their middle transform is a symmetric positive-definite inverse.
+
+\subsection{Closed-Form Per-Sample Inner Learning}
+
+The rank-space state in \cref{eq:bottleneck} has an exact learning
+interpretation. For the current sample, define
+\begin{equation}
+  \mathcal J_X(Z)
+  =\frac12\lVert Z\rVert_F^2
+  +\frac{\alpha}{2}\lVert U(X)Z-C(X)\rVert_F^2.
+  \label{eq:inner_objective}
+\end{equation}
+Its unique minimizer is
+\begin{equation}
+  Z^\star(X)
+  =(\I_r+\alpha U^\top U)^{-1}\alpha U^\top C.
+  \label{eq:inner_fast_weights}
+\end{equation}
+We interpret $U$ as a sample-conditioned inner design matrix, $C$ as its
+targets, and $Z^\star$ as temporary fast weights. Unlike a conventional TTT
+layer, no finite update count or inner learning rate is used in the forward
+pass: the strongly convex optimum is evaluated directly. The layer then
+returns
+\begin{equation}
+  Y=\mu^{-1}(C-UZ^\star),
+  \label{eq:regularized_residual}
+\end{equation}
+which is a regularized residual readout rather than the fitted component
+$UZ^\star$ itself. This distinction is essential: \LSSO\ is a closed-form
+per-sample inner learner, but it is not identical to a generic TTT module that
+evaluates an adapted nonlinear network on a separate query set.
+
+\subsection{Rank-Rotary LSSO}
+
+\RRLSSO\ injects position into the relation basis before forming global statistics. For an even rank $r$, pair adjacent rank channels and define an orthogonal block-diagonal rotation
+\begin{align}
+  R(p)&=\diag\!\left(R_{\omega_1 p},\ldots,R_{\omega_{r/2}p}\right),\\
+  R_\phi=
+  \begin{bmatrix}
+    \cos\phi&-\sin\phi\\
+    \sin\phi& \cos\phi
+  \end{bmatrix},
+  \label{eq:rank_rotation}
+\end{align}
+where the frequencies follow a fixed geometric schedule. At position $p_i$,
+\begin{equation}
+  \widetilde u_i=R(p_i)u_i.
+\end{equation}
+The solve becomes
+\begin{equation}
+  (\mu\I_N+\gamma\widetilde U\widetilde U^\top)Y=C.
+  \label{eq:rrlsso}
+\end{equation}
+The rotation itself introduces no learned absolute position table. It changes
+only the basis used to construct the bidirectional global operator and remains
+compatible with a backbone-level learned positional embedding when one is
+used.
+
+Because planar rotations compose by angle addition,
+\begin{equation}
+  (\widetilde U\widetilde U^\top)_{ij}
+  =u_i^\top R(p_i)^\top R(p_j)u_j
+  =u_i^\top R(p_j-p_i)u_j.
+  \label{eq:relative_kernel}
+\end{equation}
+Therefore the content-dependent relation kernel is modulated by relative displacement. The rank rotation does not change tensor shapes, asymptotic complexity, or the positive-semidefinite factorization.
+In the inner-learning view, it also replaces the design matrix $U$ in
+\cref{eq:inner_objective} by $\widetilde U$. Hence it changes the covariance,
+conditioning, and effective adaptation directions of the per-sample regression
+problem rather than merely attaching a position label to each token.

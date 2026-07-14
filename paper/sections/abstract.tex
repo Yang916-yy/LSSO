@@ -1,0 +1,8 @@
+\begin{abstract}
+Test-time training (TTT) interprets sequence mixing as per-context inner learning, but existing layers rely on a small number of unrolled updates and face a trade-off between inner-model capacity and optimization difficulty. We introduce the Learnable Structured Solve Operator (\LSSO), a global token mixer that instead constructs a strongly convex low-rank inner problem for every sample and solves it exactly. For each head, \LSSO\ predicts a relation basis $U$ and content target $C$, then computes
+\[
+  (\mu \I + \gamma U U^\top)Y=C.
+\]
+The Woodbury identity exposes temporary rank-space weights
+$Z^\star=(\I+\alpha U^\top U)^{-1}\alpha U^\top C$, which are exactly the unique solution of a per-sample ridge-regression objective. We prove that the token-space equilibrium and rank-space fast weights form an exact primal--dual pair, and that the solve equals the limit of any convergent gradient inner loop while eliminating finite-step truncation and unrolling. The familiar Neumann expansion becomes the special case of unit-step inner adaptation. The output $Y=\mu^{-1}(C-UZ^\star)$ is a regularized residual that suppresses sample-predictable relation modes. We further introduce Rank-Rotary LSSO (\RRLSSO), which reshapes the inner feature geometry through token-dependent orthogonal rotations while preserving positive definiteness and total relation energy. This view unifies structured optimization, equilibrium mixing, fast weights, and relative-position geometry in one exact linear-complexity operator.
+\end{abstract}
