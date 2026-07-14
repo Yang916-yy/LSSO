@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import os
+import random
 import re
 import shutil
 import sys
@@ -22,7 +24,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--filename", required=True)
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--quiet", action="store_true", help="Cache without streaming to stdout")
+    parser.add_argument(
+        "--max-downloads",
+        type=int,
+        default=int(os.environ.get("LSSO_HF_MAX_DOWNLOADS", "4")),
+        help="Maximum concurrent HTTP shard downloads across loader workers.",
+    )
     return parser.parse_args()
+
+
+@contextmanager
+def _download_slot(cache_dir: Path, slots: int):
+    """Bound HTTP concurrency across independent WebDataset worker processes."""
+
+    if slots < 1:
+        raise ValueError("max downloads must be at least one")
+    slot_dir = cache_dir / ".download-slots"
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    first = os.getpid() % slots
+    while True:
+        for offset in range(slots):
+            index = (first + offset) % slots
+            handle = (slot_dir / f"slot-{index}.lock").open("a+b")
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                continue
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                handle.close()
+            return
+        time.sleep(random.uniform(0.10, 0.35))
 
 
 def validate_tar(path: Path, *, expected_bytes: int | None = None) -> None:
@@ -108,8 +143,13 @@ def _download_validated(
                 # A full-size invalid archive is corruption, not a resumable truncation.
                 partial.unlink(missing_ok=True)
         if attempt < attempts:
-            time.sleep(min(2 ** (attempt - 1), 30))
-    raise IOError(f"failed to download a valid shard after {attempts} attempts: {url}") from last_error
+            # Jitter prevents all WebDataset workers from retrying a rate-limit
+            # response at the same instant.
+            time.sleep(min(2 ** (attempt - 1), 30) * random.uniform(0.75, 1.25))
+    raise IOError(
+        f"failed to download a valid shard after {attempts} attempts: {url}; "
+        f"last error: {type(last_error).__name__}: {last_error}"
+    ) from last_error
 
 
 def _emit_file(path: Path) -> None:
@@ -120,7 +160,14 @@ def _emit_file(path: Path) -> None:
             pass
 
 
-def stream_file(repo: str, filename: str, cache_dir: Path, *, emit: bool = True) -> None:
+def stream_file(
+    repo: str,
+    filename: str,
+    cache_dir: Path,
+    *,
+    emit: bool = True,
+    max_downloads: int = 4,
+) -> None:
     destination = cache_dir / filename
     destination.parent.mkdir(parents=True, exist_ok=True)
     lock_path = destination.with_suffix(destination.suffix + ".lock")
@@ -146,7 +193,8 @@ def stream_file(repo: str, filename: str, cache_dir: Path, *, emit: bool = True)
         url = f"https://huggingface.co/datasets/{repo}/resolve/main/{filename}"
         partial = destination.with_suffix(destination.suffix + ".partial")
         try:
-            _download_validated(url, token, partial)
+            with _download_slot(cache_dir, max_downloads):
+                _download_validated(url, token, partial)
             partial.replace(destination)
             verified_path.touch()
         except BaseException:
@@ -158,7 +206,13 @@ def stream_file(repo: str, filename: str, cache_dir: Path, *, emit: bool = True)
 
 def main() -> None:
     args = parse_args()
-    stream_file(args.repo, args.filename, Path(args.cache_dir), emit=not args.quiet)
+    stream_file(
+        args.repo,
+        args.filename,
+        Path(args.cache_dir),
+        emit=not args.quiet,
+        max_downloads=args.max_downloads,
+    )
 
 
 if __name__ == "__main__":

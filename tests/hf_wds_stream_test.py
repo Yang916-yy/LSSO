@@ -6,7 +6,20 @@ from email.message import Message
 
 import pytest
 
-from tools.hf_wds_stream import _download_validated, validate_tar
+from tools.hf_wds_stream import _download_slot, _download_validated, validate_tar
+
+
+def test_download_slot_rejects_nonpositive_limit(tmp_path) -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        with _download_slot(tmp_path, 0):
+            pass
+
+
+def test_download_slot_creates_reusable_lock(tmp_path) -> None:
+    with _download_slot(tmp_path, 1):
+        assert (tmp_path / ".download-slots" / "slot-0.lock").is_file()
+    with _download_slot(tmp_path, 1):
+        pass
 
 
 def test_validate_tar_accepts_complete_archive(tmp_path) -> None:
