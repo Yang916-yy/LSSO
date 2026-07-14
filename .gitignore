@@ -57,6 +57,8 @@ Thumbs.db
 # Local scratch files
 =*
 .tmp/
+tmp/
+root/
 third_party/
 external/
 artifacts/
