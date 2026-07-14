@@ -89,12 +89,14 @@ def test_registered_rank_can_be_passed_explicitly() -> None:
 
 
 def test_imagenet_shard_names_match_repository_layout(tmp_path) -> None:
-    train = shard_commands("train", tmp_path, "timm/imagenet-1k-wds")
+    train = shard_commands("train", tmp_path, "timm/imagenet-1k-wds", max_downloads=3)
     validation = shard_commands("validation", tmp_path, "timm/imagenet-1k-wds")
     assert "imagenet1k-train-0000.tar" in train[0]
     assert "imagenet1k-train-1023.tar" in train[-1]
     assert "imagenet1k-validation-00.tar" in validation[0]
     assert "imagenet1k-validation-63.tar" in validation[-1]
+    assert "--max-downloads 3" in train[0]
+    assert "--max-downloads 4" in validation[0]
 
 
 def test_pretrained_requires_explicit_checkpoint() -> None:

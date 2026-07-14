@@ -37,7 +37,12 @@ TRAIN_SHARDS = 1024
 VAL_SHARDS = 64
 
 
-def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
+def shard_commands(
+    split: str,
+    cache_dir: Path,
+    repo: str,
+    max_downloads: int = 4,
+) -> list[str]:
     count = TRAIN_SHARDS if split == "train" else VAL_SHARDS
     prefix = "train" if split == "train" else "validation"
     digits = 4 if split == "train" else 2
@@ -55,6 +60,8 @@ def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
                 f"imagenet1k-{prefix}-{index:0{digits}d}.tar",
                 "--cache-dir",
                 str(cache_dir),
+                "--max-downloads",
+                str(max_downloads),
             )
         )
         for index in range(count)
@@ -83,8 +90,12 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
-    train_commands = shard_commands("train", Path(args.cache_dir), args.hf_repo)
-    val_commands = shard_commands("validation", Path(args.cache_dir), args.hf_repo)
+    train_commands = shard_commands(
+        "train", Path(args.cache_dir), args.hf_repo, args.max_downloads
+    )
+    val_commands = shard_commands(
+        "validation", Path(args.cache_dir), args.hf_repo, args.max_downloads
+    )
     if args.shard_limit:
         train_commands = train_commands[:args.shard_limit]
         val_commands = val_commands[:args.shard_limit]
@@ -327,6 +338,12 @@ def parse_args() -> argparse.Namespace:
         help="Validation loader workers, independent of --workers; workers exit after each evaluation.",
     )
     parser.add_argument("--shuffle-buffer", type=int, default=10000)
+    parser.add_argument(
+        "--max-downloads",
+        type=int,
+        default=4,
+        help="Maximum concurrent Hugging Face shard downloads across data workers.",
+    )
     parser.add_argument("--shard-limit", type=int, default=0, help="Limit each split for smoke tests")
     parser.add_argument("--steps-per-epoch", type=int, default=0)
     parser.add_argument("--max-val-steps", type=int, default=0)
