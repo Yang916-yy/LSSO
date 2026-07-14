@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -47,27 +48,67 @@ def _download_validated(
     token: str,
     partial: Path,
     *,
-    attempts: int = 5,
+    attempts: int = 12,
 ) -> None:
     last_error: BaseException | None = None
+    content_range_pattern = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
     for attempt in range(1, attempts + 1):
-        partial.unlink(missing_ok=True)
+        existing_bytes = partial.stat().st_size if partial.is_file() else 0
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept-Encoding": "identity",
+        }
+        if existing_bytes:
+            headers["Range"] = f"bytes={existing_bytes}-"
         request = urllib.request.Request(
-            url, headers={"Authorization": f"Bearer {token}"}
+            url, headers=headers
         )
+        expected_bytes: int | None = None
         try:
-            with urllib.request.urlopen(request, timeout=120) as response, partial.open("wb") as sink:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                status = getattr(response, "status", response.getcode())
                 content_length = response.headers.get("Content-Length")
-                expected_bytes = int(content_length) if content_length else None
-                while chunk := response.read(1024 * 1024):
-                    sink.write(chunk)
+                content_range = response.headers.get("Content-Range")
+                append = False
+                if existing_bytes and status == 206 and content_range:
+                    match = content_range_pattern.fullmatch(content_range.strip())
+                    if not match or int(match.group(1)) != existing_bytes:
+                        partial.unlink(missing_ok=True)
+                        raise IOError(
+                            f"invalid resume response for {partial.name}: {content_range}"
+                        )
+                    append = True
+                    if match.group(3) != "*":
+                        expected_bytes = int(match.group(3))
+                elif content_length:
+                    # A server may ignore Range and return a complete 200 response.
+                    expected_bytes = int(content_length)
+                mode = "ab" if append else "wb"
+                with partial.open(mode) as sink:
+                    while chunk := response.read(1024 * 1024):
+                        sink.write(chunk)
             validate_tar(partial, expected_bytes=expected_bytes)
             return
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416 and partial.is_file():
+                try:
+                    validate_tar(partial)
+                except OSError:
+                    partial.unlink(missing_ok=True)
+                else:
+                    return
+            last_error = exc
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
             last_error = exc
-            partial.unlink(missing_ok=True)
-            if attempt < attempts:
-                time.sleep(min(2 ** (attempt - 1), 8))
+            if (
+                expected_bytes is not None
+                and partial.is_file()
+                and partial.stat().st_size >= expected_bytes
+            ):
+                # A full-size invalid archive is corruption, not a resumable truncation.
+                partial.unlink(missing_ok=True)
+        if attempt < attempts:
+            time.sleep(min(2 ** (attempt - 1), 30))
     raise IOError(f"failed to download a valid shard after {attempts} attempts: {url}") from last_error
 
 
@@ -109,7 +150,7 @@ def stream_file(repo: str, filename: str, cache_dir: Path, *, emit: bool = True)
             partial.replace(destination)
             verified_path.touch()
         except BaseException:
-            partial.unlink(missing_ok=True)
+            # Keep a truncated partial so a restarted worker can continue it via Range.
             raise
         if emit:
             _emit_file(destination)
