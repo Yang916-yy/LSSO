@@ -123,3 +123,47 @@ tested. It was about 1.5--2% slower than PyTorch's optimized contiguous
 transposes and did not lower peak memory, so it is not retained. Future layout
 work should place the transform inside a projection or readout GEMM epilogue
 rather than launch another memory-only kernel.
+
+## Blackwell mixed-input and fused-readout path
+
+The unmasked kernel now accepts FP16/BF16 U and C while accumulating the Gram
+and cross statistics and performing Cholesky/POTRS in FP32. Blackwell has two
+double-buffered loaders: a descriptor-driven Tensor Memory Accelerator path
+using `CUtensorMap` and `cp.async.bulk.tensor`, and a smaller 16-byte
+`cp.async` path. Auto selects TMA on SM100 and `cp.async` on SM120; set
+`LSSO_MATHDX_TMA=1` or `0` to force an architecture-local A/B measurement.
+Other architectures retain the synchronous loader.
+
+For the common `N<=512`, rank 16/32, head-width `<=64` case, the forward path
+also keeps K inside the CUDA block and fuses `U@K` with the Woodbury epilogue:
+
+```text
+Y = (C - (gamma / mu) * U @ K) / mu
+```
+
+This removes global K/UK traffic and two framework-level readout kernels. On
+the development RTX 5070 Ti, BF16 `systems=64, N=197, rank=32, rhs=64` measured
+about `0.0819 ms` for the complete fused operator versus about `0.50 ms` for
+the equivalent PyTorch statistics/solve/readout path. The asynchronous double
+buffer improved the fused measurement from about `0.0878 ms` to `0.0819 ms`.
+A full RRLSSO layer at `B=64, N=197, D=768, H=12, rank=32` measured `4.33 ms`
+forward-plus-backward and `0.229 GiB` peak allocation, versus `6.54 ms` and
+`0.339 GiB` with the native backend disabled. These are local implementation
+measurements and should be re-run on each target GPU.
+
+### Multi-system Cholesky and large-batch scheduling
+
+The solve-only/fallback kernel includes validated cuSolverDx
+`BatchesPerBlock=2/4` variants and an internal forced A/B operator. On SM120,
+they were consistently slower than one system per CTA. For example,
+`systems=768, rank=32, rhs=64` measured about `0.105 ms` at BPB=1 versus
+`0.249/0.259 ms` at BPB=2/4. Auto therefore retains one CTA per system even
+for large `B*H`; packing is kept only as an experimental architecture probe.
+The same result argues against a persistent-CTA work queue on SM120: the
+ordinary large grid already saturates the GPU, and reducing independent CTA
+count hurts more than launch/tail overhead. Reconsider persistence only if an
+Nsight trace on another architecture shows scheduler or tail bubbles.
+
+On SM120, forced TMA was also slightly slower for the common BF16 tile:
+approximately `0.0838 ms` versus `0.0819 ms` for `cp.async`. Hence the
+architecture-specific default rather than an unconditional TMA switch.

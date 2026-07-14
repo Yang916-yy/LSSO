@@ -121,12 +121,27 @@ def stats_solve_spd(
     c: torch.Tensor,
     alpha: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused FP32 ``U.T@U``, ``U.T@C``, Cholesky, and multi-RHS solve."""
+    """Fused mixed-input ``U.T@U``, ``U.T@C``, and FP32 SPD solve."""
 
     if not load_mathdx_backend():
         raise RuntimeError(f"failed to load LSSO MathDx backend: {_LOAD_ERROR}")
     return torch.ops.lsso_mathdx.stats_solve_spd(
         u.contiguous(), c.contiguous(), alpha.contiguous()
+    )
+
+
+def stats_solve_readout(
+    u: torch.Tensor,
+    c: torch.Tensor,
+    alpha: torch.Tensor,
+    inv_mu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse compact statistics, FP32 solve, and the Woodbury readout."""
+
+    if not load_mathdx_backend():
+        raise RuntimeError(f"failed to load LSSO MathDx backend: {_LOAD_ERROR}")
+    return torch.ops.lsso_mathdx.stats_solve_readout(
+        u.contiguous(), c.contiguous(), alpha.contiguous(), inv_mu.contiguous()
     )
 
 
@@ -139,19 +154,24 @@ def try_stats_solve_spd(
 ) -> torch.Tensor | None:
     """Return fused stats/solve output when its measured fast-path applies."""
 
+    # This low-level operator intentionally has no dispatcher autograd kernel.
+    # The custom LSSO Function calls it under no-grad and supplies the analytic
+    # backward; direct differentiable reference calls must remain in PyTorch.
+    if torch.compiler.is_compiling() or torch.is_grad_enabled():
+        return None
+
     eligible = (
         u.is_cuda
         and c.is_cuda
         and alpha.is_cuda
-        and u.dtype == torch.float32
-        and c.dtype == torch.float32
+        and u.dtype == c.dtype
+        and u.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and alpha.dtype == torch.float32
         and u.ndim == 3
         and c.ndim == 3
         and alpha.ndim == 1
         and u.shape[2] in (16, 32)
         and u.shape[1] <= max_sequence
-        and u.shape[0] <= 64
         and c.shape[2] <= 64
     )
     if not eligible or not load_mathdx_backend():
@@ -160,6 +180,49 @@ def try_stats_solve_spd(
         u.contiguous(), c.contiguous(), alpha.contiguous()
     )
     return solution
+
+
+def try_stats_solve_readout(
+    u: torch.Tensor,
+    c: torch.Tensor,
+    alpha: torch.Tensor,
+    inv_mu: torch.Tensor,
+    *,
+    max_sequence: int = 512,
+) -> torch.Tensor | None:
+    """Use the one-kernel Woodbury forward path when its tile shapes apply.
+
+    U/C stay in BF16 or FP16 in global memory. Statistics, Cholesky and K are
+    FP32, while the final ``(C - alpha * U@K) * inv_mu`` write uses C's dtype.
+    """
+
+    if torch.compiler.is_compiling() or torch.is_grad_enabled():
+        return None
+    eligible = (
+        u.is_cuda
+        and c.is_cuda
+        and alpha.is_cuda
+        and inv_mu.is_cuda
+        and u.dtype == c.dtype
+        and u.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and alpha.dtype == torch.float32
+        and inv_mu.dtype == torch.float32
+        and u.ndim == 3
+        and c.ndim == 3
+        and alpha.ndim == 1
+        and inv_mu.ndim == 1
+        and u.shape[:2] == c.shape[:2]
+        and alpha.shape[0] == inv_mu.shape[0] == u.shape[0]
+        and u.shape[2] in (16, 32)
+        and u.shape[1] <= max_sequence
+        and c.shape[2] <= 64
+    )
+    if not eligible or not load_mathdx_backend():
+        return None
+    output, _info = torch.ops.lsso_mathdx.stats_solve_readout(
+        u.contiguous(), c.contiguous(), alpha.contiguous(), inv_mu.contiguous()
+    )
+    return output
 
 
 def try_masked_stats_solve_spd(

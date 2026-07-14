@@ -10,6 +10,7 @@ from .mathdx_backend import (
     solve_spd_autograd,
     try_masked_stats_solve_spd,
     try_prepare_basis,
+    try_stats_solve_readout,
     try_stats_solve_spd,
 )
 
@@ -272,6 +273,10 @@ def _lsso_woodbury_forward(
     U_bh = U_calc.flatten(0, 1)
     C_bh = C_calc.flatten(0, 1)
     alpha_bh = gamma_over_mu.expand(B, H, 1, 1).reshape(B * H).float()
+    inv_mu_bh = inv_mu.expand(B, H, 1, 1).reshape(B * H).float()
+    fused_y = try_stats_solve_readout(U_bh, C_bh, alpha_bh, inv_mu_bh)
+    if fused_y is not None:
+        return fused_y.view(B, H, N, dh).to(output_dtype)
     K = try_stats_solve_spd(U_bh, C_bh, alpha_bh)
     if K is None:
         Ut_bh = U_bh.transpose(1, 2)
@@ -293,6 +298,8 @@ def _lsso_woodbury_forward(
     else:
         K.mul_(alpha_bh.to(K.dtype))
         K_readout = K
+    if K_readout.dtype != U_bh.dtype:
+        K_readout = K_readout.to(U_bh.dtype)
     Y = torch.baddbmm(C_bh, U_bh, K_readout, beta=1.0, alpha=-1.0).view(B, H, N, dh)
     Y.mul_(inv_mu)
     return Y.to(output_dtype)

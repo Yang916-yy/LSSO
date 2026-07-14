@@ -4,7 +4,12 @@ import argparse
 
 import torch
 
-from lsso.mathdx_backend import load_mathdx_backend, solve_spd, stats_solve_spd
+from lsso.mathdx_backend import (
+    load_mathdx_backend,
+    solve_spd,
+    stats_solve_readout,
+    stats_solve_spd,
+)
 
 
 def _time_ms(fn, warmup: int, iterations: int) -> float:
@@ -52,15 +57,18 @@ def benchmark_fused(
     rhs_width: int,
     warmup: int,
     iterations: int,
+    dtype: torch.dtype = torch.float32,
 ) -> None:
-    u = 0.2 * torch.randn(systems, sequence, rank, device="cuda")
-    c = torch.randn(systems, sequence, rhs_width, device="cuda")
+    u = (0.2 * torch.randn(systems, sequence, rank, device="cuda")).to(dtype)
+    c = torch.randn(systems, sequence, rhs_width, device="cuda").to(dtype)
     alpha = torch.full((systems,), 0.02, device="cuda")
+    inv_mu = torch.full((systems,), 1.1, device="cuda")
     eye = torch.eye(rank, device="cuda")
 
     def torch_path() -> torch.Tensor:
-        gram = u.transpose(1, 2) @ u
-        rhs = u.transpose(1, 2) @ c
+        u32, c32 = u.float(), c.float()
+        gram = u32.transpose(1, 2) @ u32
+        rhs = u32.transpose(1, 2) @ c32
         return torch.linalg.solve_ex(
             eye + alpha[:, None, None] * gram,
             rhs,
@@ -68,9 +76,14 @@ def benchmark_fused(
         )[0]
 
     def hybrid_path() -> torch.Tensor:
-        gram = u.transpose(1, 2) @ u
-        rhs = u.transpose(1, 2) @ c
+        u32, c32 = u.float(), c.float()
+        gram = u32.transpose(1, 2) @ u32
+        rhs = u32.transpose(1, 2) @ c32
         return solve_spd(eye + alpha[:, None, None] * gram, rhs)[0]
+
+    readout_ms = _time_ms(
+        lambda: stats_solve_readout(u, c, alpha, inv_mu)[0], warmup, iterations
+    )
 
     mathdx_ms = _time_ms(
         lambda: stats_solve_spd(u, c, alpha)[0], warmup, iterations
@@ -78,9 +91,10 @@ def benchmark_fused(
     hybrid_ms = _time_ms(hybrid_path, warmup, iterations)
     torch_ms = _time_ms(torch_path, warmup, iterations)
     print(
-        f"stats+solve systems={systems} N={sequence} rank={rank} rhs={rhs_width} "
+        f"stats+solve systems={systems} N={sequence} rank={rank} rhs={rhs_width} dtype={dtype} "
         f"fused={mathdx_ms:.4f}ms hybrid={hybrid_ms:.4f}ms "
-        f"torch={torch_ms:.4f}ms best={min(mathdx_ms, hybrid_ms):.4f}ms"
+        f"torch={torch_ms:.4f}ms readout={readout_ms:.4f}ms "
+        f"best={min(mathdx_ms, hybrid_ms):.4f}ms"
     )
 
 
@@ -112,6 +126,12 @@ def main() -> None:
             warmup=args.warmup,
             iterations=args.iterations,
         )
+    benchmark_fused(
+        64, 197, 32, 64,
+        warmup=args.warmup,
+        iterations=args.iterations,
+        dtype=torch.bfloat16,
+    )
 
 
 if __name__ == "__main__":

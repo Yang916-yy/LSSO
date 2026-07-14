@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 
 import examples.models  # noqa: F401
 from examples.models.vision_llama import VisionLLaMA
+from lsso.mathdx_backend import is_mathdx_available, mathdx_load_error
 from timm import create_model
 
 TRAIN_SAMPLES = 1_281_167
@@ -121,9 +122,12 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     val_loader = wds.WebLoader(
         validation,
         batch_size=None,
-        num_workers=args.workers,
+        num_workers=args.eval_workers,
         pin_memory=True,
-        persistent_workers=args.workers > 0,
+        # Validation runs once per epoch.  Keeping its worker pool alive in
+        # addition to the persistent training pool wastes host RAM for almost
+        # the entire epoch, especially with large decoded ImageNet batches.
+        persistent_workers=False,
     )
     return train_loader, val_loader
 
@@ -172,6 +176,14 @@ def train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
+    mathdx_available = is_mathdx_available()
+    print(
+        f"mathdx_backend={'loaded' if mathdx_available else 'unavailable'}"
+        + (f" error={mathdx_load_error()}" if not mathdx_available else ""),
+        flush=True,
+    )
+    if args.require_mathdx and not mathdx_available:
+        raise RuntimeError("--require-mathdx was set but the fused CUDA backend could not be loaded")
     if args.lr <= 0:
         effective_batch = args.batch_size * args.grad_accum
         args.lr = 4e-3 * effective_batch / 4096
@@ -308,6 +320,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--eval-workers",
+        type=int,
+        default=2,
+        help="Validation loader workers, independent of --workers; workers exit after each evaluation.",
+    )
     parser.add_argument("--shuffle-buffer", type=int, default=10000)
     parser.add_argument("--shard-limit", type=int, default=0, help="Limit each split for smoke tests")
     parser.add_argument("--steps-per-epoch", type=int, default=0)
@@ -326,6 +344,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--require-mathdx",
+        action="store_true",
+        help="Fail instead of silently using the PyTorch fallback when the fused backend is unavailable.",
+    )
     return parser.parse_args()
 
 

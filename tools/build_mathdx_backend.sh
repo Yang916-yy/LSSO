@@ -7,7 +7,6 @@ mathdx_root="${MATHDX_ROOT:-/opt/nvidia/nvidia-mathdx-26.06.0-cuda13/nvidia/math
 cuda_root="${CUDA_HOME:-/usr/local/cuda-13.0}"
 build_dir="${LSSO_MATHDX_BUILD_DIR:-${HOME}/.cache/lsso-mathdx-build}"
 artifact_dir="${LSSO_MATHDX_ARTIFACT_DIR:-${repo_root}/build/mathdx/lib}"
-torch_include_cache="${LSSO_TORCH_INCLUDE_CACHE:-${HOME}/.cache/lsso-torch-include}"
 release_architectures="80-real;86-real;87-real;89-real;90-real;100-real;120-real"
 release_torch_architectures="8.0;8.6;8.7;8.9;9.0;10.0;12.0"
 if [[ "${LSSO_MATHDX_RELEASE:-0}" == "1" ]]; then
@@ -24,6 +23,11 @@ if [[ ! -x "${python_bin}" ]]; then
     echo "Python virtual environment not found: ${python_bin}" >&2
     exit 1
 fi
+torch_abi_tag="$(${python_bin} -c 'import torch; print(torch.__version__.split("+")[0])')"
+if [[ -z "${LSSO_MATHDX_BUILD_DIR:-}" ]]; then
+    build_dir="${HOME}/.cache/lsso-mathdx-build-${torch_abi_tag}"
+fi
+torch_include_cache="${LSSO_TORCH_INCLUDE_CACHE:-${HOME}/.cache/lsso-torch-include-${torch_abi_tag}}"
 if [[ ! -f "${mathdx_root}/lib/cmake/mathdx/mathdx-config.cmake" ]]; then
     echo "MathDx CMake package not found under: ${mathdx_root}" >&2
     exit 1

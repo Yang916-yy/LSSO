@@ -7,6 +7,7 @@ from lsso.mathdx_backend import (
     load_mathdx_backend,
     mathdx_load_error,
     solve_spd,
+    stats_solve_readout,
     stats_solve_spd,
     try_masked_stats_solve_spd,
     try_prepare_basis,
@@ -28,6 +29,29 @@ def test_mathdx_solve_spd_matches_torch(rank: int, rhs_width: int) -> None:
     rhs = torch.randn(7, rank, rhs_width, device="cuda", dtype=torch.float32)
 
     actual, info = solve_spd(gram.contiguous(), rhs.contiguous())
+    expected = torch.linalg.solve(gram, rhs)
+
+    assert torch.count_nonzero(info).item() == 0
+    torch.testing.assert_close(actual, expected, rtol=3e-4, atol=3e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rank", [16, 32])
+@pytest.mark.parametrize("batches_per_block", [2, 4])
+def test_mathdx_multi_system_cholesky_matches_torch(
+    rank: int, batches_per_block: int
+) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+
+    torch.manual_seed(13)
+    systems, rhs_width = 128, 64
+    a = torch.randn(systems, rank, rank, device="cuda")
+    gram = a @ a.transpose(-1, -2) + torch.eye(rank, device="cuda")
+    rhs = torch.randn(systems, rank, rhs_width, device="cuda")
+    actual, info = torch.ops.lsso_mathdx.solve_spd_bpb(
+        gram.contiguous(), rhs.contiguous(), batches_per_block
+    )
     expected = torch.linalg.solve(gram, rhs)
 
     assert torch.count_nonzero(info).item() == 0
@@ -60,6 +84,40 @@ def test_mathdx_fused_stats_solve_matches_torch(
 
     assert torch.count_nonzero(info).item() == 0
     torch.testing.assert_close(actual, expected, rtol=3e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rank", [16, 32])
+@pytest.mark.parametrize("rhs_width", [48, 64])
+def test_mathdx_stats_solve_readout_matches_torch(
+    dtype: torch.dtype, rank: int, rhs_width: int
+) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+
+    torch.manual_seed(11)
+    batches, sequence = 7, 197
+    u = (0.2 * torch.randn(batches, sequence, rank, device="cuda")).to(dtype)
+    c = torch.randn(batches, sequence, rhs_width, device="cuda").to(dtype)
+    alpha = 0.05 * torch.rand(batches, device="cuda")
+    inv_mu = 0.5 + torch.rand(batches, device="cuda")
+
+    actual, info = stats_solve_readout(u, c, alpha, inv_mu)
+    u32, c32 = u.float(), c.float()
+    gram = u32.transpose(1, 2) @ u32
+    rhs = u32.transpose(1, 2) @ c32
+    system = torch.eye(rank, device="cuda") + alpha[:, None, None] * gram
+    compact = torch.linalg.solve(system, rhs)
+    expected = (
+        c32 - alpha[:, None, None] * (u32 @ compact)
+    ) * inv_mu[:, None, None]
+
+    assert torch.count_nonzero(info).item() == 0
+    tolerance = 5e-4 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(
+        actual.float(), expected, rtol=tolerance, atol=tolerance
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
