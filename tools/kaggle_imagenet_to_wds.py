@@ -116,12 +116,16 @@ def load_labels(session: requests.Session) -> tuple[dict[str, int], dict[str, in
 
 
 class AtomicShardWriter:
-    def __init__(self, root: Path, split: str, maxcount: int) -> None:
+    def __init__(
+        self, root: Path, split: str, maxcount: int, *, name_tag: str = ""
+    ) -> None:
         self.root = root
         self.split = split
         self.maxcount = maxcount
+        self.name_tag = name_tag
+        self.file_split = f"{split}-{name_tag}" if name_tag else split
         self.root.mkdir(parents=True, exist_ok=True)
-        for partial in self.root.glob(f"imagenet1k-{split}-*.tar.partial"):
+        for partial in self.root.glob(f"imagenet1k-{self.file_split}-*.tar.partial"):
             partial.unlink()
         self.shard_index, self.completed = self._resume_state()
         self.current_count = 0
@@ -132,7 +136,7 @@ class AtomicShardWriter:
     def _resume_state(self) -> tuple[int, int]:
         shard_index = completed = 0
         while True:
-            stem = f"imagenet1k-{self.split}-{shard_index:05d}"
+            stem = f"imagenet1k-{self.file_split}-{shard_index:05d}"
             shard = self.root / f"{stem}.tar"
             marker = self.root / f"{stem}.complete.json"
             if not shard.exists() and not marker.exists():
@@ -149,7 +153,7 @@ class AtomicShardWriter:
         return shard_index, completed
 
     def _open(self) -> None:
-        stem = f"imagenet1k-{self.split}-{self.shard_index:05d}"
+        stem = f"imagenet1k-{self.file_split}-{self.shard_index:05d}"
         self.partial = self.root / f"{stem}.tar.partial"
         self.stream = self.partial.open("wb", buffering=4 << 20)
         self.archive = tarfile.open(fileobj=self.stream, mode="w|")
