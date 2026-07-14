@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+import urllib.error
 from email.message import Message
 
 import pytest
@@ -90,3 +91,41 @@ def test_download_resumes_a_truncated_partial_with_http_range(tmp_path, monkeypa
     _download_validated("https://example.test/shard.tar", "token", partial)
     assert partial.read_bytes() == complete
     assert len(requests) == 2
+
+
+def test_download_honors_finite_attempt_limit(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(request)
+        raise urllib.error.URLError("temporary outage")
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    with pytest.raises(OSError, match="after 2 attempts"):
+        _download_validated(
+            "https://example.test/shard.tar",
+            "token",
+            tmp_path / "shard.tar.partial",
+            attempts=2,
+        )
+    assert len(calls) == 2
+
+
+def test_download_does_not_retry_authentication_error(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(request)
+        raise urllib.error.HTTPError(
+            request.full_url, 401, "unauthorized", {}, None
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    with pytest.raises(OSError, match="non-retryable HTTP 401"):
+        _download_validated(
+            "https://example.test/shard.tar",
+            "token",
+            tmp_path / "shard.tar.partial",
+        )
+    assert len(calls) == 1

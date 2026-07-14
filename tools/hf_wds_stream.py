@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import errno
 import fcntl
 import os
 import random
@@ -27,8 +28,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-downloads",
         type=int,
-        default=int(os.environ.get("LSSO_HF_MAX_DOWNLOADS", "4")),
+        default=int(os.environ.get("LSSO_HF_MAX_DOWNLOADS", "2")),
         help="Maximum concurrent HTTP shard downloads across loader workers.",
+    )
+    parser.add_argument(
+        "--download-attempts",
+        type=int,
+        default=int(os.environ.get("LSSO_HF_DOWNLOAD_ATTEMPTS", "0")),
+        help="Attempts per shard; 0 retries transient network errors indefinitely.",
     )
     return parser.parse_args()
 
@@ -83,11 +90,13 @@ def _download_validated(
     token: str,
     partial: Path,
     *,
-    attempts: int = 12,
+    attempts: int = 0,
 ) -> None:
     last_error: BaseException | None = None
     content_range_pattern = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         existing_bytes = partial.stat().st_size if partial.is_file() else 0
         headers = {
             "Authorization": f"Bearer {token}",
@@ -125,6 +134,10 @@ def _download_validated(
             validate_tar(partial, expected_bytes=expected_bytes)
             return
         except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403, 404}:
+                raise IOError(
+                    f"non-retryable HTTP {exc.code} while downloading {url}"
+                ) from exc
             if exc.code == 416 and partial.is_file():
                 try:
                     validate_tar(partial)
@@ -134,6 +147,12 @@ def _download_validated(
                     return
             last_error = exc
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+            if isinstance(exc, OSError) and exc.errno in {
+                errno.EACCES,
+                errno.ENOSPC,
+                errno.EROFS,
+            }:
+                raise
             last_error = exc
             if (
                 expected_bytes is not None
@@ -142,14 +161,22 @@ def _download_validated(
             ):
                 # A full-size invalid archive is corruption, not a resumable truncation.
                 partial.unlink(missing_ok=True)
-        if attempt < attempts:
-            # Jitter prevents all WebDataset workers from retrying a rate-limit
-            # response at the same instant.
-            time.sleep(min(2 ** (attempt - 1), 30) * random.uniform(0.75, 1.25))
-    raise IOError(
-        f"failed to download a valid shard after {attempts} attempts: {url}; "
-        f"last error: {type(last_error).__name__}: {last_error}"
-    ) from last_error
+        if attempts > 0 and attempt >= attempts:
+            raise IOError(
+                f"failed to download a valid shard after {attempts} attempts: {url}; "
+                f"last error: {type(last_error).__name__}: {last_error}"
+            ) from last_error
+        if attempt == 1 or attempt % 5 == 0:
+            limit = "unbounded" if attempts <= 0 else str(attempts)
+            print(
+                f"retrying {partial.name}: attempt {attempt + 1}/{limit}; "
+                f"last error: {type(last_error).__name__}: {last_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Jitter prevents all WebDataset workers from retrying a rate-limit
+        # response at the same instant.
+        time.sleep(min(2 ** min(attempt - 1, 5), 30) * random.uniform(0.75, 1.25))
 
 
 def _emit_file(path: Path) -> None:
@@ -166,7 +193,8 @@ def stream_file(
     cache_dir: Path,
     *,
     emit: bool = True,
-    max_downloads: int = 4,
+    max_downloads: int = 2,
+    download_attempts: int = 0,
 ) -> None:
     destination = cache_dir / filename
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -194,7 +222,7 @@ def stream_file(
         partial = destination.with_suffix(destination.suffix + ".partial")
         try:
             with _download_slot(cache_dir, max_downloads):
-                _download_validated(url, token, partial)
+                _download_validated(url, token, partial, attempts=download_attempts)
             partial.replace(destination)
             verified_path.touch()
         except BaseException:
@@ -212,6 +240,7 @@ def main() -> None:
         Path(args.cache_dir),
         emit=not args.quiet,
         max_downloads=args.max_downloads,
+        download_attempts=args.download_attempts,
     )
 
 
