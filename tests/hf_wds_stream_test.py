@@ -129,3 +129,24 @@ def test_download_does_not_retry_authentication_error(tmp_path, monkeypatch) -> 
             tmp_path / "shard.tar.partial",
         )
     assert len(calls) == 1
+
+
+def test_download_retries_transient_forbidden_response(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(request)
+        raise urllib.error.HTTPError(
+            request.full_url, 403, "temporary CDN rejection", {}, None
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    with pytest.raises(OSError, match="after 2 attempts"):
+        _download_validated(
+            "https://example.test/shard.tar",
+            "token",
+            tmp_path / "shard.tar.partial",
+            attempts=2,
+        )
+    assert len(calls) == 2

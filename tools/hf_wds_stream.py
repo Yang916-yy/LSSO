@@ -134,7 +134,11 @@ def _download_validated(
             validate_tar(partial, expected_bytes=expected_bytes)
             return
         except urllib.error.HTTPError as exc:
-            if exc.code in {401, 403, 404}:
+            # A gated-repository 401 is a bad/expired token and 404 is a bad
+            # shard name. Hugging Face CDN redirects can return transient 403
+            # responses under load even after the authenticated resolve
+            # request succeeded, so 403 must refresh the signed URL and retry.
+            if exc.code in {401, 404}:
                 raise IOError(
                     f"non-retryable HTTP {exc.code} while downloading {url}"
                 ) from exc
