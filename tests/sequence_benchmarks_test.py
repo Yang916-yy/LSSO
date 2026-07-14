@@ -237,6 +237,37 @@ def test_genomic_tokenizer_and_dataset():
     assert tokens.min().item() > tokenizer.pad_token_id
 
 
+def test_local_motif_stem_preserves_shape_padding_and_gradients():
+    encoder = SequenceMixerEncoder(
+        8,
+        max_length=12,
+        pad_token_id=0,
+        dim=16,
+        depth=1,
+        num_heads=4,
+        mixer="rrlsso",
+        rank=8,
+        dropout=0.0,
+        local_motif_kernel=7,
+    )
+    short = torch.tensor([[2, 3, 4, 5]])
+    padded = torch.tensor([[2, 3, 4, 5, 0, 0]])
+    output = encoder(short)
+    assert output.shape == (1, 16)
+    torch.testing.assert_close(output, encoder(padded), rtol=2e-5, atol=2e-5)
+    output.square().mean().backward()
+    assert encoder.local_motif_stem[0].weight.grad is not None
+
+
+@pytest.mark.parametrize("kernel", [-1, 2, 6])
+def test_local_motif_stem_rejects_invalid_kernel(kernel: int):
+    with pytest.raises(ValueError, match="positive odd"):
+        SequenceMixerEncoder(
+            8, max_length=12, pad_token_id=0, dim=16, depth=1,
+            num_heads=4, mixer="rrlsso", rank=8, local_motif_kernel=kernel,
+        )
+
+
 def test_reverse_complement_preserves_right_padding_and_is_an_involution():
     tokenizer = NucleotideTokenizer()
     encoder = SequenceMixerEncoder(

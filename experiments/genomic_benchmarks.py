@@ -192,6 +192,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--position-rank", type=int, default=0)
+    parser.add_argument(
+        "--local-motif-kernel",
+        type=int,
+        default=0,
+        help="odd depthwise motif-stem kernel; zero disables the local stem",
+    )
     parser.add_argument("--pooling", choices=("mean", "max", "meanmax"), default="mean")
     parser.add_argument("--reverse-complement-probability", type=float, default=0.0)
     parser.add_argument("--reverse-complement-eval", action="store_true")
@@ -276,6 +282,7 @@ def main() -> None:
         dropout=args.dropout,
         position_rank=args.position_rank,
         pooling=args.pooling,
+        local_motif_kernel=args.local_motif_kernel,
     )
     model = ReverseComplementSequenceClassifier(
         encoder,
@@ -329,6 +336,7 @@ def main() -> None:
             "max_length": max_length,
             "requested_max_length": args.max_length,
             "position_rank": args.position_rank,
+            "local_motif_kernel": args.local_motif_kernel,
             "pooling": args.pooling,
             "reverse_complement_probability": args.reverse_complement_probability,
             "reverse_complement_eval": args.reverse_complement_eval,

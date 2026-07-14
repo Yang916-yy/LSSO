@@ -1,4 +1,4 @@
-"""Validation-gated RRLSSO-DNA recipe, scale, and formal experiment program.
+"""Validation-gated RRLSSO-DNA recipe, scale, architecture, and formal program.
 
 The first two stages never evaluate the benchmark test split. They select a
 reverse-complement/pooling recipe and record Tiny/Small/Base validation curves.
@@ -46,6 +46,13 @@ SIZES = {
     "base": ModelSize(256, 2, 8, 32, 2_200_000),
 }
 
+DEEP_256X4 = ModelSize(256, 4, 8, 32, 4_000_000)
+ARCHITECTURE_CANDIDATES = {
+    "base": {"size": SIZES["base"], "local_motif_kernel": 0},
+    "base_motif7": {"size": SIZES["base"], "local_motif_kernel": 7},
+    "deep_256x4": {"size": DEEP_256X4, "local_motif_kernel": 0},
+}
+
 ENHANCEMENTS = {
     "none": {"probability": 0.0, "eval": False},
     "rc_train": {"probability": 0.5, "eval": False},
@@ -61,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--screen-seed", type=int, default=0)
-    parser.add_argument("--scale-seeds", type=int, nargs="+", default=(0, 1))
+    parser.add_argument("--scale-seeds", type=int, nargs="+", default=(0,))
     parser.add_argument("--formal-seeds", type=int, nargs="+", default=(0, 1, 2))
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--patience", type=int, default=12)
@@ -78,7 +85,9 @@ def parse_args() -> argparse.Namespace:
         help="prefer the simpler candidate when validation accuracy is within this margin",
     )
     parser.add_argument(
-        "--stop-after", choices=("recipe", "scale", "formal"), default="formal"
+        "--stop-after",
+        choices=("recipe", "scale", "architecture", "formal"),
+        default="formal",
     )
     parser.add_argument("--rerun-complete", action="store_true")
     return parser.parse_args()
@@ -144,6 +153,7 @@ def run_job(
     pooling: str,
     enhancement: dict,
     validation_only: bool,
+    local_motif_kernel: int = 0,
 ) -> dict:
     result_name = "validation_metrics.json" if validation_only else "test_metrics.json"
     result_path = output / result_name
@@ -155,6 +165,7 @@ def run_job(
         + ["--seed", str(seed)]
         + model_arguments(size)
         + recipe_arguments(pooling, enhancement)
+        + ["--local-motif-kernel", str(local_motif_kernel)]
     )
     if validation_only:
         command.append("--validation-only")
@@ -272,10 +283,87 @@ def run_scale(args: argparse.Namespace, root: Path, selection: dict) -> dict:
     return scale
 
 
-def freeze_base(args: argparse.Namespace, root: Path, selection: dict, scale: dict) -> dict:
+def run_architecture_gate(
+    args: argparse.Namespace, root: Path, selection: dict
+) -> dict:
+    """Compare depth and a local motif prior without touching test splits."""
+    if list(args.scale_seeds) != [args.screen_seed]:
+        raise ValueError(
+            "the architecture gate requires exactly the single screening seed"
+        )
+    recipe = selection["selected_recipe"]
+    enhancement = {"probability": recipe["probability"], "eval": recipe["eval"]}
+    seed = args.screen_seed
+    results: dict[str, dict[str, dict]] = {"base": {}}
+
+    # Base was already measured by the scale gate; do not train it twice.
+    for dataset in REPRESENTATIVE_TASKS:
+        source = root / "scale" / "base" / f"{dataset}-s{seed}" / "validation_metrics.json"
+        if not source.is_file():
+            raise RuntimeError(f"missing Base validation result required by gate: {source}")
+        results["base"][dataset] = json.loads(source.read_text(encoding="utf-8"))
+
+    for name in ("base_motif7", "deep_256x4"):
+        candidate = ARCHITECTURE_CANDIDATES[name]
+        by_task = {}
+        for dataset in REPRESENTATIVE_TASKS:
+            output = root / "architecture" / name / f"{dataset}-s{seed}"
+            by_task[dataset] = run_job(
+                args,
+                output=output,
+                dataset=dataset,
+                seed=seed,
+                size=candidate["size"],
+                pooling=recipe["pooling"],
+                enhancement=enhancement,
+                validation_only=True,
+                local_motif_kernel=candidate["local_motif_kernel"],
+            )
+        results[name] = by_task
+
+    scores = {name: mean_accuracy(values) for name, values in results.items()}
+    selected = choose_with_margin(
+        scores, ("base", "base_motif7", "deep_256x4"), args.tie_margin
+    )
+    summary = {
+        "protocol": {
+            "tasks": list(REPRESENTATIVE_TASKS),
+            "seed": seed,
+            "metric": "validation_accuracy_macro_over_tasks",
+            "recipe_frozen": recipe,
+            "tie_margin": args.tie_margin,
+            "test_evaluated": False,
+        },
+        "scores": scores,
+        "selected_architecture": selected,
+        "candidates": {
+            name: {
+                "size": asdict(candidate["size"]),
+                "local_motif_kernel": candidate["local_motif_kernel"],
+                "task_metrics": results[name],
+            }
+            for name, candidate in ARCHITECTURE_CANDIDATES.items()
+        },
+    }
+    atomic_json(root / "architecture_results.json", summary)
+    print(json.dumps({"architecture_results": summary}, sort_keys=True), flush=True)
+    return summary
+
+
+def freeze_base(
+    args: argparse.Namespace,
+    root: Path,
+    selection: dict,
+    scale: dict,
+    architecture: dict,
+) -> dict:
+    architecture_name = architecture["selected_architecture"]
+    candidate = ARCHITECTURE_CANDIDATES[architecture_name]
     frozen = {
-        "model": "RRLSSO-DNA-Base",
-        "size": asdict(SIZES["base"]),
+        "model": f"RRLSSO-DNA-{architecture_name}",
+        "architecture": architecture_name,
+        "size": asdict(candidate["size"]),
+        "local_motif_kernel": candidate["local_motif_kernel"],
         "recipe": selection["selected_recipe"],
         "training": {
             "epochs": args.epochs,
@@ -292,6 +380,7 @@ def freeze_base(args: argparse.Namespace, root: Path, selection: dict, scale: di
         "selection_source": {
             "recipe": "recipe_selection.json",
             "scale": "scale_results.json",
+            "architecture": "architecture_results.json",
         },
         "test_evaluated_at_freeze": False,
         "frozen_unix": time.time(),
@@ -317,11 +406,13 @@ def run_formal(args: argparse.Namespace, root: Path, frozen: dict) -> None:
     completed = 0
     for dataset in frozen["formal_tasks"]:
         for seed in frozen["formal_seeds"]:
-            output = root / "formal" / f"genomic-{dataset}-rrlsso-dna-base-s{seed}"
+            architecture = frozen.get("architecture", "base")
+            output = root / "formal" / f"genomic-{dataset}-rrlsso-dna-{architecture}-s{seed}"
             run_job(
                 args, output=output, dataset=dataset, seed=seed, size=size,
                 pooling=recipe["pooling"], enhancement=enhancement,
                 validation_only=False,
+                local_motif_kernel=int(frozen.get("local_motif_kernel", 0)),
             )
             completed += 1
     atomic_json(
@@ -350,7 +441,15 @@ def main() -> None:
     )
     if args.stop_after == "scale":
         return
-    frozen = freeze_base(args, root, selection, scale)
+    architecture_path = root / "architecture_results.json"
+    architecture = (
+        json.loads(architecture_path.read_text(encoding="utf-8"))
+        if architecture_path.exists() and not args.rerun_complete
+        else run_architecture_gate(args, root, selection)
+    )
+    if args.stop_after == "architecture":
+        return
+    frozen = freeze_base(args, root, selection, scale, architecture)
     run_formal(args, root, frozen)
 
 

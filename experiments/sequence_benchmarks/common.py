@@ -426,6 +426,10 @@ def train_classifier(
         "mlp": sum(
             parameter.numel() for name, parameter in named_parameters if ".mlp." in name
         ),
+        "local_motif_stem": sum(
+            parameter.numel() for name, parameter in named_parameters
+            if "local_motif_stem" in name
+        ),
         "pooling": sum(
             parameter.numel() for name, parameter in named_parameters
             if "pool_projection" in name

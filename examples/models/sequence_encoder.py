@@ -67,14 +67,37 @@ class SequenceMixerEncoder(nn.Module):
         projection_dim: int | None = None,
         position_rank: int = 0,
         pooling: str = "mean",
+        local_motif_kernel: int = 0,
     ) -> None:
         super().__init__()
         if pooling not in {"mean", "max", "meanmax"}:
             raise ValueError(f"unsupported sequence pooling: {pooling}")
+        if local_motif_kernel < 0 or (
+            local_motif_kernel and local_motif_kernel % 2 == 0
+        ):
+            raise ValueError("local_motif_kernel must be zero or a positive odd integer")
         self.max_length = int(max_length)
         self.pad_token_id = int(pad_token_id)
         self.pooling = pooling
         self.token_embedding = nn.Embedding(vocab_size, dim, padding_idx=pad_token_id)
+        self.local_motif_kernel = int(local_motif_kernel)
+        self.local_motif_stem = (
+            nn.Sequential(
+                nn.Conv1d(
+                    dim,
+                    dim,
+                    kernel_size=self.local_motif_kernel,
+                    padding=self.local_motif_kernel // 2,
+                    groups=dim,
+                    bias=False,
+                ),
+                nn.GELU(),
+                nn.Conv1d(dim, dim, kernel_size=1, bias=False),
+                nn.Dropout(dropout),
+            )
+            if self.local_motif_kernel
+            else None
+        )
         self.position_rank = (
             int(position_rank) if 0 < position_rank < min(max_length, dim) else 0
         )
@@ -133,6 +156,10 @@ class SequenceMixerEncoder(nn.Module):
             )
         valid = input_ids.ne(self.pad_token_id) if attention_mask is None else attention_mask.bool()
         x = self.token_embedding(input_ids)
+        x = x * valid.unsqueeze(-1).to(x.dtype)
+        if self.local_motif_stem is not None:
+            local = self.local_motif_stem(x.transpose(1, 2)).transpose(1, 2)
+            x = x + local * valid.unsqueeze(-1).to(local.dtype)
         x = self.embedding_dropout(x + self._positions(input_ids.shape[1]))
         x = x * valid.unsqueeze(-1).to(x.dtype)
         for block in self.blocks:

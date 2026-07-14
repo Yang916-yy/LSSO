@@ -154,13 +154,16 @@ uses only a validation split for checkpoint selection, and writes
 
 ### RRLSSO-DNA competitive-model program
 
-`run_rrlsso_dna_program.py` enforces a validation-gated three-stage protocol:
+`run_rrlsso_dna_program.py` enforces a validation-gated four-stage protocol:
 
 1. screen reverse-complement augmentation/evaluation and mean, max, or
    mean-max pooling on Human-vs-Worm, Non-TATA, OCR, and Cohn;
 2. freeze the selected recipe and compare Tiny (128x2, rank 16), Small
    (192x2, rank 32), and Base (256x2, rank 32) on validation data only;
-3. write an immutable `frozen_config.json`, then evaluate RRLSSO-DNA-Base on
+3. compare Base against a 256x4 candidate and Base with a residual depthwise
+   kernel-7 local motif stem, using seed 0 and validation data only;
+4. write an immutable `frozen_config.json`, then evaluate the selected
+   RRLSSO-DNA architecture on
    all eight test splits for seeds 0/1/2.
 
 The next GenomicBenchmarks validation gates are deliberately single-seed:
@@ -187,7 +190,7 @@ runs one child at a time and resumes completed stages automatically:
 ```bash
 python experiments/run_rrlsso_dna_program.py \
   --output-root runs/rrlsso_dna_program \
-  --scale-seeds 0 1 --formal-seeds 0 1 2 --workers 4
+  --scale-seeds 0 --formal-seeds 0 1 2 --workers 4
 ```
 
 Checkpoint state includes Python, NumPy, PyTorch, CUDA, DataLoader-generator,
