@@ -9,7 +9,9 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 find_package(Torch REQUIRED)
-find_package(CUDAToolkit 13.0 REQUIRED)
+# CUDA 12.8 is the first toolkit with the SM120 compiler and the matching
+# cuSolverDx fatbin target.  Newer CUDA 13 toolkits remain accepted.
+find_package(CUDAToolkit 12.8 REQUIRED)
 find_package(mathdx REQUIRED CONFIG)
 
 add_library(lsso_mathdx SHARED lsso_mathdx.cu)

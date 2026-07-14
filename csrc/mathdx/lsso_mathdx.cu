@@ -17,10 +17,28 @@
 #include <cublasdx.hpp>
 #include <cusolverdx.hpp>
 
+// MathDx 26.x exposes launch guards used by its multi-architecture examples;
+// the CUDA-12-compatible 25.12 package predates those convenience macros.
+// This extension is compiled into architecture-specific kernels, so the
+// older package does not need an additional runtime guard.
+#ifndef CUBLASDX_SKIP_IF_NOT_APPLICABLE_SM
+#define CUBLASDX_SKIP_IF_NOT_APPLICABLE_SM(Operation)
+#endif
+#ifndef CUSOLVERDX_SKIP_IF_NOT_APPLICABLE_SM
+#define CUSOLVERDX_SKIP_IF_NOT_APPLICABLE_SM(Operation)
+#endif
+
 namespace {
 
 using block_barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cuda_exp = cuda::device::experimental;
+#if CUDART_VERSION >= 13000
+constexpr int kThorMathDxArch = 1100;
+#else
+// CUDA 13 renamed Thor from SM101 to SM110. MathDx descriptors follow the
+// toolkit-specific name even though runtime compute capability reports 11.0.
+constexpr int kThorMathDxArch = 1010;
+#endif
 
 template <int TileRows, int TileColumns>
 __device__ __forceinline__ block_barrier::arrival_token issue_tma_tile(
@@ -297,7 +315,7 @@ __global__ void masked_stats_solve_spd_kernel(
     constexpr int u_tile_elements = cublasdx::cosize(Gram::get_layout_smem_a());
     constexpr int c_tile_elements = cublasdx::cosize(Cross::get_layout_smem_b());
 
-    extern __shared__ __align__(16) cublasdx::byte smem_raw[];
+    extern __shared__ __align__(16) unsigned char smem_raw[];
     float* u_tile = reinterpret_cast<float*>(smem_raw);
     float* c_tile = u_tile + u_tile_elements;
     float* a = c_tile + c_tile_elements;
@@ -463,7 +481,7 @@ __global__ void stats_solve_spd_kernel(
     constexpr int output_elements =
         (Rank > KTile ? Rank : KTile) * RhsTile;
 
-    extern __shared__ __align__(128) cublasdx::byte smem_raw[];
+    extern __shared__ __align__(128) unsigned char smem_raw[];
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ block_barrier tma_barriers[2];
     float* u_tile = reinterpret_cast<float*>(smem_raw);
@@ -870,7 +888,7 @@ __global__ void solve_spd_kernel(
     constexpr int ldb = Potrs::ldb;
     constexpr int a_elements = Rank * lda;
 
-    extern __shared__ __align__(16) cusolverdx::byte smem_raw[];
+    extern __shared__ __align__(16) unsigned char smem_raw[];
     float* a = reinterpret_cast<float*>(smem_raw);
     float* b = a + BatchesPerBlock * a_elements;
 
@@ -1194,7 +1212,7 @@ std::tuple<at::Tensor, at::Tensor> solve_spd_impl(
     } else if (cc >= 120) {
         dispatch_rank<1200>(gram, rhs, solution, info, stream, requested_batches_per_block);
     } else if (cc >= 110) {
-        dispatch_rank<1100>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<kThorMathDxArch>(gram, rhs, solution, info, stream, requested_batches_per_block);
     } else if (cc >= 103) {
         dispatch_rank<1030>(gram, rhs, solution, info, stream, requested_batches_per_block);
     } else if (cc >= 100) {
@@ -1276,7 +1294,7 @@ std::tuple<at::Tensor, at::Tensor> stats_solve_spd_impl(
     } else if (cc >= 120) {
         DISPATCH_STATS(1200);
     } else if (cc >= 110) {
-        DISPATCH_STATS(1100);
+        DISPATCH_STATS(kThorMathDxArch);
     } else if (cc >= 103) {
         DISPATCH_STATS(1030);
     } else if (cc >= 100) {
@@ -1366,7 +1384,7 @@ std::tuple<at::Tensor, at::Tensor> masked_stats_solve_spd_cuda(
     } else if (cc >= 120) {
         DISPATCH_MASKED_STATS(1200);
     } else if (cc >= 110) {
-        DISPATCH_MASKED_STATS(1100);
+        DISPATCH_MASKED_STATS(kThorMathDxArch);
     } else if (cc >= 103) {
         DISPATCH_MASKED_STATS(1030);
     } else if (cc >= 100) {

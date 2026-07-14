@@ -45,6 +45,12 @@ cd /root/LSSO
 bash tools/build_mathdx_backend.sh
 ```
 
+The backend also supports the CUDA 12.8 stack used by Colab RTX PRO 6000
+runtimes. CUDA 12.8 must use the CUDA-12 MathDx 25.12.1 package; CUDA 13 uses
+MathDx 26.x. Device LTO objects cannot be mixed across CUDA major versions.
+The formal ImageNet notebook detects `nvcc`, downloads the matching package,
+and uses an isolated build directory automatically.
+
 The release build produces a fat binary for Ampere (SM80/86/87), Ada (SM89),
 Hopper (SM90), and Blackwell (SM100/120):
 
