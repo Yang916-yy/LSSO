@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--screen-seed", type=int, default=0)
     parser.add_argument("--scale-seeds", type=int, nargs="+", default=(0,))
-    parser.add_argument("--formal-seeds", type=int, nargs="+", default=(0, 1, 2, 3, 4))
+    parser.add_argument("--formal-seeds", type=int, nargs="+", default=(0, 1, 2))
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -389,7 +389,9 @@ def freeze_base(
         "training": {
             "epochs": 100,
             "patience": 100,
-            "batch_size": 128,
+            "batch_size": 64,
+            "grad_accum": 2,
+            "effective_batch_size": 128,
             "eval_batch_size": 256,
             "lr": 6e-4,
             "weight_decay": 0.01,

@@ -26,6 +26,7 @@ class TrainingConfig:
     warmup_ratio: float = 0.05
     min_lr_ratio: float = 0.0
     posthoc_rc_eval: bool = False
+    grad_accum: int = 1
     grad_clip: float = 1.0
     label_smoothing: float = 0.0
     patience: int = 10
@@ -463,7 +464,10 @@ def train_classifier(
     batches_per_epoch = len(train_loader)
     if config.max_train_batches:
         batches_per_epoch = min(batches_per_epoch, config.max_train_batches)
-    total_steps = max(1, config.epochs * batches_per_epoch)
+    if config.grad_accum < 1:
+        raise ValueError("grad_accum must be at least one")
+    updates_per_epoch = math.ceil(batches_per_epoch / config.grad_accum)
+    total_steps = max(1, config.epochs * updates_per_epoch)
     warmup_steps = round(total_steps * config.warmup_ratio)
     if not 0.0 <= config.min_lr_ratio <= 1.0:
         raise ValueError("min_lr_ratio must be between zero and one")
@@ -494,11 +498,14 @@ def train_classifier(
             model.set_augmentation_epoch(epoch)
         model.train()
         train_loss, examples = 0.0, 0
+        accumulated_examples = 0
+        optimizer.zero_grad(set_to_none=True)
         for batch_index, raw_batch in enumerate(train_loader):
             if config.max_train_batches and batch_index >= config.max_train_batches:
                 break
             batch = _move_batch(raw_batch, device)
-            optimizer.zero_grad(set_to_none=True)
+            group_start = (batch_index // config.grad_accum) * config.grad_accum
+            group_size = min(config.grad_accum, batches_per_epoch - group_start)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 logits = _forward(model, batch)
                 loss = F.cross_entropy(
@@ -506,11 +513,22 @@ def train_classifier(
                     batch["labels"],
                     label_smoothing=config.label_smoothing,
                 )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-            optimizer.step()
-            scheduler.step()
             batch_size = batch["labels"].numel()
+            # Accumulate summed-example gradients, then normalize once per
+            # optimizer update. This exactly matches a large batch even when
+            # the final micro-batch is short.
+            (loss * batch_size).backward()
+            accumulated_examples += batch_size
+            update_due = (batch_index - group_start + 1) == group_size
+            if update_due:
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(accumulated_examples)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_examples = 0
             train_loss += float(loss.detach()) * batch_size
             examples += batch_size
         train_finished = time.perf_counter()

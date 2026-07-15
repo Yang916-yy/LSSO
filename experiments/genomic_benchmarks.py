@@ -232,6 +232,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -263,7 +264,10 @@ def apply_training_profile(args: argparse.Namespace) -> None:
     # layer-specific decay policy does not map cleanly to solve parameters.
     args.epochs = 100
     args.patience = 100
-    args.batch_size = 128
+    # Preserve the effective batch of 128 while avoiding long-sequence
+    # activation pressure on 16 GiB GPUs.
+    args.batch_size = 64
+    args.grad_accum = 2
     args.eval_batch_size = 256
     args.lr = 6e-4
     args.weight_decay = 0.01
@@ -403,6 +407,7 @@ def main() -> None:
             warmup_ratio=args.warmup_ratio,
             min_lr_ratio=args.min_lr_ratio,
             posthoc_rc_eval=args.posthoc_rc_eval,
+            grad_accum=args.grad_accum,
             patience=args.patience,
             seed=args.seed,
             resume=args.resume,
@@ -433,6 +438,8 @@ def main() -> None:
             "validation_only": args.validation_only,
             "validation_fraction": args.validation_fraction,
             "batch_size": args.batch_size,
+            "grad_accum": args.grad_accum,
+            "effective_batch_size": args.batch_size * args.grad_accum,
             "eval_batch_size": args.eval_batch_size,
             "workers": args.workers,
             "max_train_samples": args.max_train_samples,

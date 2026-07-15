@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -413,6 +414,48 @@ def test_shared_trainer_writes_and_resumes_checkpoints(tmp_path: Path, monkeypat
         config=config,
         metadata={"suite": "test", "dataset": "tiny", "mixer": "rrlsso"},
     )
+
+
+def test_gradient_accumulation_matches_effective_large_batch(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    rows = [
+        (torch.tensor([2, 3]), 0),
+        (torch.tensor([3, 4]), 1),
+        (torch.tensor([2, 4]), 0),
+        (torch.tensor([4, 3]), 1),
+        (torch.tensor([2, 2]), 0),
+    ]
+    large_loader = make_loader(
+        rows, batch_size=4, workers=0, device=torch.device("cpu"),
+        collate_fn=collate_tokens, train=False, seed=0,
+    )
+    micro_loader = make_loader(
+        rows, batch_size=2, workers=0, device=torch.device("cpu"),
+        collate_fn=collate_tokens, train=False, seed=0,
+    )
+    encoder = SequenceMixerEncoder(
+        8, max_length=4, pad_token_id=0, dim=8, depth=1,
+        num_heads=2, mixer="rrlsso", rank=4, dropout=0.0,
+    )
+    large_model = SequenceClassifier(encoder, 2)
+    micro_model = copy.deepcopy(large_model)
+    metadata = {"suite": "test", "dataset": "tiny", "mixer": "rrlsso"}
+    train_classifier(
+        large_model, large_loader, large_loader, None, num_classes=2,
+        config=TrainingConfig(output=str(tmp_path / "large"), epochs=1, seed=0),
+        metadata=metadata,
+    )
+    train_classifier(
+        micro_model, micro_loader, micro_loader, None, num_classes=2,
+        config=TrainingConfig(
+            output=str(tmp_path / "micro"), epochs=1, seed=0, grad_accum=2
+        ),
+        metadata=metadata,
+    )
+    for large_parameter, micro_parameter in zip(
+        large_model.parameters(), micro_model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(large_parameter, micro_parameter, rtol=1e-5, atol=1e-6)
 
 
 def test_validation_only_training_never_writes_test_metrics(tmp_path: Path, monkeypatch):
