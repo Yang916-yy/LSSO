@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--screen-seed", type=int, default=0)
     parser.add_argument("--scale-seeds", type=int, nargs="+", default=(0,))
-    parser.add_argument("--formal-seeds", type=int, nargs="+", default=(0, 1, 2))
+    parser.add_argument("--formal-seeds", type=int, nargs="+", default=(0, 1, 2, 3, 4))
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -154,6 +154,8 @@ def run_job(
     enhancement: dict,
     validation_only: bool,
     local_motif_kernel: int = 0,
+    training_profile: str = "standard",
+    posthoc_rc_eval: bool = False,
 ) -> dict:
     result_name = "validation_metrics.json" if validation_only else "test_metrics.json"
     result_path = output / result_name
@@ -166,7 +168,10 @@ def run_job(
         + model_arguments(size)
         + recipe_arguments(pooling, enhancement)
         + ["--local-motif-kernel", str(local_motif_kernel)]
+        + ["--training-profile", training_profile]
     )
+    if posthoc_rc_eval:
+        command.append("--posthoc-rc-eval")
     if validation_only:
         command.append("--validation-only")
     print(json.dumps({"status": "starting", "command": command}), flush=True)
@@ -358,22 +363,35 @@ def freeze_base(
     architecture: dict,
 ) -> dict:
     architecture_name = architecture["selected_architecture"]
+    if architecture_name != "base_motif7":
+        raise RuntimeError(
+            f"expected the validated base_motif7 architecture, got {architecture_name}"
+        )
     candidate = ARCHITECTURE_CANDIDATES[architecture_name]
     frozen = {
-        "model": f"RRLSSO-DNA-{architecture_name}",
+        "model": "RRLSSO-DNA-Base-Motif7",
         "architecture": architecture_name,
         "size": asdict(candidate["size"]),
         "local_motif_kernel": candidate["local_motif_kernel"],
-        "recipe": selection["selected_recipe"],
+        "recipe": {
+            "pooling": "mean",
+            "reverse_complement_probability": 0.5,
+            "posthoc_rc_eval": True,
+            "mutation_probability": 0.002,
+            "mutation_clean_epochs": 20,
+            "training_profile": "hyenadna-flavor-rc-mutation",
+        },
         "training": {
-            "epochs": args.epochs,
-            "patience": args.patience,
-            "batch_size": args.batch_size,
-            "eval_batch_size": args.eval_batch_size,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "warmup_ratio": args.warmup_ratio,
-            "dropout": args.dropout,
+            "epochs": 100,
+            "patience": 100,
+            "batch_size": 128,
+            "eval_batch_size": 256,
+            "lr": 6e-4,
+            "weight_decay": 0.01,
+            "warmup_ratio": 0.01,
+            "min_lr_ratio": 0.1,
+            "embedding_dropout": 0.1,
+            "residual_dropout": 0.0,
         },
         "formal_tasks": list(GENOMIC_BENCHMARKS),
         "formal_seeds": list(args.formal_seeds),
@@ -381,6 +399,8 @@ def freeze_base(
             "recipe": "recipe_selection.json",
             "scale": "scale_results.json",
             "architecture": "architecture_results.json",
+            "recipe_probe": "recipe_hyenadna_flavor_rc_mutation",
+            "posthoc_probe": "recipe_hyenadna_flavor_rc_mutation_posthoc",
         },
         "test_evaluated_at_freeze": False,
         "frozen_unix": time.time(),
@@ -402,7 +422,10 @@ def freeze_base(
 def run_formal(args: argparse.Namespace, root: Path, frozen: dict) -> None:
     size = ModelSize(**frozen["size"])
     recipe = frozen["recipe"]
-    enhancement = {"probability": recipe["probability"], "eval": recipe["eval"]}
+    enhancement = {
+        "probability": recipe["reverse_complement_probability"],
+        "eval": False,
+    }
     completed = 0
     for dataset in frozen["formal_tasks"]:
         for seed in frozen["formal_seeds"]:
@@ -413,6 +436,8 @@ def run_formal(args: argparse.Namespace, root: Path, frozen: dict) -> None:
                 pooling=recipe["pooling"], enhancement=enhancement,
                 validation_only=False,
                 local_motif_kernel=int(frozen.get("local_motif_kernel", 0)),
+                training_profile=recipe["training_profile"],
+                posthoc_rc_eval=bool(recipe["posthoc_rc_eval"]),
             )
             completed += 1
     atomic_json(

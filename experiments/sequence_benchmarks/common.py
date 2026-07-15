@@ -25,6 +25,7 @@ class TrainingConfig:
     weight_decay: float = 0.01
     warmup_ratio: float = 0.05
     min_lr_ratio: float = 0.0
+    posthoc_rc_eval: bool = False
     grad_clip: float = 1.0
     label_smoothing: float = 0.0
     patience: int = 10
@@ -562,6 +563,10 @@ def train_classifier(
             break
     best_state = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best_state["model"])
+    if config.posthoc_rc_eval:
+        if not hasattr(model, "reverse_complement_eval"):
+            raise ValueError("posthoc_rc_eval requires a reverse-complement classifier")
+        model.reverse_complement_eval = True
     evaluation_loader = validation_loader if test_loader is None else test_loader
     final_metrics = evaluate(
         model, evaluation_loader, device, num_classes, config.max_eval_batches
@@ -573,6 +578,7 @@ def train_classifier(
         "loss": final_metrics["loss"],
         "selected_epoch": int(best_state["epoch"]),
         "parameters": run_config["parameters"],
+        "posthoc_rc_eval": config.posthoc_rc_eval,
     }
     history = []
     if metrics_path.exists():

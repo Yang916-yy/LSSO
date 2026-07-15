@@ -286,8 +286,6 @@ def apply_training_profile(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     apply_training_profile(args)
-    if args.posthoc_rc_eval:
-        args.reverse_complement_eval = True
     seed_all(args.seed)
     train_rows, test_rows, sequence_key, label_key, provenance = load_splits(
         args.dataset, args.data_root, args.cache_dir, args.dataset_revision
@@ -371,6 +369,8 @@ def main() -> None:
     if args.evaluate_checkpoint:
         state = torch.load(args.evaluate_checkpoint, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model"])
+        if args.posthoc_rc_eval:
+            model.reverse_complement_eval = True
         model.to(device)
         started = time.perf_counter()
         metrics = evaluate(model, validation_loader, device, num_classes)
@@ -402,6 +402,7 @@ def main() -> None:
             weight_decay=args.weight_decay,
             warmup_ratio=args.warmup_ratio,
             min_lr_ratio=args.min_lr_ratio,
+            posthoc_rc_eval=args.posthoc_rc_eval,
             patience=args.patience,
             seed=args.seed,
             resume=args.resume,
@@ -426,6 +427,7 @@ def main() -> None:
             "pooling": args.pooling,
             "reverse_complement_probability": args.reverse_complement_probability,
             "reverse_complement_eval": args.reverse_complement_eval,
+            "posthoc_rc_eval": args.posthoc_rc_eval,
             "mutation_probability": args.mutation_probability,
             "mutation_clean_epochs": args.mutation_clean_epochs,
             "validation_only": args.validation_only,
