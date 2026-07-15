@@ -211,6 +211,14 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="odd depthwise motif-stem kernel; zero disables the local stem",
     )
+    parser.add_argument(
+        "--local-motif-dilations",
+        type=int,
+        nargs="*",
+        default=(),
+        help="enable gated kernel-9 local blocks with these dilation rates",
+    )
+    parser.add_argument("--local-motif-layer-scale", type=float, default=1e-3)
     parser.add_argument("--pooling", choices=("mean", "max", "meanmax"), default="mean")
     parser.add_argument("--reverse-complement-probability", type=float, default=0.0)
     parser.add_argument("--reverse-complement-eval", action="store_true")
@@ -345,6 +353,8 @@ def main() -> None:
         position_rank=args.position_rank,
         pooling=args.pooling,
         local_motif_kernel=args.local_motif_kernel,
+        local_motif_dilations=tuple(args.local_motif_dilations),
+        local_motif_layer_scale=args.local_motif_layer_scale,
     )
     model = ReverseComplementSequenceClassifier(
         encoder,
@@ -429,6 +439,8 @@ def main() -> None:
             "position_rank": args.position_rank,
             "embedding_dropout": args.embedding_dropout,
             "local_motif_kernel": args.local_motif_kernel,
+            "local_motif_dilations": list(args.local_motif_dilations),
+            "local_motif_layer_scale": args.local_motif_layer_scale,
             "pooling": args.pooling,
             "reverse_complement_probability": args.reverse_complement_probability,
             "reverse_complement_eval": args.reverse_complement_eval,

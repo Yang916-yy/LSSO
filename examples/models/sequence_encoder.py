@@ -7,6 +7,48 @@ import torch.nn.functional as F
 from lsso import MixerAdapter
 
 
+class GatedDilatedMotifBlock(nn.Module):
+    """Padding-safe local DNA block with independent feature and gate paths."""
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        kernel_size: int = 9,
+        dilation: int = 1,
+        dropout: float = 0.0,
+        layer_scale_init: float = 1e-3,
+    ) -> None:
+        super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer")
+        if dilation <= 0:
+            raise ValueError("dilation must be positive")
+        padding = dilation * (kernel_size - 1) // 2
+        self.norm = nn.LayerNorm(dim)
+        self.feature_depthwise = nn.Conv1d(
+            dim, dim, kernel_size, padding=padding, dilation=dilation,
+            groups=dim, bias=False,
+        )
+        self.feature_pointwise = nn.Conv1d(dim, dim, 1)
+        self.gate_depthwise = nn.Conv1d(
+            dim, dim, kernel_size, padding=padding, dilation=dilation,
+            groups=dim, bias=False,
+        )
+        self.gate_pointwise = nn.Conv1d(dim, dim, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_scale = nn.Parameter(torch.full((dim,), float(layer_scale_init)))
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        mask = valid_mask.unsqueeze(-1).to(device=x.device, dtype=x.dtype)
+        local = (self.norm(x) * mask).transpose(1, 2)
+        feature = self.feature_pointwise(self.feature_depthwise(local))
+        gate = self.gate_pointwise(self.gate_depthwise(local))
+        update = (F.gelu(feature) * torch.sigmoid(gate)).transpose(1, 2)
+        x = x + self.dropout(update) * self.layer_scale
+        return x * mask
+
+
 class SequenceMixerBlock(nn.Module):
     def __init__(
         self,
@@ -69,6 +111,8 @@ class SequenceMixerEncoder(nn.Module):
         position_rank: int = 0,
         pooling: str = "mean",
         local_motif_kernel: int = 0,
+        local_motif_dilations: tuple[int, ...] = (),
+        local_motif_layer_scale: float = 1e-3,
     ) -> None:
         super().__init__()
         if pooling not in {"mean", "max", "meanmax"}:
@@ -77,6 +121,12 @@ class SequenceMixerEncoder(nn.Module):
             local_motif_kernel and local_motif_kernel % 2 == 0
         ):
             raise ValueError("local_motif_kernel must be zero or a positive odd integer")
+        if local_motif_kernel and local_motif_dilations:
+            raise ValueError(
+                "local_motif_kernel and local_motif_dilations select different local stems"
+            )
+        if any(dilation <= 0 for dilation in local_motif_dilations):
+            raise ValueError("local_motif_dilations must contain only positive integers")
         self.max_length = int(max_length)
         self.pad_token_id = int(pad_token_id)
         self.pooling = pooling
@@ -98,6 +148,17 @@ class SequenceMixerEncoder(nn.Module):
             )
             if self.local_motif_kernel
             else None
+        )
+        self.local_motif_dilations = tuple(int(value) for value in local_motif_dilations)
+        self.local_motif_blocks = nn.ModuleList(
+            GatedDilatedMotifBlock(
+                dim,
+                kernel_size=9,
+                dilation=dilation,
+                dropout=dropout,
+                layer_scale_init=local_motif_layer_scale,
+            )
+            for dilation in self.local_motif_dilations
         )
         self.position_rank = (
             int(position_rank) if 0 < position_rank < min(max_length, dim) else 0
@@ -165,7 +226,15 @@ class SequenceMixerEncoder(nn.Module):
             x = x + local * valid.unsqueeze(-1).to(local.dtype)
         x = self.embedding_dropout(x + self._positions(input_ids.shape[1]))
         x = x * valid.unsqueeze(-1).to(x.dtype)
-        for block in self.blocks:
+        local_cursor = 0
+        local_base, local_extra = divmod(len(self.local_motif_blocks), len(self.blocks))
+        for block_index, block in enumerate(self.blocks):
+            local_count = local_base + (1 if block_index < local_extra else 0)
+            for local_block in self.local_motif_blocks[
+                local_cursor : local_cursor + local_count
+            ]:
+                x = local_block(x, valid)
+            local_cursor += local_count
             x = block(x, valid)
         x = self.norm(x)
         return self.projection(self._pool(x, valid))

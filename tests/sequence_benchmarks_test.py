@@ -308,6 +308,41 @@ def test_local_motif_stem_rejects_invalid_kernel(kernel: int):
         )
 
 
+def test_gated_dilated_motif_blocks_preserve_padding_and_receive_gradients():
+    encoder = SequenceMixerEncoder(
+        8,
+        max_length=24,
+        pad_token_id=0,
+        dim=16,
+        depth=2,
+        num_heads=4,
+        mixer="rrlsso",
+        rank=8,
+        dropout=0.0,
+        position_rank=4,
+        local_motif_dilations=(1, 1, 4, 16, 64),
+    )
+    assert [block.feature_depthwise.dilation[0] for block in encoder.local_motif_blocks] == [
+        1, 1, 4, 16, 64
+    ]
+    short = torch.tensor([[2, 3, 4, 5, 2, 3]])
+    padded = torch.tensor([[2, 3, 4, 5, 2, 3, 0, 0]])
+    output = encoder(short)
+    torch.testing.assert_close(output, encoder(padded), rtol=2e-5, atol=2e-5)
+    output.square().mean().backward()
+    assert encoder.local_motif_blocks[0].feature_depthwise.weight.grad is not None
+    assert encoder.local_motif_blocks[-1].gate_pointwise.weight.grad is not None
+
+
+def test_local_motif_stems_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="different local stems"):
+        SequenceMixerEncoder(
+            8, max_length=12, pad_token_id=0, dim=16, depth=2,
+            num_heads=4, mixer="rrlsso", rank=8, local_motif_kernel=7,
+            local_motif_dilations=(1, 4),
+        )
+
+
 def test_reverse_complement_preserves_right_padding_and_is_an_involution():
     tokenizer = NucleotideTokenizer()
     encoder = SequenceMixerEncoder(
