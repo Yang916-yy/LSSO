@@ -368,10 +368,15 @@ def freeze_base(
             f"expected the validated base_motif7 architecture, got {architecture_name}"
         )
     candidate = ARCHITECTURE_CANDIDATES[architecture_name]
+    formal_size = asdict(candidate["size"])
+    # The mouse-enhancer task contains sequences up to 4,776 bases, so its
+    # learned absolute position table adds about 1.2M parameters. This raises
+    # only the safety guard; model width, depth, rank, and modules are unchanged.
+    formal_size["max_parameters"] = 3_000_000
     frozen = {
         "model": "RRLSSO-DNA-Base-Motif7",
         "architecture": architecture_name,
-        "size": asdict(candidate["size"]),
+        "size": formal_size,
         "local_motif_kernel": candidate["local_motif_kernel"],
         "recipe": {
             "pooling": "mean",
