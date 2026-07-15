@@ -489,6 +489,8 @@ def train_classifier(
         started = time.perf_counter()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        if hasattr(model, "set_augmentation_epoch"):
+            model.set_augmentation_epoch(epoch)
         model.train()
         train_loss, examples = 0.0, 0
         for batch_index, raw_batch in enumerate(train_loader):

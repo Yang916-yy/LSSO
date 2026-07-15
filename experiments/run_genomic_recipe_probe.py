@@ -27,14 +27,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tasks", nargs="+", default=TASKS)
-    parser.add_argument("--rc-augmentation", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--rc-augmentation", action="store_true")
+    mode.add_argument("--rc-mutation", action="store_true")
+    mode.add_argument("--posthoc-rc-eval", action="store_true")
+    parser.add_argument(
+        "--checkpoint-root",
+        default="runs/rrlsso_dna_program/recipe_hyenadna_flavor_rc/base_motif7",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    profile = "hyenadna-flavor-rc" if args.rc_augmentation else "hyenadna-flavor"
-    default_name = "recipe_hyenadna_flavor_rc" if args.rc_augmentation else "recipe_hyenadna_flavor"
+    if args.rc_mutation:
+        profile, default_name = (
+            "hyenadna-flavor-rc-mutation",
+            "recipe_hyenadna_flavor_rc_mutation",
+        )
+    elif args.rc_augmentation or args.posthoc_rc_eval:
+        profile = "hyenadna-flavor-rc"
+        default_name = (
+            "recipe_hyenadna_flavor_rc_posthoc"
+            if args.posthoc_rc_eval
+            else "recipe_hyenadna_flavor_rc"
+        )
+    else:
+        profile, default_name = "hyenadna-flavor", "recipe_hyenadna_flavor"
     output_root = Path(args.output_root or f"runs/rrlsso_dna_program/{default_name}/base_motif7")
     for task in args.tasks:
         output = output_root / f"{task}-s{args.seed}"
@@ -60,6 +79,14 @@ def main() -> None:
             "--seed", str(args.seed),
             "--validation-only",
         ]
+        if args.posthoc_rc_eval:
+            checkpoint = Path(args.checkpoint_root) / f"{task}-s{args.seed}" / "best.pt"
+            if not checkpoint.is_file():
+                raise FileNotFoundError(f"missing checkpoint: {checkpoint}")
+            command += [
+                "--evaluate-checkpoint", str(checkpoint),
+                "--posthoc-rc-eval",
+            ]
         print(json.dumps({"status": "starting", "command": command}), flush=True)
         subprocess.run(command, cwd=ROOT, check=True)
 

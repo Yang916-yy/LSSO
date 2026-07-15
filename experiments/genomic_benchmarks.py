@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -19,6 +21,7 @@ from experiments.sequence_benchmarks.common import (
     IndexDataset,
     TrainingConfig,
     collate_tokens,
+    evaluate,
     make_loader,
     seed_all,
     stratified_split_indices,
@@ -177,7 +180,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--training-profile",
-        choices=("standard", "hyenadna-flavor", "hyenadna-flavor-rc"),
+        choices=(
+            "standard",
+            "hyenadna-flavor",
+            "hyenadna-flavor-rc",
+            "hyenadna-flavor-rc-mutation",
+        ),
         default="standard",
     )
     parser.add_argument("--dataset", choices=GENOMIC_BENCHMARKS, default="human_enhancers_cohn")
@@ -206,6 +214,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooling", choices=("mean", "max", "meanmax"), default="mean")
     parser.add_argument("--reverse-complement-probability", type=float, default=0.0)
     parser.add_argument("--reverse-complement-eval", action="store_true")
+    parser.add_argument("--posthoc-rc-eval", action="store_true")
+    parser.add_argument("--mutation-probability", type=float, default=0.0)
+    parser.add_argument("--mutation-clean-epochs", type=int, default=0)
     parser.add_argument(
         "--validation-only",
         action="store_true",
@@ -236,11 +247,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-eval-batches", type=int, default=0)
     parser.add_argument("--max-parameters", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--evaluate-checkpoint", default="")
     return parser.parse_args()
 
 
 def apply_training_profile(args: argparse.Namespace) -> None:
-    if args.training_profile not in {"hyenadna-flavor", "hyenadna-flavor-rc"}:
+    if args.training_profile not in {
+        "hyenadna-flavor",
+        "hyenadna-flavor-rc",
+        "hyenadna-flavor-rc-mutation",
+    }:
         return
     # Transfer the architecture-agnostic portion of the official HyenaDNA
     # scratch recipe. Keep RRLSSO's milder weight decay because Hyena's
@@ -257,14 +273,21 @@ def apply_training_profile(args: argparse.Namespace) -> None:
     args.embedding_dropout = 0.1
     args.pooling = "mean"
     args.reverse_complement_probability = (
-        0.5 if args.training_profile == "hyenadna-flavor-rc" else 0.0
+        0.5 if args.training_profile in {
+            "hyenadna-flavor-rc", "hyenadna-flavor-rc-mutation"
+        } else 0.0
     )
     args.reverse_complement_eval = False
+    if args.training_profile == "hyenadna-flavor-rc-mutation":
+        args.mutation_probability = 0.002
+        args.mutation_clean_epochs = 20
 
 
 def main() -> None:
     args = parse_args()
     apply_training_profile(args)
+    if args.posthoc_rc_eval:
+        args.reverse_complement_eval = True
     seed_all(args.seed)
     train_rows, test_rows, sequence_key, label_key, provenance = load_splits(
         args.dataset, args.data_root, args.cache_dir, args.dataset_revision
@@ -327,6 +350,8 @@ def main() -> None:
         complement_ids=tokenizer.complement_ids,
         reverse_complement_probability=args.reverse_complement_probability,
         reverse_complement_eval=args.reverse_complement_eval,
+        mutation_probability=args.mutation_probability,
+        mutation_stop_epoch=max(0, args.epochs - args.mutation_clean_epochs),
     )
     output = args.output or f"runs/sequence/genomic-{args.dataset}-{args.mixer}-s{args.seed}"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -343,6 +368,27 @@ def main() -> None:
         test, batch_size=args.eval_batch_size, workers=args.workers, device=device,
         collate_fn=collate, train=False, seed=args.seed,
     )
+    if args.evaluate_checkpoint:
+        state = torch.load(args.evaluate_checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(state["model"])
+        model.to(device)
+        started = time.perf_counter()
+        metrics = evaluate(model, validation_loader, device, num_classes)
+        result = {
+            **metrics,
+            "parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "selected_epoch": int(state.get("epoch", -1)),
+            "evaluation_seconds": time.perf_counter() - started,
+            "checkpoint": str(Path(args.evaluate_checkpoint).resolve()),
+            "posthoc_rc_eval": args.posthoc_rc_eval,
+        }
+        output_path = Path(output)
+        output_path.mkdir(parents=True, exist_ok=True)
+        temporary = output_path / "validation_metrics.json.tmp"
+        temporary.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(output_path / "validation_metrics.json")
+        print(json.dumps({"validation": result}, sort_keys=True), flush=True)
+        return
     train_classifier(
         model,
         train_loader,
@@ -380,6 +426,8 @@ def main() -> None:
             "pooling": args.pooling,
             "reverse_complement_probability": args.reverse_complement_probability,
             "reverse_complement_eval": args.reverse_complement_eval,
+            "mutation_probability": args.mutation_probability,
+            "mutation_clean_epochs": args.mutation_clean_epochs,
             "validation_only": args.validation_only,
             "validation_fraction": args.validation_fraction,
             "batch_size": args.batch_size,

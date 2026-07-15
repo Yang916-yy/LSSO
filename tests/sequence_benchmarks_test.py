@@ -151,6 +151,7 @@ def test_hyenadna_flavor_profile_maps_only_generic_training_choices():
         warmup_ratio=0.05, min_lr_ratio=0.0, dropout=0.1,
         embedding_dropout=None, pooling="max",
         reverse_complement_probability=0.5, reverse_complement_eval=True,
+        mutation_probability=0.0, mutation_clean_epochs=0,
     )
     apply_training_profile(args)
     assert (args.epochs, args.lr, args.warmup_ratio) == (100, 6e-4, 0.01)
@@ -163,6 +164,11 @@ def test_hyenadna_flavor_profile_maps_only_generic_training_choices():
     apply_training_profile(args)
     assert args.reverse_complement_probability == 0.5
     assert args.reverse_complement_eval is False
+
+    args.training_profile = "hyenadna-flavor-rc-mutation"
+    apply_training_profile(args)
+    assert args.mutation_probability == 0.002
+    assert args.mutation_clean_epochs == 20
 
 
 def test_stratified_subset_is_exact_deterministic_and_order_unbiased():
@@ -317,6 +323,28 @@ def test_reverse_complement_preserves_right_padding_and_is_an_involution():
     restored, restored_mask = model.reverse_complement(reverse, reverse_mask)
     assert torch.equal(restored, ids)
     assert torch.equal(restored_mask, mask)
+
+
+def test_point_mutation_changes_only_canonical_bases_before_clean_stage():
+    tokenizer = NucleotideTokenizer()
+    encoder = SequenceMixerEncoder(
+        tokenizer.vocab_size, max_length=8, pad_token_id=0,
+        dim=16, depth=1, num_heads=4, mixer="rrlsso", rank=8, dropout=0.0,
+    )
+    model = ReverseComplementSequenceClassifier(
+        encoder,
+        2,
+        complement_ids=tokenizer.complement_ids,
+        mutation_probability=1.0,
+        mutation_stop_epoch=80,
+    )
+    inputs = torch.tensor([[2, 3, 4, 5, 6, 1, 0]])
+    mask = inputs.ne(0)
+    mutated = model.mutate(inputs, mask)
+    assert torch.all(mutated[:, :4] != inputs[:, :4])
+    assert torch.equal(mutated[:, 4:], inputs[:, 4:])
+    model.set_augmentation_epoch(80)
+    assert torch.equal(model.mutate(inputs, mask), inputs)
 
 
 @pytest.mark.parametrize("pooling", ["mean", "max", "meanmax"])

@@ -195,6 +195,17 @@ It changes only architecture-agnostic training choices on Non-TATA and OCR:
 dropout 0.1, and zero residual dropout. RRLSSO keeps weight decay 0.01 instead
 of copying Hyena-specific layer decay.
 
+Two final augmentation checks use the same launcher. Post-hoc RC averages the
+original and reverse-complement logits from an existing checkpoint without
+updating weights. The mutation probe changes each canonical base with
+probability 0.002 for epochs 0--79, then disables mutation for a 20-epoch clean
+fine-tuning tail:
+
+```bash
+python experiments/run_genomic_recipe_probe.py --posthoc-rc-eval --tasks TASK...
+python experiments/run_genomic_recipe_probe.py --rc-mutation --tasks TASK...
+```
+
 The first two stages pass `--validation-only`; those run directories contain
 `validation_metrics.json` and cannot contain `test_metrics.json`. The launcher
 runs one child at a time and resumes completed stages automatically:

@@ -315,6 +315,8 @@ class ReverseComplementSequenceClassifier(SequenceClassifier):
         complement_ids: torch.Tensor,
         reverse_complement_probability: float = 0.0,
         reverse_complement_eval: bool = False,
+        mutation_probability: float = 0.0,
+        mutation_stop_epoch: int = 0,
     ) -> None:
         super().__init__(encoder, num_classes)
         if not 0.0 <= reverse_complement_probability <= 1.0:
@@ -323,7 +325,31 @@ class ReverseComplementSequenceClassifier(SequenceClassifier):
             raise ValueError("complement_ids must be a one-dimensional lookup table")
         self.reverse_complement_probability = float(reverse_complement_probability)
         self.reverse_complement_eval = bool(reverse_complement_eval)
+        if not 0.0 <= mutation_probability <= 1.0:
+            raise ValueError("mutation_probability must be in [0, 1]")
+        self.mutation_probability = float(mutation_probability)
+        self.mutation_stop_epoch = int(mutation_stop_epoch)
+        self.augmentation_epoch = 0
         self.register_buffer("complement_ids", complement_ids.long(), persistent=True)
+
+    def set_augmentation_epoch(self, epoch: int) -> None:
+        self.augmentation_epoch = int(epoch)
+
+    def mutate(self, inputs: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        if (
+            self.mutation_probability <= 0.0
+            or self.augmentation_epoch >= self.mutation_stop_epoch
+        ):
+            return inputs
+        # NucleotideTokenizer assigns contiguous ids 2..5 to A/C/G/T. N,
+        # unknown, and padding are deliberately left untouched.
+        canonical = attention_mask & inputs.ge(2) & inputs.le(5)
+        selected = canonical & (
+            torch.rand(inputs.shape, device=inputs.device) < self.mutation_probability
+        )
+        offset = torch.randint(1, 4, inputs.shape, device=inputs.device)
+        replacements = 2 + (inputs.long() - 2 + offset) % 4
+        return torch.where(selected, replacements.to(inputs.dtype), inputs)
 
     def reverse_complement(
         self, inputs: torch.Tensor, attention_mask: torch.Tensor | None = None
@@ -346,6 +372,8 @@ class ReverseComplementSequenceClassifier(SequenceClassifier):
         self, inputs: torch.Tensor, attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         valid = inputs.ne(self.encoder.pad_token_id) if attention_mask is None else attention_mask.bool()
+        if self.training:
+            inputs = self.mutate(inputs, valid)
         reverse_inputs, reverse_mask = self.reverse_complement(inputs, valid)
         if self.training and self.reverse_complement_probability > 0.0:
             selected = torch.rand(inputs.shape[0], device=inputs.device) < self.reverse_complement_probability
