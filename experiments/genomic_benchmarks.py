@@ -177,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--training-profile",
-        choices=("standard", "hyenadna-flavor"),
+        choices=("standard", "hyenadna-flavor", "hyenadna-flavor-rc"),
         default="standard",
     )
     parser.add_argument("--dataset", choices=GENOMIC_BENCHMARKS, default="human_enhancers_cohn")
@@ -240,7 +240,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def apply_training_profile(args: argparse.Namespace) -> None:
-    if args.training_profile != "hyenadna-flavor":
+    if args.training_profile not in {"hyenadna-flavor", "hyenadna-flavor-rc"}:
         return
     # Transfer the architecture-agnostic portion of the official HyenaDNA
     # scratch recipe. Keep RRLSSO's milder weight decay because Hyena's
@@ -256,7 +256,9 @@ def apply_training_profile(args: argparse.Namespace) -> None:
     args.dropout = 0.0
     args.embedding_dropout = 0.1
     args.pooling = "mean"
-    args.reverse_complement_probability = 0.0
+    args.reverse_complement_probability = (
+        0.5 if args.training_profile == "hyenadna-flavor-rc" else 0.0
+    )
     args.reverse_complement_eval = False
 
 

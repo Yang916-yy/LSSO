@@ -159,6 +159,11 @@ def test_hyenadna_flavor_profile_maps_only_generic_training_choices():
     assert args.min_lr_ratio == 0.1
     assert args.reverse_complement_probability == 0.0
 
+    args.training_profile = "hyenadna-flavor-rc"
+    apply_training_profile(args)
+    assert args.reverse_complement_probability == 0.5
+    assert args.reverse_complement_eval is False
+
 
 def test_stratified_subset_is_exact_deterministic_and_order_unbiased():
     labels = [0] * 10 + [1] * 6 + [2] * 4

@@ -21,18 +21,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output-root",
-        default="runs/rrlsso_dna_program/recipe_hyenadna_flavor/base_motif7",
+        default="",
     )
     parser.add_argument("--cache-dir", default="data/genomic_benchmarks")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tasks", nargs="+", default=TASKS)
+    parser.add_argument("--rc-augmentation", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_root = Path(args.output_root)
-    for task in TASKS:
+    profile = "hyenadna-flavor-rc" if args.rc_augmentation else "hyenadna-flavor"
+    default_name = "recipe_hyenadna_flavor_rc" if args.rc_augmentation else "recipe_hyenadna_flavor"
+    output_root = Path(args.output_root or f"runs/rrlsso_dna_program/{default_name}/base_motif7")
+    for task in args.tasks:
         output = output_root / f"{task}-s{args.seed}"
         result = output / "validation_metrics.json"
         if result.is_file():
@@ -44,7 +48,7 @@ def main() -> None:
             "--dataset", task,
             "--cache-dir", args.cache_dir,
             "--output", str(output),
-            "--training-profile", "hyenadna-flavor",
+            "--training-profile", profile,
             "--mixer", "rrlsso",
             "--dim", "256",
             "--depth", "2",
