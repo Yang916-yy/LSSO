@@ -175,6 +175,11 @@ def load_splits(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--training-profile",
+        choices=("standard", "hyenadna-flavor"),
+        default="standard",
+    )
     parser.add_argument("--dataset", choices=GENOMIC_BENCHMARKS, default="human_enhancers_cohn")
     parser.add_argument("--data-root", default="")
     parser.add_argument("--cache-dir", default="data/genomic_benchmarks")
@@ -208,12 +213,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--embedding-dropout",
+        type=float,
+        default=None,
+        help="embedding-only dropout; defaults to --dropout when omitted",
+    )
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--workers", type=int, default=4)
@@ -227,8 +239,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def apply_training_profile(args: argparse.Namespace) -> None:
+    if args.training_profile != "hyenadna-flavor":
+        return
+    # Transfer the architecture-agnostic portion of the official HyenaDNA
+    # scratch recipe. Keep RRLSSO's milder weight decay because Hyena's
+    # layer-specific decay policy does not map cleanly to solve parameters.
+    args.epochs = 100
+    args.patience = 100
+    args.batch_size = 128
+    args.eval_batch_size = 256
+    args.lr = 6e-4
+    args.weight_decay = 0.01
+    args.warmup_ratio = 0.01
+    args.min_lr_ratio = 0.1
+    args.dropout = 0.0
+    args.embedding_dropout = 0.1
+    args.pooling = "mean"
+    args.reverse_complement_probability = 0.0
+    args.reverse_complement_eval = False
+
+
 def main() -> None:
     args = parse_args()
+    apply_training_profile(args)
     seed_all(args.seed)
     train_rows, test_rows, sequence_key, label_key, provenance = load_splits(
         args.dataset, args.data_root, args.cache_dir, args.dataset_revision
@@ -280,6 +314,7 @@ def main() -> None:
         rank=args.rank,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
+        embedding_dropout=args.embedding_dropout,
         position_rank=args.position_rank,
         pooling=args.pooling,
         local_motif_kernel=args.local_motif_kernel,
@@ -318,6 +353,7 @@ def main() -> None:
             lr=args.lr,
             weight_decay=args.weight_decay,
             warmup_ratio=args.warmup_ratio,
+            min_lr_ratio=args.min_lr_ratio,
             patience=args.patience,
             seed=args.seed,
             resume=args.resume,
@@ -327,6 +363,7 @@ def main() -> None:
         ),
         metadata={
             "suite": "genomic",
+            "training_profile": args.training_profile,
             "dataset": args.dataset,
             "mixer": args.mixer,
             "rank": args.rank,
@@ -336,6 +373,7 @@ def main() -> None:
             "max_length": max_length,
             "requested_max_length": args.max_length,
             "position_rank": args.position_rank,
+            "embedding_dropout": args.embedding_dropout,
             "local_motif_kernel": args.local_motif_kernel,
             "pooling": args.pooling,
             "reverse_complement_probability": args.reverse_complement_probability,

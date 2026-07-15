@@ -14,8 +14,13 @@ from examples.models import (
     SequencePairClassifier,
     SequenceValueEncoder,
 )
-from experiments.genomic_benchmarks import NucleotideTokenizer, StringSequenceDataset
+from experiments.genomic_benchmarks import (
+    NucleotideTokenizer,
+    StringSequenceDataset,
+    apply_training_profile,
+)
 from experiments.sequence_benchmarks.common import (
+    _scheduler_lambda,
     _classification_metrics,
     LengthBucketBatchSampler,
     TrainingConfig,
@@ -130,6 +135,29 @@ def test_recipe_selection_prefers_simpler_candidate_inside_margin():
     assert choose_with_margin(
         scores, ("none", "rc_train", "rc_train_eval"), margin=0.0025
     ) == "rc_train"
+
+
+def test_cosine_scheduler_respects_nonzero_floor():
+    assert _scheduler_lambda(100, 0, 100, 0.1) == pytest.approx(0.1)
+    assert _scheduler_lambda(0, 0, 100, 0.1) == pytest.approx(1.0)
+
+
+def test_hyenadna_flavor_profile_maps_only_generic_training_choices():
+    from argparse import Namespace
+
+    args = Namespace(
+        training_profile="hyenadna-flavor", epochs=60, patience=12,
+        batch_size=64, eval_batch_size=64, lr=3e-4, weight_decay=0.01,
+        warmup_ratio=0.05, min_lr_ratio=0.0, dropout=0.1,
+        embedding_dropout=None, pooling="max",
+        reverse_complement_probability=0.5, reverse_complement_eval=True,
+    )
+    apply_training_profile(args)
+    assert (args.epochs, args.lr, args.warmup_ratio) == (100, 6e-4, 0.01)
+    assert (args.dropout, args.embedding_dropout) == (0.0, 0.1)
+    assert args.weight_decay == 0.01
+    assert args.min_lr_ratio == 0.1
+    assert args.reverse_complement_probability == 0.0
 
 
 def test_stratified_subset_is_exact_deterministic_and_order_unbiased():

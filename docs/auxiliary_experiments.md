@@ -183,6 +183,18 @@ The local motif stem is an architecture candidate, not an RRLSSO replacement.
 If retained, controlled mixer comparisons must give the identical stem to MHA,
 LSSO, and RRLSSO.
 
+After selecting Base+motif-7, run the low-budget HyenaDNA-flavored recipe
+transfer with:
+
+```bash
+python experiments/run_genomic_recipe_probe.py
+```
+
+It changes only architecture-agnostic training choices on Non-TATA and OCR:
+100 epochs, batch 128, LR 6e-4, 1% warmup, a 0.1 cosine floor, embedding
+dropout 0.1, and zero residual dropout. RRLSSO keeps weight decay 0.01 instead
+of copying Hyena-specific layer decay.
+
 The first two stages pass `--validation-only`; those run directories contain
 `validation_metrics.json` and cannot contain `test_metrics.json`. The launcher
 runs one child at a time and resumes completed stages automatically:

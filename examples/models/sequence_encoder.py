@@ -64,6 +64,7 @@ class SequenceMixerEncoder(nn.Module):
         rank: int = 32,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
+        embedding_dropout: float | None = None,
         projection_dim: int | None = None,
         position_rank: int = 0,
         pooling: str = "mean",
@@ -106,7 +107,9 @@ class SequenceMixerEncoder(nn.Module):
         self.position_projection = (
             nn.Linear(position_dim, dim, bias=False) if self.position_rank else None
         )
-        self.embedding_dropout = nn.Dropout(dropout)
+        self.embedding_dropout = nn.Dropout(
+            dropout if embedding_dropout is None else embedding_dropout
+        )
         self.blocks = nn.ModuleList(
             SequenceMixerBlock(
                 dim,

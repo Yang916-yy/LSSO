@@ -24,6 +24,7 @@ class TrainingConfig:
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.05
+    min_lr_ratio: float = 0.0
     grad_clip: float = 1.0
     label_smoothing: float = 0.0
     patience: int = 10
@@ -390,11 +391,14 @@ def evaluate(
     return metrics
 
 
-def _scheduler_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
+def _scheduler_lambda(
+    step: int, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.0
+) -> float:
     if warmup_steps and step < warmup_steps:
         return max(1e-8, (step + 1) / warmup_steps)
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
 def train_classifier(
@@ -460,9 +464,13 @@ def train_classifier(
         batches_per_epoch = min(batches_per_epoch, config.max_train_batches)
     total_steps = max(1, config.epochs * batches_per_epoch)
     warmup_steps = round(total_steps * config.warmup_ratio)
+    if not 0.0 <= config.min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must be between zero and one")
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda step: _scheduler_lambda(step, warmup_steps, total_steps),
+        lambda step: _scheduler_lambda(
+            step, warmup_steps, total_steps, config.min_lr_ratio
+        ),
     )
     start_epoch, best, stale_epochs = 0, float("-inf"), 0
     last_path = output / "last.pt"
