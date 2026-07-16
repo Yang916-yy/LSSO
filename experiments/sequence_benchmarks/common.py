@@ -196,6 +196,7 @@ class FixedOrderSampler(Sampler[int]):
 
 def collate_tokens(rows: Sequence[tuple[torch.Tensor, int]], pad_token_id: int = 0):
     sequences, labels = zip(*rows)
+    lengths = [int(sequence.shape[0]) for sequence in sequences]
     inputs = pad_sequence(
         [sequence.long() for sequence in sequences],
         batch_first=True,
@@ -204,6 +205,7 @@ def collate_tokens(rows: Sequence[tuple[torch.Tensor, int]], pad_token_id: int =
     return {
         "inputs": inputs,
         "mask": inputs.ne(pad_token_id),
+        "padding_ratio": 1.0 - sum(lengths) / max(inputs.numel(), 1),
         "labels": torch.tensor(labels, dtype=torch.long),
     }
 
@@ -212,6 +214,8 @@ def collate_token_pairs(
     rows: Sequence[tuple[torch.Tensor, torch.Tensor, int]], pad_token_id: int = 0
 ):
     first, second, labels = zip(*rows)
+    first_lengths = [int(tokens.shape[0]) for tokens in first]
+    second_lengths = [int(tokens.shape[0]) for tokens in second]
     first_ids = pad_sequence(
         [tokens.long() for tokens in first], batch_first=True, padding_value=pad_token_id
     )
@@ -221,8 +225,12 @@ def collate_token_pairs(
     return {
         "first": first_ids,
         "first_mask": first_ids.ne(pad_token_id),
+        "first_padding_ratio": 1.0
+        - sum(first_lengths) / max(first_ids.numel(), 1),
         "second": second_ids,
         "second_mask": second_ids.ne(pad_token_id),
+        "second_padding_ratio": 1.0
+        - sum(second_lengths) / max(second_ids.numel(), 1),
         "labels": torch.tensor(labels, dtype=torch.long),
     }
 
@@ -235,6 +243,8 @@ def collate_values(rows: Sequence[tuple[torch.Tensor, int]]):
     return {
         "inputs": inputs,
         "mask": positions < lengths.unsqueeze(1),
+        "padding_ratio": 1.0
+        - int(lengths.sum().item()) / max(inputs.shape[0] * inputs.shape[1], 1),
         "labels": torch.tensor(labels, dtype=torch.long),
     }
 
@@ -318,19 +328,28 @@ def _restore_loader_state(loader: DataLoader, state: dict | None) -> None:
         loader.generator.set_state(state["generator"])
 
 
-def _move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+def _move_batch(batch: dict, device: torch.device) -> dict:
     return {
         key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
         for key, value in batch.items()
     }
 
 
-def _forward(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+def _forward(model: torch.nn.Module, batch: dict) -> torch.Tensor:
     if "first" in batch:
         return model(
-            batch["first"], batch["first_mask"], batch["second"], batch["second_mask"]
+            batch["first"],
+            batch["first_mask"],
+            batch["second"],
+            batch["second_mask"],
+            first_padding_ratio_hint=batch.get("first_padding_ratio"),
+            second_padding_ratio_hint=batch.get("second_padding_ratio"),
         )
-    return model(batch["inputs"], batch["mask"])
+    return model(
+        batch["inputs"],
+        batch["mask"],
+        padding_ratio_hint=batch.get("padding_ratio"),
+    )
 
 
 def _classification_metrics(

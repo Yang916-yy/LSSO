@@ -140,6 +140,47 @@ def load_splits(
             FolderRows(train_dir, mapping), FolderRows(test_dir, mapping),
             "sequence", "label", provenance,
         )
+    # ``datasets.load_dataset`` contacts the Hub even when the Arrow payload is
+    # already complete. Formal sweeps should remain restartable during a Hub
+    # outage, so prefer a matching on-disk revision before making any request.
+    if cache_dir:
+        dataset_cache = (
+            Path(cache_dir)
+            / f"katarinagresova___genomic_benchmarks_{dataset_name}"
+            / "default"
+            / "0.0.0"
+        )
+        candidates = []
+        if revision:
+            candidates.append(dataset_cache / revision)
+        elif dataset_cache.is_dir():
+            candidates.extend(
+                sorted(
+                    (path for path in dataset_cache.iterdir() if path.is_dir()),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )
+            )
+        for candidate in candidates:
+            train_files = tuple(candidate.glob("*-train.arrow"))
+            test_files = tuple(candidate.glob("*-test.arrow"))
+            if len(train_files) != 1 or len(test_files) != 1:
+                continue
+            from datasets import Dataset
+
+            train_rows = Dataset.from_file(str(train_files[0]))
+            test_rows = Dataset.from_file(str(test_files[0]))
+            sequence_key = (
+                "seq" if "seq" in train_rows.column_names else "sequence"
+            )
+            provenance = {
+                "source": "huggingface-cache",
+                "repository": f"katarinagresova/Genomic_Benchmarks_{dataset_name}",
+                "revision": candidate.name,
+                "train_fingerprint": train_rows._fingerprint,
+                "test_fingerprint": test_rows._fingerprint,
+            }
+            return train_rows, test_rows, sequence_key, "label", provenance
     try:
         from datasets import load_dataset
         from huggingface_hub import HfApi

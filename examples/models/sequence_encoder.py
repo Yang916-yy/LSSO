@@ -80,8 +80,18 @@ class SequenceMixerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        x = x + self.mixer(self.norm1(x), valid_mask=valid_mask)
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        padding_ratio_hint: float | None = None,
+    ) -> torch.Tensor:
+        x = x + self.mixer(
+            self.norm1(x),
+            valid_mask=valid_mask,
+            padding_ratio_hint=padding_ratio_hint,
+        )
         x = x + self.mlp(self.norm2(x))
         return x * valid_mask.unsqueeze(-1).to(x.dtype)
 
@@ -210,7 +220,11 @@ class SequenceMixerEncoder(nn.Module):
         return self.pool_projection(torch.cat((mean, maximum), dim=-1))
 
     def forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        padding_ratio_hint: float | None = None,
     ) -> torch.Tensor:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, length]")
@@ -235,7 +249,7 @@ class SequenceMixerEncoder(nn.Module):
             ]:
                 x = local_block(x, valid)
             local_cursor += local_count
-            x = block(x, valid)
+            x = block(x, valid, padding_ratio_hint=padding_ratio_hint)
         x = self.norm(x)
         return self.projection(self._pool(x, valid))
 
@@ -330,7 +344,11 @@ class SequenceValueEncoder(nn.Module):
         return self.pool_projection(torch.cat((mean, maximum), dim=-1))
 
     def forward(
-        self, values: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        values: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        padding_ratio_hint: float | None = None,
     ) -> torch.Tensor:
         if values.ndim != 3:
             raise ValueError("values must have shape [batch, length, channels]")
@@ -348,7 +366,7 @@ class SequenceValueEncoder(nn.Module):
         x = self.embedding_dropout(x + self._positions(values.shape[1]))
         x = x * valid.unsqueeze(-1).to(x.dtype)
         for block in self.blocks:
-            x = block(x, valid)
+            x = block(x, valid, padding_ratio_hint=padding_ratio_hint)
         x = self.norm(x)
         return self.projection(self._pool(x, valid))
 
@@ -363,9 +381,19 @@ class SequenceClassifier(nn.Module):
         self.head = nn.Linear(output_dim, num_classes)
 
     def forward(
-        self, inputs: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        inputs: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        padding_ratio_hint: float | None = None,
     ) -> torch.Tensor:
-        return self.head(self.encoder(inputs, attention_mask))
+        return self.head(
+            self.encoder(
+                inputs,
+                attention_mask,
+                padding_ratio_hint=padding_ratio_hint,
+            )
+        )
 
 
 class ReverseComplementSequenceClassifier(SequenceClassifier):
@@ -434,11 +462,26 @@ class ReverseComplementSequenceClassifier(SequenceClassifier):
         complemented = torch.where(valid, complemented, inputs.long())
         return complemented.to(inputs.dtype), valid
 
-    def _classify(self, inputs: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        return self.head(self.encoder(inputs, attention_mask))
+    def _classify(
+        self,
+        inputs: torch.Tensor,
+        attention_mask: torch.Tensor,
+        padding_ratio_hint: float | None = None,
+    ) -> torch.Tensor:
+        return self.head(
+            self.encoder(
+                inputs,
+                attention_mask,
+                padding_ratio_hint=padding_ratio_hint,
+            )
+        )
 
     def forward(
-        self, inputs: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        inputs: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        padding_ratio_hint: float | None = None,
     ) -> torch.Tensor:
         valid = inputs.ne(self.encoder.pad_token_id) if attention_mask is None else attention_mask.bool()
         if self.training:
@@ -447,10 +490,12 @@ class ReverseComplementSequenceClassifier(SequenceClassifier):
         if self.training and self.reverse_complement_probability > 0.0:
             selected = torch.rand(inputs.shape[0], device=inputs.device) < self.reverse_complement_probability
             inputs = torch.where(selected.unsqueeze(1), reverse_inputs, inputs)
-            return self._classify(inputs, valid)
-        logits = self._classify(inputs, valid)
+            return self._classify(inputs, valid, padding_ratio_hint)
+        logits = self._classify(inputs, valid, padding_ratio_hint)
         if not self.training and self.reverse_complement_eval:
-            reverse_logits = self._classify(reverse_inputs, reverse_mask)
+            reverse_logits = self._classify(
+                reverse_inputs, reverse_mask, padding_ratio_hint
+            )
             logits = 0.5 * (logits + reverse_logits)
         return logits
 
@@ -478,9 +523,20 @@ class SequencePairClassifier(nn.Module):
         first_mask: torch.Tensor,
         second: torch.Tensor,
         second_mask: torch.Tensor,
+        *,
+        first_padding_ratio_hint: float | None = None,
+        second_padding_ratio_hint: float | None = None,
     ) -> torch.Tensor:
-        first_embedding = self.encoder(first, first_mask)
-        second_embedding = self.encoder(second, second_mask)
+        first_embedding = self.encoder(
+            first,
+            first_mask,
+            padding_ratio_hint=first_padding_ratio_hint,
+        )
+        second_embedding = self.encoder(
+            second,
+            second_mask,
+            padding_ratio_hint=second_padding_ratio_hint,
+        )
         features = torch.cat(
             [
                 first_embedding,

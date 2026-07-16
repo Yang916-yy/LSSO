@@ -109,11 +109,15 @@ def test_pair_classifier_and_collates():
     assert logits.shape == (2, 2)
     assert batch["first_mask"].sum(dim=1).tolist() == [2, 1]
     assert batch["second_mask"].sum(dim=1).tolist() == [1, 3]
+    assert batch["first_padding_ratio"] == pytest.approx(0.25)
+    assert batch["second_padding_ratio"] == pytest.approx(1.0 / 3.0)
 
     token_batch = collate_tokens([(torch.tensor([2, 3]), 0), (torch.tensor([4]), 1)])
     assert token_batch["inputs"].tolist() == [[2, 3], [4, 0]]
+    assert token_batch["padding_ratio"] == pytest.approx(0.25)
     value_batch = collate_values([(torch.ones(2, 3), 0), (torch.ones(4, 3), 1)])
     assert value_batch["mask"].sum(dim=1).tolist() == [2, 4]
+    assert value_batch["padding_ratio"] == pytest.approx(0.25)
 
 
 def test_stratified_split_is_disjoint_and_keeps_each_class_in_train():
