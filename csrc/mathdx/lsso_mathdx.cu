@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <tuple>
 
 #include <ATen/ATen.h>
@@ -48,6 +49,7 @@ __device__ __forceinline__ block_barrier::arrival_token issue_tma_tile(
     int row,
     int batch,
     block_barrier& barrier) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (threadIdx.x == 0) {
         cuda_exp::cp_async_bulk_tensor_3d_global_to_shared(
             destination, tensor_map, column, row, batch, barrier);
@@ -55,6 +57,12 @@ __device__ __forceinline__ block_barrier::arrival_token issue_tma_tile(
             barrier, 1, TileRows * TileColumns * 2);
     }
     return barrier.arrive();
+#else
+    // Runtime architecture dispatch never calls a TMA specialization on
+    // pre-Hopper devices. This compile-time stub is still required because a
+    // release translation unit emits descriptors for several SM families.
+    return barrier.arrive();
+#endif
 }
 
 template <int KTile, int Rank, int RhsTile>
@@ -67,6 +75,7 @@ __device__ __forceinline__ block_barrier::arrival_token issue_tma_cross_tiles(
     int rhs_start,
     int batch,
     block_barrier& barrier) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (threadIdx.x == 0) {
         cuda_exp::cp_async_bulk_tensor_3d_global_to_shared(
             u_destination, u_map, 0, sequence_start, batch, barrier);
@@ -76,6 +85,9 @@ __device__ __forceinline__ block_barrier::arrival_token issue_tma_cross_tiles(
             barrier, 1, KTile * (Rank + RhsTile) * 2);
     }
     return barrier.arrive();
+#else
+    return barrier.arrive();
+#endif
 }
 
 template <typename scalar_t, bool Inverse>
@@ -285,14 +297,17 @@ struct GemmTraits {
         cublasdx::SM<Arch>());
 };
 
-template <typename scalar_t, int Rank, int RhsTile, int KTile, int Arch>
+template <typename scalar_t, int Rank, int RhsTile, int KTile, int Arch,
+          bool FuseReadout>
 __global__ void masked_stats_solve_spd_kernel(
     const scalar_t* __restrict__ u,
     const scalar_t* __restrict__ c,
     const bool* __restrict__ valid_mask,
     const float* __restrict__ length_scale,
     const float* __restrict__ alpha,
+    const float* __restrict__ inv_mu,
     float* __restrict__ solution,
+    scalar_t* __restrict__ output,
     int* __restrict__ info,
     int64_t batches,
     int64_t heads,
@@ -300,6 +315,7 @@ __global__ void masked_stats_solve_spd_kernel(
     int64_t rhs_width) {
     using Gram = typename GemmTraits<Rank, Rank, KTile, Arch>::Type;
     using Cross = typename GemmTraits<Rank, RhsTile, KTile, Arch>::Type;
+    using Readout = typename GemmTraits<KTile, RhsTile, Rank, Arch>::Type;
     using Solver = SolverTraits<Rank, RhsTile, Arch>;
     using Potrf = typename Solver::Potrf;
     using Potrs = typename Solver::Potrs;
@@ -307,6 +323,11 @@ __global__ void masked_stats_solve_spd_kernel(
     CUBLASDX_SKIP_IF_NOT_APPLICABLE_SM(Gram);
     CUSOLVERDX_SKIP_IF_NOT_APPLICABLE_SM(Potrf);
 
+    // Each CTA owns one compact system. The token dimension is intentionally
+    // reduced in KTile chunks below, so long sequences do not require an
+    // intermediate [B, H, chunks, r, r] statistics tensor or a second
+    // reduction kernel. A grid over all B*H systems naturally supplies the
+    // large-batch schedule and keeps the Cholesky state CTA-local.
     const int64_t batch = static_cast<int64_t>(blockIdx.x);
     if (batch >= batches) return;
 
@@ -328,35 +349,39 @@ __global__ void masked_stats_solve_spd_kernel(
     auto cross_b = cublasdx::make_tensor(c_tile, Cross::get_layout_smem_b());
     auto gram_output_tensor = cublasdx::make_tensor(gemm_output, Gram::get_layout_gmem_c());
     auto cross_output_tensor = cublasdx::make_tensor(gemm_output, Cross::get_layout_gmem_c());
+    auto readout_a = cublasdx::make_tensor(u_tile, Readout::get_layout_smem_a());
+    auto readout_b = cublasdx::make_tensor(c_tile, Readout::get_layout_smem_b());
+    auto readout_output_tensor = cublasdx::make_tensor(
+        gemm_output, Readout::get_layout_gmem_c());
 
     const int64_t sample = batch / heads;
     const scalar_t* u_batch = u + batch * sequence * Rank;
     const scalar_t* c_batch = c + batch * sequence * rhs_width;
     const bool* mask_batch = valid_mask + sample * sequence;
     const float scale = length_scale[sample];
-    float* solution_batch = solution + batch * Rank * rhs_width;
-    __shared__ int tile_has_valid;
+    float* solution_batch = FuseReadout ? nullptr : solution + batch * Rank * rhs_width;
+    scalar_t* output_batch = FuseReadout ? output + batch * sequence * rhs_width : nullptr;
+    static_assert(KTile == 32, "masked tile ballot assumes one warp per token tile");
+    __shared__ unsigned int tile_valid_bits;
 
     auto gram_accumulator = Gram().suggest_accumulator();
     gram_accumulator.clear();
     for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
-        if (threadIdx.x == 0) {
-            tile_has_valid = 0;
-            const int64_t tile_end = min(sequence_start + KTile, sequence);
-            for (int64_t token = sequence_start; token < tile_end; ++token) {
-                if (mask_batch[token]) {
-                    tile_has_valid = 1;
-                    break;
-                }
-            }
+        if (threadIdx.x < KTile) {
+            const int64_t token = sequence_start + threadIdx.x;
+            const bool valid = token < sequence && mask_batch[token];
+            const unsigned int bits = __ballot_sync(0xffffffffu, valid);
+            if (threadIdx.x == 0) tile_valid_bits = bits;
         }
         __syncthreads();
-        if (!tile_has_valid) continue;
+        const unsigned int valid_bits = tile_valid_bits;
+        if (valid_bits == 0) continue;
+        const bool full_tile = valid_bits == 0xffffffffu;
         for (int linear = threadIdx.x; linear < Rank * KTile; linear += blockDim.x) {
             const int row = linear / KTile;
             const int k = linear - row * KTile;
             const int64_t token = sequence_start + k;
-            const bool valid = token < sequence && mask_batch[token];
+            const bool valid = full_tile || ((valid_bits >> k) & 1u);
             gram_a(row, k) = valid
                 ? static_cast<float>(u_batch[token * Rank + row]) * scale
                 : 0.0f;
@@ -382,23 +407,21 @@ __global__ void masked_stats_solve_spd_kernel(
         auto cross_accumulator = Cross().suggest_accumulator();
         cross_accumulator.clear();
         for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
-            if (threadIdx.x == 0) {
-                tile_has_valid = 0;
-                const int64_t tile_end = min(sequence_start + KTile, sequence);
-                for (int64_t token = sequence_start; token < tile_end; ++token) {
-                    if (mask_batch[token]) {
-                        tile_has_valid = 1;
-                        break;
-                    }
-                }
+            if (threadIdx.x < KTile) {
+                const int64_t token = sequence_start + threadIdx.x;
+                const bool valid = token < sequence && mask_batch[token];
+                const unsigned int bits = __ballot_sync(0xffffffffu, valid);
+                if (threadIdx.x == 0) tile_valid_bits = bits;
             }
             __syncthreads();
-            if (!tile_has_valid) continue;
+            const unsigned int valid_bits = tile_valid_bits;
+            if (valid_bits == 0) continue;
+            const bool full_tile = valid_bits == 0xffffffffu;
             for (int linear = threadIdx.x; linear < Rank * KTile; linear += blockDim.x) {
                 const int row = linear / KTile;
                 const int k = linear - row * KTile;
                 const int64_t token = sequence_start + k;
-                const bool valid = token < sequence && mask_batch[token];
+                const bool valid = full_tile || ((valid_bits >> k) & 1u);
                 cross_a(row, k) = valid
                     ? static_cast<float>(u_batch[token * Rank + row]) * scale
                     : 0.0f;
@@ -408,7 +431,7 @@ __global__ void masked_stats_solve_spd_kernel(
                 const int col = linear - k * RhsTile;
                 const int64_t token = sequence_start + k;
                 const int64_t global_col = rhs_start + col;
-                const bool valid = token < sequence && mask_batch[token];
+                const bool valid = full_tile || ((valid_bits >> k) & 1u);
                 cross_b(k, col) = valid && global_col < rhs_width
                     ? static_cast<float>(c_batch[token * rhs_width + global_col])
                     : 0.0f;
@@ -427,15 +450,61 @@ __global__ void masked_stats_solve_spd_kernel(
         __syncthreads();
         Potrs().execute(a, lda, b, ldb);
         __syncthreads();
-        for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
-            const int row = linear / RhsTile;
-            const int col = linear - row * RhsTile;
-            const int64_t global_col = rhs_start + col;
-            if (global_col < rhs_width) {
-                solution_batch[row * rhs_width + global_col] = b[row * ldb + col];
+        if constexpr (!FuseReadout) {
+            for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
+                const int row = linear / RhsTile;
+                const int col = linear - row * RhsTile;
+                const int64_t global_col = rhs_start + col;
+                if (global_col < rhs_width) {
+                    solution_batch[row * rhs_width + global_col] = b[row * ldb + col];
+                }
+            }
+            __syncthreads();
+        } else {
+            for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
+                const int row = linear / RhsTile;
+                const int col = linear - row * RhsTile;
+                readout_b(row, col) = b[row * ldb + col];
+            }
+            __syncthreads();
+            for (int64_t token_start = 0; token_start < sequence; token_start += KTile) {
+                for (int linear = threadIdx.x; linear < KTile * Rank; linear += blockDim.x) {
+                    const int row = linear / Rank;
+                    const int col = linear - row * Rank;
+                    const int64_t token = token_start + row;
+                    const bool valid = token < sequence && mask_batch[token];
+                    // Mask is checked before the global load: padding values
+                    // cannot enter either statistics or the readout.
+                    readout_a(row, col) = valid
+                        ? static_cast<float>(u_batch[token * Rank + col]) * scale
+                        : 0.0f;
+                }
+                __syncthreads();
+                auto readout_accumulator = Readout().suggest_accumulator();
+                readout_accumulator.clear();
+                Readout().execute(readout_a, readout_b, readout_accumulator);
+                readout_accumulator.partition_and_store(readout_output_tensor);
+                __syncthreads();
+                for (int linear = threadIdx.x; linear < KTile * RhsTile; linear += blockDim.x) {
+                    const int row = linear / RhsTile;
+                    const int col = linear - row * RhsTile;
+                    const int64_t token = token_start + row;
+                    const int64_t global_col = rhs_start + col;
+                    if (token < sequence && global_col < rhs_width) {
+                        if (mask_batch[token]) {
+                            const float local = static_cast<float>(
+                                c_batch[token * rhs_width + global_col]);
+                            output_batch[token * rhs_width + global_col] = static_cast<scalar_t>(
+                                (local - alpha_batch * gemm_output[linear]) *
+                                inv_mu[batch]);
+                        } else {
+                            output_batch[token * rhs_width + global_col] = scalar_t(0);
+                        }
+                    }
+                }
+                __syncthreads();
             }
         }
-        __syncthreads();
     }
 }
 
@@ -475,9 +544,11 @@ __global__ void stats_solve_spd_kernel(
         cublasdx::cosize(Gram::get_layout_smem_a());
     constexpr int c_tile_elements =
         cublasdx::cosize(Cross::get_layout_smem_b());
-    constexpr bool use_tma = UseTma && Arch >= 1000 && sizeof(scalar_t) == 2;
+    // Hopper (SM90) introduced TMA. Ampere and Ada instead use the cp.async
+    // pipeline below, which is hardware accelerated from SM80 onward.
+    constexpr bool use_tma = UseTma && Arch >= 900 && sizeof(scalar_t) == 2;
     constexpr bool use_async_staging =
-        !use_tma && Arch >= 1000 && sizeof(scalar_t) == 2;
+        !use_tma && Arch >= 800 && sizeof(scalar_t) == 2;
     constexpr int output_elements =
         (Rank > KTile ? Rank : KTile) * RhsTile;
 
@@ -805,63 +876,186 @@ __global__ void stats_solve_spd_kernel(
     }
 }
 
-template <typename scalar_t, int Rank, int Arch>
+template <typename scalar_t, int Rank, int Arch, bool FuseReadout>
 void launch_masked_stats_solve_typed(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
     const at::Tensor& length_scale,
     const at::Tensor& alpha,
+    const at::Tensor& inv_mu,
     at::Tensor& solution,
+    at::Tensor& output,
     at::Tensor& info,
     cudaStream_t stream) {
     constexpr int rhs_tile = 32;
     constexpr int k_tile = 32;
     using Gram = typename GemmTraits<Rank, Rank, k_tile, Arch>::Type;
     using Cross = typename GemmTraits<Rank, rhs_tile, k_tile, Arch>::Type;
+    using Readout = typename GemmTraits<k_tile, rhs_tile, Rank, Arch>::Type;
     using Solver = SolverTraits<Rank, rhs_tile, Arch>;
     using Potrf = typename Solver::Potrf;
     using Potrs = typename Solver::Potrs;
     constexpr size_t smem_bytes = sizeof(float) * (
         cublasdx::cosize(Gram::get_layout_smem_a()) +
         cublasdx::cosize(Cross::get_layout_smem_b()) +
-        Rank * Potrf::lda + Rank * Potrs::ldb + Rank * rhs_tile);
+        Rank * Potrf::lda + Rank * Potrs::ldb +
+        (Rank > k_tile ? Rank : k_tile) * rhs_tile);
+    static_assert(cublasdx::cosize(Gram::get_layout_smem_a()) >=
+                  cublasdx::cosize(Readout::get_layout_smem_a()));
+    static_assert(cublasdx::cosize(Cross::get_layout_smem_b()) >=
+                  cublasdx::cosize(Readout::get_layout_smem_b()));
 
-    auto kernel = masked_stats_solve_spd_kernel<scalar_t, Rank, rhs_tile, k_tile, Arch>;
+    auto kernel = masked_stats_solve_spd_kernel<
+        scalar_t, Rank, rhs_tile, k_tile, Arch, FuseReadout>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
     const int64_t systems = u.size(0) * u.size(1);
+    TORCH_CHECK(
+        systems <= static_cast<int64_t>(std::numeric_limits<unsigned int>::max()),
+        "B * H exceeds the CUDA launch-grid limit");
     kernel<<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
         u.const_data_ptr<scalar_t>(), c.const_data_ptr<scalar_t>(),
         valid_mask.const_data_ptr<bool>(), length_scale.const_data_ptr<float>(),
-        alpha.const_data_ptr<float>(), solution.mutable_data_ptr<float>(),
+        alpha.const_data_ptr<float>(),
+        FuseReadout ? inv_mu.const_data_ptr<float>() : nullptr,
+        FuseReadout ? nullptr : solution.mutable_data_ptr<float>(),
+        FuseReadout ? output.mutable_data_ptr<scalar_t>() : nullptr,
         info.mutable_data_ptr<int>(), systems, u.size(1), u.size(2), c.size(3));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int Arch>
+template <int Arch, bool FuseReadout>
 void dispatch_masked_stats_solve_rank(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
     const at::Tensor& length_scale,
     const at::Tensor& alpha,
+    const at::Tensor& inv_mu,
     at::Tensor& solution,
+    at::Tensor& output,
     at::Tensor& info,
     cudaStream_t stream) {
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16, u.scalar_type(),
         "masked_stats_solve_spd_cuda", [&] {
             if (u.size(3) == 16) {
-                launch_masked_stats_solve_typed<scalar_t, 16, Arch>(
-                    u, c, valid_mask, length_scale, alpha, solution, info, stream);
+                launch_masked_stats_solve_typed<scalar_t, 16, Arch, FuseReadout>(
+                    u, c, valid_mask, length_scale, alpha, inv_mu,
+                    solution, output, info, stream);
             } else if (u.size(3) == 32) {
-                launch_masked_stats_solve_typed<scalar_t, 32, Arch>(
-                    u, c, valid_mask, length_scale, alpha, solution, info, stream);
+                launch_masked_stats_solve_typed<scalar_t, 32, Arch, FuseReadout>(
+                    u, c, valid_mask, length_scale, alpha, inv_mu,
+                    solution, output, info, stream);
             } else {
                 TORCH_CHECK(false, "MathDx backend supports rank 16 or 32, got ", u.size(3));
             }
         });
+}
+
+template <typename scalar_t, int Rank, bool Masked>
+__global__ void lsso_backward_fused_kernel(
+    const scalar_t* __restrict__ u,
+    const scalar_t* __restrict__ y,
+    const scalar_t* __restrict__ p,
+    const float* __restrict__ gamma,
+    const bool* __restrict__ valid_mask,
+    const float* __restrict__ length_scale,
+    scalar_t* __restrict__ grad_u,
+    float* __restrict__ grad_mu,
+    float* __restrict__ grad_gamma,
+    int64_t systems,
+    int64_t heads,
+    int64_t sequence,
+    int64_t width) {
+    const int64_t system = static_cast<int64_t>(blockIdx.x);
+    if (system >= systems) return;
+    const int64_t sample = system / heads;
+    const scalar_t* u_batch = u + system * sequence * Rank;
+    const scalar_t* y_batch = y + system * sequence * width;
+    const scalar_t* p_batch = p + system * sequence * width;
+    scalar_t* grad_batch = grad_u + system * sequence * Rank;
+    const bool* mask_batch = Masked ? valid_mask + sample * sequence : nullptr;
+    const float scale2 = Masked ? length_scale[sample] * length_scale[sample] : 1.0f;
+    const int compact_elements = static_cast<int>(width) * Rank;
+
+    extern __shared__ __align__(16) float shared[];
+    float* ytu = shared;
+    float* ptu = ytu + compact_elements;
+    float* reduction = ptu + compact_elements;
+
+    // Each lane owns one or more compact (channel, rank) entries and scans N.
+    // Padding is tested before U/Y/P are loaded.
+    for (int linear = threadIdx.x; linear < compact_elements; linear += blockDim.x) {
+        const int channel = linear / Rank;
+        const int rank = linear - channel * Rank;
+        float y_sum = 0.0f;
+        float p_sum = 0.0f;
+        for (int64_t token = 0; token < sequence; ++token) {
+            if constexpr (Masked) {
+                if (!mask_batch[token]) continue;
+            }
+            const float uv = static_cast<float>(u_batch[token * Rank + rank]);
+            y_sum += static_cast<float>(y_batch[token * width + channel]) * uv;
+            p_sum += static_cast<float>(p_batch[token * width + channel]) * uv;
+        }
+        ytu[linear] = y_sum;
+        ptu[linear] = p_sum;
+    }
+    __syncthreads();
+
+    float mu_partial = 0.0f;
+    for (int64_t linear = threadIdx.x;
+         linear < sequence * width;
+         linear += blockDim.x) {
+        const int64_t token = linear / width;
+        if constexpr (Masked) {
+            if (!mask_batch[token]) continue;
+        }
+        mu_partial -= static_cast<float>(y_batch[linear]) *
+                      static_cast<float>(p_batch[linear]);
+    }
+    float gamma_partial = 0.0f;
+    for (int linear = threadIdx.x; linear < compact_elements; linear += blockDim.x) {
+        gamma_partial -= ytu[linear] * ptu[linear] * scale2;
+    }
+    reduction[threadIdx.x] = mu_partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_mu[system] = reduction[0];
+    reduction[threadIdx.x] = gamma_partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_gamma[system] = reduction[0];
+    __syncthreads();
+
+    const float coefficient = -gamma[system] * scale2;
+    for (int64_t linear = threadIdx.x;
+         linear < sequence * Rank;
+         linear += blockDim.x) {
+        const int64_t token = linear / Rank;
+        const int rank = static_cast<int>(linear - token * Rank);
+        if constexpr (Masked) {
+            if (!mask_batch[token]) {
+                grad_batch[linear] = scalar_t(0);
+                continue;
+            }
+        }
+        float value = 0.0f;
+        for (int64_t channel = 0; channel < width; ++channel) {
+            const int compact = static_cast<int>(channel) * Rank + rank;
+            value += static_cast<float>(p_batch[token * width + channel]) * ytu[compact]
+                   + static_cast<float>(y_batch[token * width + channel]) * ptu[compact];
+        }
+        grad_batch[linear] = static_cast<scalar_t>(coefficient * value);
+    }
 }
 
 template <int Rank, int RhsTile, int Arch, int BatchesPerBlock>
@@ -994,9 +1188,17 @@ void launch_solve(
     cudaStream_t stream,
     int requested_batches_per_block = 0) {
     const int64_t batches = gram.size(0);
-    // Forced 2/4-system modes are retained for architecture benchmarking.
-    // SM120 measurements show that one CTA per system remains faster even at
-    // 768+ systems, so auto deliberately selects BPB=1.
+    // BPB=2/4 is architecture and shape dependent. Auto remains the safe
+    // one-system-per-CTA policy; an offline benchmark can install an
+    // architecture-specific choice through LSSO_MATHDX_BATCHES_PER_BLOCK.
+    if (requested_batches_per_block == 0) {
+        if (const char* mode = std::getenv("LSSO_MATHDX_BATCHES_PER_BLOCK")) {
+            const int configured = std::atoi(mode);
+            if (configured == 1 || configured == 2 || configured == 4) {
+                requested_batches_per_block = configured;
+            }
+        }
+    }
     if (requested_batches_per_block == 4 && batches % 4 == 0) {
         launch_solve_typed<Rank, Arch, 4>(
             gram, rhs, solution, info, stream);
@@ -1088,7 +1290,7 @@ void launch_stats_solve_typed(
     static_assert(cublasdx::cosize(Cross::get_layout_smem_b()) >=
                   cublasdx::cosize(Readout::get_layout_smem_b()));
     constexpr size_t async_staging_bytes =
-        (Arch >= 1000 && sizeof(scalar_t) == 2)
+        (Arch >= 800 && sizeof(scalar_t) == 2)
         ? sizeof(scalar_t) * 2 * k_tile * (Rank + rhs_tile)
         : 0;
     constexpr size_t smem_bytes = sizeof(float) * (
@@ -1139,11 +1341,11 @@ void dispatch_stats_solve_rank(
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16, u.scalar_type(),
         "stats_solve_spd_cuda", [&] {
-            // SM100 benefits from TMA's descriptor-driven bulk transfers.
-            // On the development SM120, the smaller cp.async staging path is
-            // 2--3% faster for RRLSSO tiles, so auto keeps it. The environment
-            // override supports architecture-specific A/B without rebuilding.
-            bool tma_enabled = Arch >= 1000 && Arch < 1200;
+            // Hopper and datacenter Blackwell benefit from descriptor-driven
+            // TMA transfers. On the development SM120, the smaller cp.async
+            // staging path is 2--3% faster for RRLSSO tiles, so auto keeps it.
+            // The environment override supports architecture-specific A/B.
+            bool tma_enabled = Arch >= 900 && Arch < 1200;
             if (const char* mode = std::getenv("LSSO_MATHDX_TMA")) {
                 if (mode[0] == '1' || mode[0] == 'y' || mode[0] == 'Y') {
                     tma_enabled = true;
@@ -1151,7 +1353,7 @@ void dispatch_stats_solve_rank(
                     tma_enabled = false;
                 }
             }
-            const bool use_tma = tma_enabled && Arch >= 1000 &&
+            const bool use_tma = tma_enabled && Arch >= 900 &&
                 sizeof(scalar_t) == 2 &&
                 c.size(2) >= 32 && c.size(2) % 32 == 0;
             if (u.size(2) == 16) {
@@ -1174,6 +1376,98 @@ void dispatch_stats_solve_rank(
                 TORCH_CHECK(false, "MathDx backend supports rank 16 or 32, got ", u.size(2));
             }
         });
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> lsso_backward_fused_cuda(
+    const at::Tensor& u,
+    const at::Tensor& y,
+    const at::Tensor& p,
+    const at::Tensor& gamma,
+    const at::Tensor& valid_mask,
+    const at::Tensor& length_scale) {
+    TORCH_CHECK(u.is_cuda() && y.is_cuda() && p.is_cuda() && gamma.is_cuda(),
+                "u, y, p, and gamma must be CUDA tensors");
+    TORCH_CHECK(u.scalar_type() == y.scalar_type() && u.scalar_type() == p.scalar_type(),
+                "u, y, and p must have the same dtype");
+    TORCH_CHECK(u.dim() == 4 && y.dim() == 4 && p.dim() == 4,
+                "u, y, and p must be rank-4 tensors");
+    TORCH_CHECK(u.sizes().slice(0, 3) == y.sizes().slice(0, 3) && y.sizes() == p.sizes(),
+                "u/y/p leading dimensions differ");
+    TORCH_CHECK(u.size(3) == 16 || u.size(3) == 32,
+                "fused backward supports rank 16 or 32");
+    TORCH_CHECK(y.size(3) > 0 && y.size(3) <= 64,
+                "fused backward supports width in [1, 64]");
+    TORCH_CHECK(gamma.scalar_type() == at::kFloat && gamma.dim() == 1 &&
+                gamma.size(0) == u.size(0) * u.size(1),
+                "gamma must be float32 with shape [B * H]");
+    TORCH_CHECK(u.is_contiguous() && y.is_contiguous() && p.is_contiguous() &&
+                gamma.is_contiguous(), "fused backward inputs must be contiguous");
+    const bool masked = valid_mask.numel() != 0;
+    if (masked) {
+        TORCH_CHECK(valid_mask.is_cuda() && valid_mask.scalar_type() == at::kBool &&
+                    valid_mask.is_contiguous() && valid_mask.dim() == 2 &&
+                    valid_mask.size(0) == u.size(0) && valid_mask.size(1) == u.size(2),
+                    "valid_mask must be contiguous bool [B, N]");
+        TORCH_CHECK(length_scale.is_cuda() && length_scale.scalar_type() == at::kFloat &&
+                    length_scale.is_contiguous() && length_scale.dim() == 1 &&
+                    length_scale.size(0) == u.size(0),
+                    "length_scale must be contiguous float32 [B]");
+    }
+    const c10::cuda::CUDAGuard device_guard(u.device());
+    auto grad_u = at::empty_like(u);
+    const int64_t systems = u.size(0) * u.size(1);
+    auto grad_mu = at::empty({systems}, u.options().dtype(at::kFloat));
+    auto grad_gamma = at::empty({systems}, u.options().dtype(at::kFloat));
+    const size_t smem_bytes = sizeof(float) *
+        (2 * u.size(3) * y.size(3) + 256);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(u.get_device()).stream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16, u.scalar_type(),
+        "lsso_backward_fused_cuda", [&] {
+            auto launch16_masked = [&] {
+                lsso_backward_fused_kernel<scalar_t, 16, true>
+                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
+                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
+                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
+                        valid_mask.const_data_ptr<bool>(), length_scale.const_data_ptr<float>(),
+                        grad_u.mutable_data_ptr<scalar_t>(), grad_mu.mutable_data_ptr<float>(),
+                        grad_gamma.mutable_data_ptr<float>(), systems, u.size(1), u.size(2), y.size(3));
+            };
+            auto launch16 = [&] {
+                lsso_backward_fused_kernel<scalar_t, 16, false>
+                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
+                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
+                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
+                        nullptr, nullptr, grad_u.mutable_data_ptr<scalar_t>(),
+                        grad_mu.mutable_data_ptr<float>(), grad_gamma.mutable_data_ptr<float>(),
+                        systems, u.size(1), u.size(2), y.size(3));
+            };
+            auto launch32_masked = [&] {
+                lsso_backward_fused_kernel<scalar_t, 32, true>
+                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
+                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
+                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
+                        valid_mask.const_data_ptr<bool>(), length_scale.const_data_ptr<float>(),
+                        grad_u.mutable_data_ptr<scalar_t>(), grad_mu.mutable_data_ptr<float>(),
+                        grad_gamma.mutable_data_ptr<float>(), systems, u.size(1), u.size(2), y.size(3));
+            };
+            auto launch32 = [&] {
+                lsso_backward_fused_kernel<scalar_t, 32, false>
+                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
+                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
+                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
+                        nullptr, nullptr, grad_u.mutable_data_ptr<scalar_t>(),
+                        grad_mu.mutable_data_ptr<float>(), grad_gamma.mutable_data_ptr<float>(),
+                        systems, u.size(1), u.size(2), y.size(3));
+            };
+            if (u.size(3) == 16) {
+                if (masked) launch16_masked(); else launch16();
+            } else {
+                if (masked) launch32_masked(); else launch32();
+            }
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {grad_u, grad_mu, grad_gamma};
 }
 
 std::tuple<at::Tensor, at::Tensor> solve_spd_impl(
@@ -1329,12 +1623,14 @@ std::tuple<at::Tensor, at::Tensor> stats_solve_readout_cuda(
     return stats_solve_spd_impl<true>(u, c, alpha, inv_mu);
 }
 
-std::tuple<at::Tensor, at::Tensor> masked_stats_solve_spd_cuda(
+template <bool FuseReadout>
+std::tuple<at::Tensor, at::Tensor> masked_stats_solve_impl(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
     const at::Tensor& length_scale,
-    const at::Tensor& alpha) {
+    const at::Tensor& alpha,
+    const at::Tensor& inv_mu) {
     TORCH_CHECK(
         u.is_cuda() && c.is_cuda() && valid_mask.is_cuda() &&
         length_scale.is_cuda() && alpha.is_cuda(),
@@ -1347,6 +1643,14 @@ std::tuple<at::Tensor, at::Tensor> masked_stats_solve_spd_cuda(
     TORCH_CHECK(valid_mask.scalar_type() == at::kBool, "valid_mask must be bool");
     TORCH_CHECK(length_scale.scalar_type() == at::kFloat, "length_scale must be float32");
     TORCH_CHECK(alpha.scalar_type() == at::kFloat, "alpha must be float32");
+    if constexpr (FuseReadout) {
+        TORCH_CHECK(inv_mu.is_cuda() && inv_mu.scalar_type() == at::kFloat &&
+                    inv_mu.is_contiguous() && inv_mu.dim() == 1 &&
+                    inv_mu.size(0) == u.size(0) * u.size(1),
+                    "inv_mu must be contiguous float32 with shape [B * H]");
+        TORCH_CHECK(inv_mu.get_device() == u.get_device(),
+                    "inv_mu must be on the same GPU");
+    }
     TORCH_CHECK(
         u.is_contiguous() && c.is_contiguous() && valid_mask.is_contiguous() &&
         length_scale.is_contiguous() && alpha.is_contiguous(),
@@ -1370,15 +1674,19 @@ std::tuple<at::Tensor, at::Tensor> masked_stats_solve_spd_cuda(
 
     const c10::cuda::CUDAGuard device_guard(u.device());
     const int64_t systems = u.size(0) * u.size(1);
-    auto solution = at::empty({systems, u.size(3), c.size(3)}, u.options().dtype(at::kFloat));
+    auto solution = FuseReadout
+        ? at::empty({0}, u.options().dtype(at::kFloat))
+        : at::empty({systems, u.size(3), c.size(3)}, u.options().dtype(at::kFloat));
+    auto output = FuseReadout ? at::empty_like(c) : at::empty({0}, u.options());
     auto info = at::zeros({systems}, u.options().dtype(at::kInt));
     const auto* props = at::cuda::getCurrentDeviceProperties();
     const int cc = props->major * 10 + props->minor;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(u.get_device()).stream();
 
 #define DISPATCH_MASKED_STATS(ARCH) \
-    dispatch_masked_stats_solve_rank<ARCH>( \
-        u, c, valid_mask, length_scale, alpha, solution, info, stream)
+    dispatch_masked_stats_solve_rank<ARCH, FuseReadout>( \
+        u, c, valid_mask, length_scale, alpha, inv_mu, \
+        solution, output, info, stream)
     if (cc >= 121) {
         DISPATCH_MASKED_STATS(1210);
     } else if (cc >= 120) {
@@ -1403,7 +1711,29 @@ std::tuple<at::Tensor, at::Tensor> masked_stats_solve_spd_cuda(
         TORCH_CHECK(false, "MathDx backend requires an Ampere-or-newer GPU");
     }
 #undef DISPATCH_MASKED_STATS
-    return {solution, info};
+    return {FuseReadout ? output : solution, info};
+}
+
+std::tuple<at::Tensor, at::Tensor> masked_stats_solve_spd_cuda(
+    const at::Tensor& u,
+    const at::Tensor& c,
+    const at::Tensor& valid_mask,
+    const at::Tensor& length_scale,
+    const at::Tensor& alpha) {
+    auto empty = at::empty({0}, alpha.options());
+    return masked_stats_solve_impl<false>(
+        u, c, valid_mask, length_scale, alpha, empty);
+}
+
+std::tuple<at::Tensor, at::Tensor> masked_stats_solve_readout_cuda(
+    const at::Tensor& u,
+    const at::Tensor& c,
+    const at::Tensor& valid_mask,
+    const at::Tensor& length_scale,
+    const at::Tensor& alpha,
+    const at::Tensor& inv_mu) {
+    return masked_stats_solve_impl<true>(
+        u, c, valid_mask, length_scale, alpha, inv_mu);
 }
 
 at::Tensor rank_rotary_cuda(
@@ -1569,6 +1899,8 @@ TORCH_LIBRARY(lsso_mathdx, m) {
     m.def("stats_solve_spd(Tensor u, Tensor c, Tensor alpha) -> (Tensor solution, Tensor info)");
     m.def("stats_solve_readout(Tensor u, Tensor c, Tensor alpha, Tensor inv_mu) -> (Tensor output, Tensor info)");
     m.def("masked_stats_solve_spd(Tensor u, Tensor c, Tensor valid_mask, Tensor length_scale, Tensor alpha) -> (Tensor solution, Tensor info)");
+    m.def("masked_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor length_scale, Tensor alpha, Tensor inv_mu) -> (Tensor output, Tensor info)");
+    m.def("lsso_backward_fused(Tensor u, Tensor y, Tensor p, Tensor gamma, Tensor valid_mask, Tensor length_scale) -> (Tensor grad_u, Tensor grad_mu, Tensor grad_gamma)");
     m.def("rank_rotary(Tensor input, Tensor cos, Tensor sin, bool inverse=False) -> Tensor");
     m.def("normalize_basis(Tensor input, float eps, float length_scale) -> (Tensor output, Tensor inv_rms)");
     m.def("normalize_basis_backward(Tensor grad_output, Tensor input, Tensor inv_rms, float length_scale) -> Tensor");
@@ -1582,6 +1914,8 @@ TORCH_LIBRARY_IMPL(lsso_mathdx, CUDA, m) {
     m.impl("stats_solve_spd", &stats_solve_spd_cuda);
     m.impl("stats_solve_readout", &stats_solve_readout_cuda);
     m.impl("masked_stats_solve_spd", &masked_stats_solve_spd_cuda);
+    m.impl("masked_stats_solve_readout", &masked_stats_solve_readout_cuda);
+    m.impl("lsso_backward_fused", &lsso_backward_fused_cuda);
     m.impl("rank_rotary", &rank_rotary_cuda);
     m.impl("normalize_basis", &normalize_basis_cuda);
     m.impl("normalize_basis_backward", &normalize_basis_backward_cuda);

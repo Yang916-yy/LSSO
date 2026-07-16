@@ -67,6 +67,22 @@ def solve_spd(gram: torch.Tensor, rhs: torch.Tensor) -> tuple[torch.Tensor, torc
     return torch.ops.lsso_mathdx.solve_spd(gram, rhs)
 
 
+def solve_spd_bpb(
+    gram: torch.Tensor,
+    rhs: torch.Tensor,
+    batches_per_block: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Benchmark an explicit 1/2/4-system cuSolverDx CTA schedule."""
+
+    if batches_per_block not in (1, 2, 4):
+        raise ValueError("batches_per_block must be 1, 2, or 4")
+    if not load_mathdx_backend():
+        raise RuntimeError(f"failed to load LSSO MathDx backend: {_LOAD_ERROR}")
+    return torch.ops.lsso_mathdx.solve_spd_bpb(
+        gram, rhs, batches_per_block
+    )
+
+
 def solve_spd_or_torch(gram: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Use cuSolverDx when supported, otherwise preserve the PyTorch path."""
 
@@ -232,14 +248,38 @@ def try_masked_stats_solve_spd(
     length_scale: torch.Tensor,
     alpha: torch.Tensor,
     *,
-    max_sequence: int = 512,
+    max_sequence: int | None = None,
+    padding_ratio_hint: float | None = None,
+    native_padding_threshold: float = 0.75,
 ) -> torch.Tensor | None:
     """Fuse masked/scaled statistics and solve without reading padded U/C.
 
     ``u`` and ``c`` retain their native training dtype. The CUDA kernel checks
     ``valid_mask`` before loading either tensor, converts valid values to FP32
-    in shared memory, and accumulates/solves the compact system in FP32.
+    in shared memory, and accumulates/solves the compact system in FP32. Long
+    sequences are reduced in fixed-size token tiles inside each CTA, while the
+    launch grid assigns one independent CTA to every ``(batch, head)`` system.
+
+    ``max_sequence`` is an optional caller-side policy cap retained for
+    compatibility. The native kernel itself has no 512-token or 64-system
+    limit. ``padding_ratio_hint`` enables a zero-synchronization hybrid policy:
+    when supplied by a CPU-side collator, low-padding inputs return ``None``
+    and use the cuBLAS fallback. The backend never reads a CUDA mask back to
+    the host to make this decision.
     """
+
+    if padding_ratio_hint is not None:
+        if not 0.0 <= padding_ratio_hint <= 1.0:
+            raise ValueError(
+                f"padding_ratio_hint must be in [0, 1], got {padding_ratio_hint}"
+            )
+        if not 0.0 <= native_padding_threshold <= 1.0:
+            raise ValueError(
+                "native_padding_threshold must be in [0, 1], got "
+                f"{native_padding_threshold}"
+            )
+        if padding_ratio_hint < native_padding_threshold:
+            return None
 
     if torch.compiler.is_compiling():
         return None
@@ -264,8 +304,7 @@ def try_masked_stats_solve_spd(
         and length_scale.shape[0] == u.shape[0]
         and alpha.shape[0] == u.shape[0] * u.shape[1]
         and u.shape[3] in (16, 32)
-        and u.shape[2] <= max_sequence
-        and u.shape[0] * u.shape[1] <= 64
+        and (max_sequence is None or u.shape[2] <= max_sequence)
         and c.shape[3] <= 64
     )
     if not eligible or not load_mathdx_backend():
@@ -278,6 +317,128 @@ def try_masked_stats_solve_spd(
         alpha.contiguous(),
     )
     return solution
+
+
+def try_masked_stats_solve_readout(
+    u: torch.Tensor,
+    c: torch.Tensor,
+    valid_mask: torch.Tensor,
+    length_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    inv_mu: torch.Tensor,
+    *,
+    max_sequence: int | None = None,
+    padding_ratio_hint: float | None = None,
+    native_padding_threshold: float = 0.75,
+) -> torch.Tensor | None:
+    """Fused masked statistics, solve, and padding-safe Woodbury readout."""
+    if padding_ratio_hint is not None:
+        if not 0.0 <= padding_ratio_hint <= 1.0:
+            raise ValueError(
+                f"padding_ratio_hint must be in [0, 1], got {padding_ratio_hint}"
+            )
+        if not 0.0 <= native_padding_threshold <= 1.0:
+            raise ValueError(
+                "native_padding_threshold must be in [0, 1], got "
+                f"{native_padding_threshold}"
+            )
+        if padding_ratio_hint < native_padding_threshold:
+            return None
+    if torch.compiler.is_compiling() or torch.is_grad_enabled():
+        return None
+    eligible = (
+        u.is_cuda
+        and c.is_cuda
+        and valid_mask.is_cuda
+        and length_scale.is_cuda
+        and alpha.is_cuda
+        and inv_mu.is_cuda
+        and u.dtype == c.dtype
+        and u.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and valid_mask.dtype == torch.bool
+        and length_scale.dtype == torch.float32
+        and alpha.dtype == torch.float32
+        and inv_mu.dtype == torch.float32
+        and u.ndim == 4
+        and c.ndim == 4
+        and valid_mask.ndim == 2
+        and length_scale.ndim == 1
+        and alpha.ndim == inv_mu.ndim == 1
+        and u.shape[:3] == c.shape[:3]
+        and valid_mask.shape == (u.shape[0], u.shape[2])
+        and length_scale.shape[0] == u.shape[0]
+        and alpha.shape[0] == inv_mu.shape[0] == u.shape[0] * u.shape[1]
+        and u.shape[3] in (16, 32)
+        and (max_sequence is None or u.shape[2] <= max_sequence)
+        and c.shape[3] <= 64
+    )
+    if not eligible or not load_mathdx_backend():
+        return None
+    output, _info = torch.ops.lsso_mathdx.masked_stats_solve_readout(
+        u.contiguous(),
+        c.contiguous(),
+        valid_mask.contiguous(),
+        length_scale.contiguous(),
+        alpha.contiguous(),
+        inv_mu.contiguous(),
+    )
+    return output
+
+
+def try_lsso_backward_fused(
+    u: torch.Tensor,
+    y: torch.Tensor,
+    p: torch.Tensor,
+    gamma_bh: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    length_scale: torch.Tensor | None = None,
+    max_sequence: int | None = 512,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Fuse compact backward statistics, parameter reductions, and grad-U."""
+    masked = valid_mask is not None
+    eligible = (
+        not torch.compiler.is_compiling()
+        and not torch.is_grad_enabled()
+        and u.is_cuda
+        and y.is_cuda
+        and p.is_cuda
+        and gamma_bh.is_cuda
+        and u.dtype == y.dtype == p.dtype
+        and u.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and u.ndim == y.ndim == p.ndim == 4
+        and u.shape[:3] == y.shape[:3]
+        and y.shape == p.shape
+        and u.shape[3] in (16, 32)
+        and y.shape[3] <= 64
+        and (max_sequence is None or u.shape[2] <= max_sequence)
+        and gamma_bh.dtype == torch.float32
+        and gamma_bh.shape == (u.shape[0] * u.shape[1],)
+    )
+    if masked:
+        eligible = eligible and (
+            valid_mask is not None
+            and length_scale is not None
+            and valid_mask.is_cuda
+            and length_scale.is_cuda
+            and valid_mask.dtype == torch.bool
+            and length_scale.dtype == torch.float32
+            and valid_mask.shape == (u.shape[0], u.shape[2])
+            and length_scale.shape == (u.shape[0],)
+        )
+    if not eligible or not load_mathdx_backend():
+        return None
+    if not masked:
+        valid_mask = torch.empty(0, device=u.device, dtype=torch.bool)
+        length_scale = torch.empty(0, device=u.device, dtype=torch.float32)
+    return torch.ops.lsso_mathdx.lsso_backward_fused(
+        u.contiguous(),
+        y.contiguous(),
+        p.contiguous(),
+        gamma_bh.contiguous(),
+        valid_mask.contiguous(),
+        length_scale.contiguous(),
+    )
 
 
 class _RankRotaryFunction(torch.autograd.Function):

@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from .mathdx_backend import (
     solve_spd_autograd,
+    try_lsso_backward_fused,
+    try_masked_stats_solve_readout,
     try_masked_stats_solve_spd,
     try_prepare_basis,
     try_stats_solve_readout,
@@ -128,6 +130,111 @@ def _solve_no_check(G: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Solve batched small systems without synchronization-heavy error checks."""
     with torch.amp.autocast(device_type=G.device.type, enabled=False):
         return solve_spd_autograd(G, rhs)
+
+
+_FUSED_STATS_MAX_SEQUENCE = 512
+# On SM120, a single cuBLAS GEMM remains faster through ordinary ViT-B/4 and
+# 8K contexts. Split-N starts paying for its compact-partial reduction around
+# 16K tokens; keep the threshold conservative to avoid short-sequence regressions.
+_SPLIT_STATS_MIN_SEQUENCE = 16384
+_SPLIT_STATS_CHUNK_SIZE = 1024
+_FUSED_BACKWARD_MAX_SEQUENCE = 512
+_SPLIT_BACKWARD_MIN_SEQUENCE = 32768
+_SPLIT_BACKWARD_MAX_SYSTEMS = 8
+_SPLIT_BACKWARD_CHUNK_SIZE = 1024
+
+
+def _compact_statistics(
+    U: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    solve_dtype: torch.dtype,
+    split_n: bool = False,
+    chunk_size: int = _SPLIT_STATS_CHUNK_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute compact Woodbury statistics, optionally sequence-parallel.
+
+    The split-N path maps sequence chunks into an additional batch dimension,
+    lets cuBLAS evaluate all partial products in parallel, and only reduces the
+    compact ``r x r`` / ``r x d`` partials.  It bounds the K dimension of each
+    GEMM and avoids assigning an ultra-long sequence to one native statistics
+    CTA.  No token-sized intermediate is materialized.
+    """
+    if not split_n or U.shape[1] <= chunk_size:
+        Ut = U.transpose(1, 2)
+        return (
+            _bmm_accumulate(Ut, U, dtype=solve_dtype),
+            _bmm_accumulate(Ut, C, dtype=solve_dtype),
+        )
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    systems, sequence, rank = U.shape
+    rhs_width = C.shape[2]
+    chunks = (sequence + chunk_size - 1) // chunk_size
+    padded_sequence = chunks * chunk_size
+    if padded_sequence != sequence:
+        U = F.pad(U, (0, 0, 0, padded_sequence - sequence))
+        C = F.pad(C, (0, 0, 0, padded_sequence - sequence))
+    # [systems, chunks, K, width] -> [systems * chunks, K, width]
+    U_chunks = U.view(systems, chunks, chunk_size, rank).flatten(0, 1)
+    C_chunks = C.view(systems, chunks, chunk_size, rhs_width).flatten(0, 1)
+    Ut_chunks = U_chunks.transpose(1, 2)
+    gram = _bmm_accumulate(Ut_chunks, U_chunks, dtype=solve_dtype)
+    cross = _bmm_accumulate(Ut_chunks, C_chunks, dtype=solve_dtype)
+    return (
+        gram.view(systems, chunks, rank, rank).sum(dim=1),
+        cross.view(systems, chunks, rank, rhs_width).sum(dim=1),
+    )
+
+
+def _backward_compact_statistics(
+    U: torch.Tensor,
+    Y: torch.Tensor,
+    P: torch.Tensor,
+    *,
+    split_n: bool = False,
+    chunk_size: int = _SPLIT_BACKWARD_CHUNK_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``Y.T@U``, ``P.T@U`` and per-system ``-<P,Y>``.
+
+    For very long, low-batch workloads, sequence chunks become an additional
+    GEMM batch dimension. This supplies enough parallel work without creating
+    token-sized statistics. The caller still uses cuBLAS for the output-sized
+    grad-U readout, which is faster than a serial per-system CTA at long N.
+    """
+    if not split_n or U.shape[1] <= chunk_size:
+        return (
+            torch.bmm(Y.transpose(1, 2), U),
+            torch.bmm(P.transpose(1, 2), U),
+            -(P * Y).sum(dim=(1, 2), dtype=_solve_dtype(P, Y)),
+        )
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    systems, sequence, rank = U.shape
+    width = Y.shape[2]
+    chunks = (sequence + chunk_size - 1) // chunk_size
+    padded_sequence = chunks * chunk_size
+    if padded_sequence != sequence:
+        amount = padded_sequence - sequence
+        U = F.pad(U, (0, 0, 0, amount))
+        Y = F.pad(Y, (0, 0, 0, amount))
+        P = F.pad(P, (0, 0, 0, amount))
+    U_chunks = U.view(systems, chunks, chunk_size, rank).flatten(0, 1)
+    Y_chunks = Y.view(systems, chunks, chunk_size, width).flatten(0, 1)
+    P_chunks = P.view(systems, chunks, chunk_size, width).flatten(0, 1)
+    YtU = torch.bmm(Y_chunks.transpose(1, 2), U_chunks)
+    PtU = torch.bmm(P_chunks.transpose(1, 2), U_chunks)
+    grad_mu = -(P_chunks * Y_chunks).sum(
+        dim=(1, 2), dtype=_solve_dtype(P, Y)
+    )
+    compact_dtype = _solve_dtype(U, Y, P)
+    return (
+        YtU.view(systems, chunks, width, rank).sum(dim=1, dtype=compact_dtype),
+        PtU.view(systems, chunks, width, rank).sum(dim=1, dtype=compact_dtype),
+        grad_mu.view(systems, chunks).sum(dim=1),
+    )
 
 
 def make_solve_state(
@@ -274,14 +381,34 @@ def _lsso_woodbury_forward(
     C_bh = C_calc.flatten(0, 1)
     alpha_bh = gamma_over_mu.expand(B, H, 1, 1).reshape(B * H).float()
     inv_mu_bh = inv_mu.expand(B, H, 1, 1).reshape(B * H).float()
-    fused_y = try_stats_solve_readout(U_bh, C_bh, alpha_bh, inv_mu_bh)
+    # Shape dispatcher: the one-CTA fused kernel wins for short sequences,
+    # while long sequences use cuBLAS statistics + MathDx Cholesky + cuBLAS
+    # readout. Ultra-long sequences additionally split the K dimension so
+    # several sequence chunks can be evaluated concurrently.
+    fused_y = try_stats_solve_readout(
+        U_bh,
+        C_bh,
+        alpha_bh,
+        inv_mu_bh,
+        max_sequence=_FUSED_STATS_MAX_SEQUENCE,
+    )
     if fused_y is not None:
         return fused_y.view(B, H, N, dh).to(output_dtype)
-    K = try_stats_solve_spd(U_bh, C_bh, alpha_bh)
+    K = try_stats_solve_spd(
+        U_bh,
+        C_bh,
+        alpha_bh,
+        max_sequence=_FUSED_STATS_MAX_SEQUENCE,
+    )
     if K is None:
-        Ut_bh = U_bh.transpose(1, 2)
-        UtU = _bmm_accumulate(Ut_bh, U_bh, dtype=solve_dtype).view(B, H, r, r)
-        UtC = _bmm_accumulate(Ut_bh, C_bh, dtype=solve_dtype).view(B, H, r, dh)
+        UtU_bh, UtC_bh = _compact_statistics(
+            U_bh,
+            C_bh,
+            solve_dtype=solve_dtype,
+            split_n=N >= _SPLIT_STATS_MIN_SEQUENCE,
+        )
+        UtU = UtU_bh.view(B, H, r, r)
+        UtC = UtC_bh.view(B, H, r, dh)
         if eye is None:
             eye = torch.eye(r, device=U.device, dtype=calc_dtype).view(1, 1, r, r)
         G = eye.to(solve_dtype) + gamma_over_mu.to(solve_dtype) * UtU.to(solve_dtype)
@@ -486,31 +613,64 @@ class _LSSOAutograd(torch.autograd.Function):
         grad = grad_output.contiguous()
         P = _lsso_woodbury_forward(U, grad, mu, gamma)
 
+        gamma_bh = gamma.expand(B, H, 1, 1).reshape(B * H).float()
+        fused_backward = try_lsso_backward_fused(
+            U, Y, P, gamma_bh, max_sequence=_FUSED_BACKWARD_MAX_SEQUENCE
+        )
+        if fused_backward is not None:
+            grad_U, grad_mu_flat, grad_gamma_flat = fused_backward
+            grad_mu_bh = grad_mu_flat.view(B, H, 1, 1)
+            grad_gamma_bh = grad_gamma_flat.view(B, H, 1, 1)
+            grad_mu = (
+                grad_mu_bh.sum(dim=0, keepdim=True)
+                if mu.shape[0] == 1
+                else grad_mu_bh
+            )
+            grad_gamma = (
+                grad_gamma_bh.sum(dim=0, keepdim=True)
+                if gamma.shape[0] == 1
+                else grad_gamma_bh
+            )
+            return (
+                grad_U,
+                P.to(grad_output.dtype),
+                grad_mu.to(mu.dtype),
+                grad_gamma.to(gamma.dtype),
+                None,
+            )
+
         calc_dtype = torch.float64 if U.dtype == torch.float64 or Y.dtype == torch.float64 else torch.float32
         matmul_dtype = U.dtype if U.dtype in (torch.float16, torch.bfloat16) else calc_dtype
         U_m = U.to(matmul_dtype).flatten(0, 1)
         Y_m = Y.to(matmul_dtype).flatten(0, 1)
         P_m = P.to(matmul_dtype).flatten(0, 1)
 
-        YtU = torch.bmm(Y_m.transpose(1, 2), U_m)
-        PtU = torch.bmm(P_m.transpose(1, 2), U_m)
-        grad_U_m = torch.bmm(P_m, YtU)
+        split_n = (
+            N >= _SPLIT_BACKWARD_MIN_SEQUENCE
+            and B * H <= _SPLIT_BACKWARD_MAX_SYSTEMS
+        )
+        YtU, PtU, grad_mu_flat = _backward_compact_statistics(
+            U_m,
+            Y_m,
+            P_m,
+            split_n=split_n,
+            chunk_size=_SPLIT_BACKWARD_CHUNK_SIZE,
+        )
+        YtU_readout = YtU.to(matmul_dtype)
+        PtU_readout = PtU.to(matmul_dtype)
+        grad_U_m = torch.bmm(P_m, YtU_readout)
         # Accumulate the symmetric second term in the GEMM epilogue.  This
         # avoids materializing another [B * H, N, r] tensor in backward.
-        grad_U_m.baddbmm_(Y_m, PtU)
+        grad_U_m.baddbmm_(Y_m, PtU_readout)
         grad_U_m.mul_(gamma.expand(B, H, 1, 1).to(matmul_dtype).reshape(B * H, 1, 1))
         grad_U = grad_U_m.neg_().view(B, H, N, r).to(U.dtype)
 
         grad_C = P.to(grad_output.dtype)
 
-        if calc_dtype == torch.float64:
-            grad_mu_bh = -(P.to(calc_dtype) * Y.to(calc_dtype)).sum(dim=(2, 3)).view(B, H, 1, 1)
-        else:
-            grad_mu_bh = -(P * Y).sum(dim=(2, 3), dtype=torch.float32).view(B, H, 1, 1)
-        if YtU.dim() == 4:
-            grad_gamma_bh = -(PtU.to(calc_dtype) * YtU.to(calc_dtype)).sum(dim=(2, 3)).view(B, H, 1, 1)
-        else:
-            grad_gamma_bh = -(PtU.to(calc_dtype) * YtU.to(calc_dtype)).sum(dim=(1, 2)).view(B, H, 1, 1)
+        grad_mu_bh = grad_mu_flat.view(B, H, 1, 1)
+        grad_gamma_bh = -(
+            PtU.to(calc_dtype) * YtU.to(calc_dtype)
+        ).sum(dim=(1, 2)).view(B, H, 1, 1)
 
         if mu.shape[0] == 1:
             grad_mu = grad_mu_bh.sum(dim=0, keepdim=True)
@@ -549,6 +709,7 @@ def _lsso_masked_woodbury_forward(
     valid_mask: torch.Tensor,
     length_scale: torch.Tensor,
     eye: torch.Tensor | None = None,
+    padding_ratio_hint: float | None = None,
 ) -> torch.Tensor:
     """Masked solve whose native path predicates padded U/C global loads."""
     B, H, N, r = U.shape
@@ -556,14 +717,31 @@ def _lsso_masked_woodbury_forward(
     inv_mu = mu.reciprocal()
     alpha = gamma * inv_mu
     alpha_bh = alpha.expand(B, H, 1, 1).reshape(B * H).float()
+    inv_mu_bh = inv_mu.expand(B, H, 1, 1).reshape(B * H).float()
+    fused_y = try_masked_stats_solve_readout(
+        U,
+        C,
+        valid_mask,
+        length_scale.float(),
+        alpha_bh,
+        inv_mu_bh,
+        padding_ratio_hint=padding_ratio_hint,
+    )
+    if fused_y is not None:
+        return fused_y
     K = try_masked_stats_solve_spd(
-        U, C, valid_mask, length_scale.float(), alpha_bh
+        U,
+        C,
+        valid_mask,
+        length_scale.float(),
+        alpha_bh,
+        padding_ratio_hint=padding_ratio_hint,
     )
     if K is None:
-        mask_u = valid_mask[:, None, :, None].to(dtype=U.dtype)
-        mask_c = mask_u.to(dtype=C.dtype)
-        U_scaled = U * mask_u * length_scale.to(U.dtype).view(B, 1, 1, 1)
-        C_masked = C * mask_c
+        active = valid_mask[:, None, :, None]
+        U_safe = torch.where(active, U, torch.zeros((), device=U.device, dtype=U.dtype))
+        C_masked = torch.where(active, C, torch.zeros((), device=C.device, dtype=C.dtype))
+        U_scaled = U_safe * length_scale.to(U.dtype).view(B, 1, 1, 1)
         return _lsso_woodbury_forward(U_scaled, C_masked, mu, gamma, eye)
 
     U_bh = U.flatten(0, 1)
@@ -581,11 +759,21 @@ def _lsso_masked_woodbury_forward(
 
 class _MaskedLSSOAutograd(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, U, C, mu, gamma, eye, valid_mask, length_scale):
+    def forward(
+        ctx, U, C, mu, gamma, eye, valid_mask, length_scale, padding_ratio_hint
+    ):
         Y = _lsso_masked_woodbury_forward(
-            U, C, mu, gamma, valid_mask, length_scale, eye
+            U,
+            C,
+            mu,
+            gamma,
+            valid_mask,
+            length_scale,
+            eye,
+            padding_ratio_hint,
         )
         ctx.save_for_backward(U, Y, mu, gamma, valid_mask, length_scale)
+        ctx.padding_ratio_hint = padding_ratio_hint
         return Y
 
     @staticmethod
@@ -593,20 +781,82 @@ class _MaskedLSSOAutograd(torch.autograd.Function):
         U, Y, mu, gamma, valid_mask, length_scale = ctx.saved_tensors
         B, H, N, r = U.shape
         mask = valid_mask[:, None, :, None]
-        grad = grad_output.mul(mask.to(grad_output.dtype)).contiguous()
+        grad = torch.where(
+            mask,
+            grad_output,
+            torch.zeros((), device=grad_output.device, dtype=grad_output.dtype),
+        ).contiguous()
         P = _lsso_masked_woodbury_forward(
-            U, grad, mu, gamma, valid_mask, length_scale
+            U,
+            grad,
+            mu,
+            gamma,
+            valid_mask,
+            length_scale,
+            padding_ratio_hint=ctx.padding_ratio_hint,
         )
+
+        gamma_bh = gamma.expand(B, H, 1, 1).reshape(B * H).float()
+        fused_backward = try_lsso_backward_fused(
+            U,
+            Y,
+            P,
+            gamma_bh,
+            valid_mask=valid_mask,
+            length_scale=length_scale.float(),
+            max_sequence=_FUSED_BACKWARD_MAX_SEQUENCE,
+        )
+        if fused_backward is not None:
+            grad_U, grad_mu_flat, grad_gamma_flat = fused_backward
+            grad_mu_bh = grad_mu_flat.view(B, H, 1, 1)
+            grad_gamma_bh = grad_gamma_flat.view(B, H, 1, 1)
+            grad_mu = (
+                grad_mu_bh.sum(dim=0, keepdim=True)
+                if mu.shape[0] == 1
+                else grad_mu_bh
+            )
+            grad_gamma = (
+                grad_gamma_bh.sum(dim=0, keepdim=True)
+                if gamma.shape[0] == 1
+                else grad_gamma_bh
+            )
+            return (
+                grad_U,
+                P.to(grad_output.dtype),
+                grad_mu.to(mu.dtype),
+                grad_gamma.to(gamma.dtype),
+                None,
+                None,
+                None,
+                None,
+            )
 
         calc_dtype = torch.float64 if U.dtype == torch.float64 else torch.float32
         matmul_dtype = U.dtype if U.dtype in (torch.float16, torch.bfloat16) else calc_dtype
-        U_m = U.to(matmul_dtype).flatten(0, 1)
-        Y_m = Y.to(matmul_dtype).flatten(0, 1)
-        P_m = P.to(matmul_dtype).flatten(0, 1)
-        YtU = torch.bmm(Y_m.transpose(1, 2), U_m)
-        PtU = torch.bmm(P_m.transpose(1, 2), U_m)
-        grad_U_m = torch.bmm(P_m, YtU)
-        grad_U_m.baddbmm_(Y_m, PtU)
+        # torch.where, unlike multiplication by a zero mask, prevents NaN or
+        # Inf padding values from entering cuBLAS on hybrid/split-N paths.
+        active = mask.to(torch.bool)
+        U_safe = torch.where(active, U, torch.zeros((), device=U.device, dtype=U.dtype))
+        Y_safe = torch.where(active, Y, torch.zeros((), device=Y.device, dtype=Y.dtype))
+        P_safe = torch.where(active, P, torch.zeros((), device=P.device, dtype=P.dtype))
+        U_m = U_safe.to(matmul_dtype).flatten(0, 1)
+        Y_m = Y_safe.to(matmul_dtype).flatten(0, 1)
+        P_m = P_safe.to(matmul_dtype).flatten(0, 1)
+        split_n = (
+            N >= _SPLIT_BACKWARD_MIN_SEQUENCE
+            and B * H <= _SPLIT_BACKWARD_MAX_SYSTEMS
+        )
+        YtU, PtU, grad_mu_flat = _backward_compact_statistics(
+            U_m,
+            Y_m,
+            P_m,
+            split_n=split_n,
+            chunk_size=_SPLIT_BACKWARD_CHUNK_SIZE,
+        )
+        YtU_readout = YtU.to(matmul_dtype)
+        PtU_readout = PtU.to(matmul_dtype)
+        grad_U_m = torch.bmm(P_m, YtU_readout)
+        grad_U_m.baddbmm_(Y_m, PtU_readout)
         scale2 = length_scale.square()[:, None].expand(B, H).reshape(B * H, 1, 1)
         coeff = gamma.expand(B, H, 1, 1).reshape(B * H, 1, 1) * scale2
         grad_U = grad_U_m.mul_(coeff.to(matmul_dtype)).neg_().view(B, H, N, r)
@@ -614,7 +864,7 @@ class _MaskedLSSOAutograd(torch.autograd.Function):
         grad_U = grad_U.to(U.dtype)
         grad_C = P.to(grad_output.dtype)
 
-        grad_mu_bh = -(P * Y).sum(dim=(2, 3), dtype=calc_dtype).view(B, H, 1, 1)
+        grad_mu_bh = grad_mu_flat.view(B, H, 1, 1)
         grad_gamma_bh = -(PtU.to(calc_dtype) * YtU.to(calc_dtype)).sum(dim=(1, 2))
         grad_gamma_bh = grad_gamma_bh.view(B, H)
         grad_gamma_bh.mul_(scale2.view(B, H).to(calc_dtype))
@@ -633,6 +883,7 @@ class _MaskedLSSOAutograd(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -648,6 +899,7 @@ def lsso(
     length_normalize: bool = True,
     length_reference: float = 1.0,
     valid_mask: torch.Tensor | None = None,
+    padding_ratio_hint: float | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, LSSOAux]:
     """
     Functional LSSO core, analogous to an attention kernel.
@@ -667,6 +919,8 @@ def lsso(
             that length.
         valid_mask: optional [B, N] mask used for effective lengths. Masked U/C
             entries are zeroed here as a safety measure.
+        padding_ratio_hint: optional CPU-side padding fraction used to select
+            the native masked kernel without synchronizing the CUDA mask.
 
     Returns:
         Y: solved token states, [B, H, N, dh].
@@ -700,10 +954,24 @@ def lsso(
                 U.requires_grad or C.requires_grad or mu.requires_grad or gamma.requires_grad
             ):
                 return _MaskedLSSOAutograd.apply(
-                    U, C, mu, gamma, eye, valid_mask, length_scale
+                    U,
+                    C,
+                    mu,
+                    gamma,
+                    eye,
+                    valid_mask,
+                    length_scale,
+                    padding_ratio_hint,
                 )
             return _lsso_masked_woodbury_forward(
-                U, C, mu, gamma, valid_mask, length_scale, eye
+                U,
+                C,
+                mu,
+                gamma,
+                valid_mask,
+                length_scale,
+                eye,
+                padding_ratio_hint,
             )
         solve_mask = valid_mask[:, None, :, None].to(device=U.device, dtype=U.dtype)
         U = U * solve_mask
@@ -849,7 +1117,13 @@ class LSSO(nn.Module):
         self.prune_rank_keep: int | None = None
         self.last_diagnostics: LSSODiagnostics | None = None
 
-    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        *,
+        padding_ratio_hint: float | None = None,
+    ) -> torch.Tensor:
         B, N, D = x.shape
         H = self.num_heads
         dh = self.head_dim
@@ -915,6 +1189,7 @@ class LSSO(nn.Module):
                 length_normalize=self.length_normalize and not fused_basis,
                 length_reference=self.length_reference,
                 valid_mask=valid_mask,
+                padding_ratio_hint=padding_ratio_hint,
             )
         else:
             Y = lsso(
@@ -927,6 +1202,7 @@ class LSSO(nn.Module):
                 length_normalize=self.length_normalize and not fused_basis,
                 length_reference=self.length_reference,
                 valid_mask=valid_mask,
+                padding_ratio_hint=padding_ratio_hint,
             )
             aux = None
 

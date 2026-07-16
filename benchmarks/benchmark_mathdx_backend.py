@@ -7,6 +7,7 @@ import torch
 from lsso.mathdx_backend import (
     load_mathdx_backend,
     solve_spd,
+    solve_spd_bpb,
     stats_solve_readout,
     stats_solve_spd,
 )
@@ -37,7 +38,18 @@ def benchmark_solve(
     gram = a @ a.transpose(-1, -2) + torch.eye(rank, device="cuda")
     rhs = torch.randn(systems, rank, rhs_width, device="cuda")
 
-    mathdx_ms = _time_ms(lambda: solve_spd(gram, rhs)[0], warmup, iterations)
+    schedules = {}
+    for batches_per_block in (1, 2, 4):
+        if systems % batches_per_block == 0:
+            schedules[batches_per_block] = _time_ms(
+                lambda bpb=batches_per_block: solve_spd_bpb(
+                    gram, rhs, bpb
+                )[0],
+                warmup,
+                iterations,
+            )
+    best_bpb = min(schedules, key=schedules.get)
+    mathdx_ms = schedules[1]
     torch_ms = _time_ms(
         lambda: torch.linalg.solve_ex(gram, rhs, check_errors=False)[0],
         warmup,
@@ -46,7 +58,9 @@ def benchmark_solve(
     print(
         f"solve systems={systems} rank={rank} rhs={rhs_width} "
         f"mathdx={mathdx_ms:.4f}ms torch={torch_ms:.4f}ms "
-        f"speedup={torch_ms / mathdx_ms:.2f}x"
+        f"speedup={torch_ms / mathdx_ms:.2f}x "
+        f"bpb={','.join(f'{key}:{value:.4f}' for key, value in schedules.items())} "
+        f"recommended_bpb={best_bpb}"
     )
 
 

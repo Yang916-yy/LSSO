@@ -6,13 +6,78 @@ import pytest
 import torch
 
 from lsso import GroupedLSSO, GroupedRRLSSO, LSSO, RRLSSO
-from lsso.modules import lsso
+import lsso.modules as lsso_modules
+from lsso.modules import _backward_compact_statistics, _compact_statistics, lsso
 
 
 def _positive_parameters(heads: int, *, dtype: torch.dtype = torch.float64):
     mu = (torch.rand(heads, dtype=dtype) + 0.5).requires_grad_()
     gamma = (torch.rand(heads, dtype=dtype) + 0.1).requires_grad_()
     return mu, gamma
+
+
+def test_split_n_compact_statistics_matches_single_gemm() -> None:
+    torch.manual_seed(1707)
+    systems, sequence, rank, width = 5, 37, 4, 7
+    u = torch.randn(systems, sequence, rank, dtype=torch.float64)
+    c = torch.randn(systems, sequence, width, dtype=torch.float64)
+    expected_gram = u.transpose(1, 2) @ u
+    expected_cross = u.transpose(1, 2) @ c
+    gram, cross = _compact_statistics(
+        u, c, solve_dtype=torch.float64, split_n=True, chunk_size=8
+    )
+    torch.testing.assert_close(gram, expected_gram, rtol=2e-15, atol=2e-15)
+    torch.testing.assert_close(cross, expected_cross, rtol=2e-15, atol=2e-15)
+
+
+def test_split_n_backward_statistics_matches_single_gemm() -> None:
+    torch.manual_seed(1708)
+    systems, sequence, rank, width = 3, 43, 5, 7
+    u = torch.randn(systems, sequence, rank, dtype=torch.float64)
+    y = torch.randn(systems, sequence, width, dtype=torch.float64)
+    p = torch.randn(systems, sequence, width, dtype=torch.float64)
+    actual = _backward_compact_statistics(
+        u, y, p, split_n=True, chunk_size=8
+    )
+    expected = (
+        y.transpose(1, 2) @ u,
+        p.transpose(1, 2) @ u,
+        -(p * y).sum(dim=(1, 2)),
+    )
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=5e-14, atol=3e-15)
+
+
+def test_padding_ratio_hint_is_reused_by_custom_backward(monkeypatch) -> None:
+    hints = []
+
+    def fake_native(*args, padding_ratio_hint=None, **kwargs):
+        hints.append(padding_ratio_hint)
+        return None
+
+    monkeypatch.setattr(
+        lsso_modules, "try_masked_stats_solve_spd", fake_native
+    )
+    B, H, N, r, dh = 2, 2, 7, 4, 5
+    U = torch.randn(B, H, N, r, requires_grad=True)
+    C = torch.randn(B, H, N, dh, requires_grad=True)
+    mu = torch.ones(H, requires_grad=True)
+    gamma = torch.full((H,), 0.05, requires_grad=True)
+    mask = torch.tensor(
+        [[1, 1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 0, 0, 0]],
+        dtype=torch.bool,
+    )
+
+    lsso(
+        U,
+        C,
+        mu,
+        gamma,
+        valid_mask=mask,
+        padding_ratio_hint=0.25,
+    ).square().mean().backward()
+
+    assert hints == [0.25, 0.25]
 
 
 def test_masked_functional_matches_individually_cropped_sequences() -> None:
@@ -210,3 +275,105 @@ def test_masked_cuda_bfloat16_matches_cropped_prefix(
     assert x.grad is not None
     assert torch.count_nonzero(x.grad[1, 5:]).item() == 0
     assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("padding_ratio_hint", [0.1, 0.9])
+def test_masked_cuda_nan_padding_cannot_leak_through_forward_or_backward(
+    padding_ratio_hint: float,
+) -> None:
+    """Exercise the complete fused readout/backward path with poisoned padding."""
+    torch.manual_seed(1708)
+    B, H, N, rank, width = 2, 2, 65, 16, 32
+    mask = torch.tensor(
+        [[True] * N, [True] * 7 + [False] * (N - 7)], device="cuda"
+    )
+    padding_u = ~mask[:, None, :, None]
+    u = torch.randn(B, H, N, rank, device="cuda", dtype=torch.bfloat16)
+    c = torch.randn(B, H, N, width, device="cuda", dtype=torch.bfloat16)
+    u = torch.where(padding_u, torch.full_like(u, float("nan")), u).requires_grad_()
+    c = torch.where(padding_u, torch.full_like(c, float("nan")), c).requires_grad_()
+    mu = torch.ones(H, device="cuda", requires_grad=True)
+    gamma = torch.full((H,), 0.02, device="cuda", requires_grad=True)
+
+    output = lsso(
+        u,
+        c,
+        mu,
+        gamma,
+        valid_mask=mask,
+        padding_ratio_hint=padding_ratio_hint,
+    )
+    padding_y = padding_u.expand_as(output)
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output.masked_select(padding_y)) == 0
+    upstream = torch.randn_like(output)
+    upstream = torch.where(
+        mask[:, None, :, None], upstream, torch.full_like(upstream, float("nan"))
+    )
+    output.backward(upstream)
+    assert u.grad is not None and c.grad is not None
+    assert torch.isfinite(u.grad).all() and torch.isfinite(c.grad).all()
+    assert torch.count_nonzero(u.grad.masked_select(padding_u.expand_as(u.grad))) == 0
+    assert torch.count_nonzero(c.grad.masked_select(padding_y)) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dispatch", ["hybrid", "split_n"])
+def test_long_backward_dispatch_matches_native_and_blocks_arbitrary_mask_leaks(
+    monkeypatch, dispatch: str
+) -> None:
+    torch.manual_seed(1709)
+    B, H, N, rank, width = 2, 2, 65, 16, 32
+    mask = torch.rand(B, N, device="cuda") > 0.45
+    mask[:, 0] = True
+    u0 = torch.randn(B, H, N, rank, device="cuda", dtype=torch.bfloat16)
+    c0 = torch.randn(B, H, N, width, device="cuda", dtype=torch.bfloat16)
+    probe = torch.randn(B, H, N, width, device="cuda", dtype=torch.bfloat16)
+    probe = probe * mask[:, None, :, None]
+
+    def run(u_value: torch.Tensor, c_value: torch.Tensor):
+        u = u_value.detach().clone().requires_grad_()
+        c = c_value.detach().clone().requires_grad_()
+        mu = torch.ones(H, device="cuda", requires_grad=True)
+        gamma = torch.full((H,), 0.02, device="cuda", requires_grad=True)
+        output = lsso(
+            u, c, mu, gamma, valid_mask=mask, padding_ratio_hint=0.9
+        )
+        gradients = torch.autograd.grad(
+            (output * probe).sum(), (u, c, mu, gamma)
+        )
+        return output.detach(), tuple(value.detach() for value in gradients)
+
+    native_output, native_gradients = run(u0, c0)
+    monkeypatch.setattr(lsso_modules, "_FUSED_BACKWARD_MAX_SEQUENCE", 0)
+    if dispatch == "split_n":
+        monkeypatch.setattr(lsso_modules, "_SPLIT_BACKWARD_MIN_SEQUENCE", 1)
+        monkeypatch.setattr(lsso_modules, "_SPLIT_BACKWARD_MAX_SYSTEMS", B * H)
+        monkeypatch.setattr(lsso_modules, "_SPLIT_BACKWARD_CHUNK_SIZE", 8)
+    else:
+        monkeypatch.setattr(lsso_modules, "_SPLIT_BACKWARD_MIN_SEQUENCE", N + 1)
+
+    output, gradients = run(u0, c0)
+    torch.testing.assert_close(output, native_output, rtol=0, atol=0)
+    for value, reference in zip(gradients, native_gradients, strict=True):
+        torch.testing.assert_close(value, reference, rtol=4e-2, atol=4e-2)
+
+    padding = ~mask[:, None, :, None]
+    poisoned_u = torch.where(padding, torch.full_like(u0, float("nan")), u0)
+    poisoned_c = torch.where(padding, torch.full_like(c0, float("nan")), c0)
+    poisoned_output, poisoned_gradients = run(poisoned_u, poisoned_c)
+    assert torch.isfinite(poisoned_output).all()
+    assert torch.count_nonzero(
+        poisoned_output.masked_select(padding.expand_as(poisoned_output))
+    ) == 0
+    torch.testing.assert_close(poisoned_output, output, rtol=0, atol=0)
+    for value, reference in zip(poisoned_gradients, gradients, strict=True):
+        assert torch.isfinite(value).all()
+        torch.testing.assert_close(value, reference, rtol=4e-2, atol=4e-2)
+    assert torch.count_nonzero(
+        poisoned_gradients[0].masked_select(padding.expand_as(poisoned_gradients[0]))
+    ) == 0
+    assert torch.count_nonzero(
+        poisoned_gradients[1].masked_select(padding.expand_as(poisoned_gradients[1]))
+    ) == 0

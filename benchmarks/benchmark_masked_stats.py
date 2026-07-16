@@ -35,9 +35,9 @@ def peak_bytes(fn) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--sequence", type=int, default=512)
+    parser.add_argument("--sequence", type=int, default=2048)
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--iterations", type=int, default=200)
@@ -52,7 +52,10 @@ def main() -> None:
     eye = torch.eye(r, device="cuda").expand(B * H, r, r)
 
     print(f"device={torch.cuda.get_device_name()} shape=({B},{H},{N},{r},{dh}) dtype={dtype}")
-    print("padding  old_ms  native_ms  speedup  old_peak_MiB  native_peak_MiB")
+    print(
+        "padding  old_ms  native_ms  hybrid_ms  speedup  "
+        "old_peak_MiB  native_peak_MiB  hybrid_peak_MiB"
+    )
     for ratio in (0.0, 0.25, 0.5, 0.75, 0.9):
         valid = max(1, round(N * (1.0 - ratio)))
         mask = torch.arange(N, device="cuda")[None] < valid
@@ -75,13 +78,22 @@ def main() -> None:
             assert out is not None
             return out
 
+        def hybrid_path():
+            out = try_masked_stats_solve_spd(
+                u, c, mask, scale, alpha, padding_ratio_hint=ratio
+            )
+            return old_path() if out is None else out
+
         old_ms = timed(old_path, 20, args.iterations)
         native_ms = timed(native_path, 20, args.iterations)
+        hybrid_ms = timed(hybrid_path, 20, args.iterations)
         old_peak = peak_bytes(old_path) / 2**20
         native_peak = peak_bytes(native_path) / 2**20
+        hybrid_peak = peak_bytes(hybrid_path) / 2**20
         print(
             f"{ratio:7.0%} {old_ms:7.3f} {native_ms:10.3f} "
-            f"{old_ms/native_ms:8.2f}x {old_peak:13.2f} {native_peak:16.2f}"
+            f"{hybrid_ms:10.3f} {old_ms/native_ms:8.2f}x "
+            f"{old_peak:13.2f} {native_peak:16.2f} {hybrid_peak:16.2f}"
         )
 
 

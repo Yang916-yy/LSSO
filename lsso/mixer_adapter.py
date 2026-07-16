@@ -44,6 +44,7 @@ class RotaryMHA(nn.Module):
         x: torch.Tensor,
         *,
         valid_mask: torch.Tensor | None = None,
+        padding_ratio_hint: float | None = None,
         spatial_shape: tuple[int, int] | None = None,
         position_coords: torch.Tensor | None = None,
         num_prefix_tokens: int = 0,
@@ -108,6 +109,7 @@ class MixerAdapter(nn.Module):
         x: torch.Tensor,
         *,
         valid_mask: torch.Tensor | None = None,
+        padding_ratio_hint: float | None = None,
         spatial_shape: tuple[int, int] | None = None,
         position_coords: torch.Tensor | None = None,
         num_prefix_tokens: int = 0,
@@ -121,10 +123,15 @@ class MixerAdapter(nn.Module):
                 num_prefix_tokens=num_prefix_tokens,
             )
         if self.mixer_name == "lsso":
-            return self.mixer(x, valid_mask=valid_mask)
+            return self.mixer(
+                x,
+                valid_mask=valid_mask,
+                padding_ratio_hint=padding_ratio_hint,
+            )
         return self.mixer(
             x,
             valid_mask=valid_mask,
+            padding_ratio_hint=padding_ratio_hint,
             spatial_shape=spatial_shape if self.rotary_2d and positional else None,
             position_coords=position_coords if self.rotary_2d and positional else None,
             num_prefix_tokens=num_prefix_tokens,
