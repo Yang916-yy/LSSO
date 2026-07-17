@@ -1,0 +1,124 @@
+\section{Experiments}
+\label{sec:experiments}
+
+The main visual experiments are deferred while large-scale pretraining is in
+progress. We first test whether the same bidirectional solve operator transfers
+outside vision, using genomic sequence classification as an auxiliary
+evaluation. This setting is useful because it combines short regulatory motifs
+with global sequence context and includes sequence lengths for which quadratic
+attention becomes arithmetically expensive.
+
+\subsection{Auxiliary Experiment I: Genomic Sequence Classification}
+
+\paragraph{Datasets and protocol.}
+We use eight binary classification tasks from
+GenomicBenchmarks~\cite{gresova2023genomic}: coding versus intergenic sequence,
+human versus worm, mouse enhancers, the Cohn and Ensembl human enhancer tasks,
+human regulatory regions, non-TATA promoters, and human open chromatin regions
+(OCR). We retain the official test split and select checkpoints using a
+stratified $10\%$ validation split drawn only from the training set. Results are
+test-set mean and sample standard deviation over three seeds.
+
+Both mixers use the same compact, non-pretrained DNA encoder: width $256$, two
+mixer blocks, eight heads, a learned absolute position embedding, a local
+depthwise motif stem of width seven, a $4\times$ MLP, and masked mean pooling.
+The \RRLSSO\ model uses rank $r=32$ and fixed one-dimensional rank rotation;
+the baseline replaces only the mixer with multi-head attention (MHA). We train
+for 100 epochs with AdamW, cosine decay, effective batch size $128$, and BF16.
+The shared augmentation applies reverse complementation with probability
+$0.5$ and a $0.2\%$ nucleotide mutation rate, followed by 20 clean epochs.
+At test time, original and reverse-complement logits are averaged. Thus the
+comparison isolates the global mixer while preserving the same local inductive
+bias, optimization, augmentation, and pooling.
+
+\twocolumn[{
+  \begin{minipage}{\textwidth}
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{3.5pt}
+  \refstepcounter{table}\label{tab:genomic}
+  \textbf{Table \thetable:} GenomicBenchmarks test results and mixer arithmetic.
+  Accuracy is reported in percent as mean $\pm$ sample standard deviation over
+  three seeds. MACs are per sample for both mixer layers at the configured
+  maximum sequence length; one multiply--accumulate is one MAC. Bold marks the
+  higher mean.\par\smallskip
+  \begin{tabular}{lrrrrrrr}
+    \toprule
+    Task & $N_{\max}$ & \RRLSSO\ Acc. & MHA Acc. & \RRLSSO\ MCC & MHA MCC
+      & \RRLSSO\ GMAC & MHA GMAC \\
+    \midrule
+    Coding--Intergenic
+      & 200  & \textbf{90.03 $\pm$ 0.15} & 89.47 $\pm$ 0.07
+      & \textbf{0.8006} & 0.7901 & 0.089 & 0.146 \\
+    Human--Worm
+      & 200  & \textbf{96.89 $\pm$ 0.10} & 96.73 $\pm$ 0.01
+      & \textbf{0.9378} & 0.9345 & 0.089 & 0.146 \\
+    Mouse Enhancers
+      & 4707 & \textbf{76.03 $\pm$ 0.72} & 73.55 $\pm$ 4.37
+      & \textbf{0.5271} & 0.4874 & 2.083 & 25.155 \\
+    Cohn Enhancers
+      & 500  & \textbf{72.70 $\pm$ 0.55} & 72.28 $\pm$ 0.16
+      & \textbf{0.4545} & 0.4474 & 0.222 & 0.518 \\
+    Ensembl Enhancers
+      & 573  & \textbf{91.50 $\pm$ 0.66} & 90.24 $\pm$ 0.43
+      & \textbf{0.8306} & 0.8051 & 0.254 & 0.637 \\
+    Regulatory
+      & 802  & \textbf{94.11 $\pm$ 0.11} & 94.04 $\pm$ 0.02
+      & \textbf{0.9115} & 0.9106 & 0.355 & 1.079 \\
+    Non-TATA
+      & 251  & 90.71 $\pm$ 1.12 & \textbf{91.07 $\pm$ 0.18}
+      & 0.8187 & \textbf{0.8235} & 0.112 & 0.196 \\
+    OCR
+      & 593  & \textbf{80.33 $\pm$ 0.45} & 79.45 $\pm$ 0.35
+      & \textbf{0.6068} & 0.5899 & 0.263 & 0.671 \\
+    \midrule
+    Macro average
+      & -- & \textbf{86.54} & 85.85
+      & \textbf{0.7359} & 0.7236 & -- & -- \\
+    \bottomrule
+  \end{tabular}
+  \vspace{1em}
+  \end{minipage}
+}]
+
+\paragraph{Predictive results.}
+As shown in \cref{tab:genomic}, \RRLSSO\ obtains the higher mean accuracy and
+MCC on seven of eight tasks. It improves macro-average accuracy by $0.68$
+percentage points and MCC by $0.0124$. The only loss is on Non-TATA promoters,
+where MHA leads by $0.36$ percentage points. The \RRLSSO\ models also use
+exactly 131,552 fewer parameters than their matched MHA counterparts; because
+the learned position table changes with task length, this corresponds to a
+$4.5\%$--$7.5\%$ reduction in total parameters. These results do not claim a
+genomics state of the art; rather, they isolate the transferability of the
+proposed mixer under a controlled architecture and training recipe.
+
+\paragraph{Arithmetic and long-sequence behavior.}
+For one MHA layer, we count
+\begin{equation}
+  \operatorname{MAC}_{\mathrm{MHA}}=4ND^2+2N^2D,
+\end{equation}
+covering the query/key/value and output projections, $QK^\top$, and attention
+readout. For \RRLSSO, we count the fused $U/C$ and output projections, compact
+statistics, Woodbury readout, and dense-equivalent Cholesky and triangular
+solves:
+\begin{align}
+  \operatorname{MAC}_{\RRLSSO}
+  ={}&ND(2D+Hr)+HNr^2+2NrD \notag\\
+    &+Dr^2+\frac{Hr^3}{6}.
+\end{align}
+Elementwise normalization, rotary transforms, activations, and softmax are
+excluded from both counts. Across the eight tasks, \RRLSSO\ reduces mixer MACs
+by $1.64\times$--$12.08\times$.
+
+Lower arithmetic does not necessarily imply lower wall-clock time for short
+sequences, because Flash-SDPA benefits from highly mature, hardware-specific
+kernel fusion. The longest task nevertheless demonstrates that the asymptotic
+advantage can become practical. Mouse Enhancers has maximum length 4,707 and
+mean effective length 2,348. On an NVIDIA GeForce RTX 5070 Ti, using the same
+BF16 training step, batch size 64, augmentation, backward pass, gradient
+clipping, and fused AdamW update, \RRLSSO\ reduces mixer arithmetic from
+$25.16$ to $2.08$ GMAC and shortens one training epoch from $3.18$ to $1.73$
+seconds, a $1.83\times$ end-to-end speedup. We therefore treat MACs as the
+primary implementation-independent efficiency measure and this longest task as
+evidence that the linear sequence dependence can translate into realized
+training acceleration.
