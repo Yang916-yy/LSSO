@@ -64,15 +64,24 @@ X = X + MLP(LN(X))
 
 ## Repository layout
 
+The installable framework exposes stable interfaces through `lsso`,
+`lsso.ops`, `lsso.nn`, and `lsso.backends`. Legacy implementation imports are
+kept compatible while internals are split incrementally. See
+[`docs/repository_architecture.md`](docs/repository_architecture.md) for layer
+boundaries and [`CONTRIBUTING.md`](CONTRIBUTING.md) for change and artifact
+policy.
+
 ```text
-lsso/          core bidirectional operators and MathDx dispatch
-csrc/mathdx/   fused cuBLASDx + cuSOLVERDx extension
-examples/      compact ViT integration reference
-experiments/   CIFAR-100 training, strength sweep, and diagnostics
-benchmarks/    active grouped and MathDx benchmarks
-tests/         numerical, normalization, and backend checks
-docs/          architecture and active-program notes
-tools/         build helpers
+lsso/          installable operators, modules, and backend facades
+csrc/mathdx/   fused CUDA/MathDx implementation
+examples/      compact model integration references
+experiments/   reproducible vision and sequence task programs
+integrations/  timm, MMDetection, and MMSegmentation adapters
+benchmarks/    performance and complexity measurement
+tests/         numerical, dispatch, integration, and regression checks
+docs/          architecture, recipes, and active research notes
+paper/         manuscript sources and compact experimental tables
+tools/         build, data, and repository operations
 ```
 
 Historical causal, retrieval, diffusion, and paper artifacts are deliberately
