@@ -67,4 +67,4 @@ The rank $r$ is therefore both a capacity control and a systems parameter. Incre
 
 \subsection{Scope of the Formulation}
 
-The operator studied here is bidirectional: a single solve uses statistics from all valid tokens. We do not derive or claim a causal decoding recurrence. We also distinguish the mathematical inverse from a generic Sylvester equation solver: although the module name is retained, the implemented primitive is a positive-shifted low-rank linear system with multiple right-hand sides. This narrower description exposes the exact assumptions used by the theory and implementation.
+The operator studied here is bidirectional: a single solve uses statistics from all valid tokens. We do not derive or claim a causal decoding recurrence. The term \emph{structured solve} refers specifically to the positive-shifted low-rank linear system with multiple right-hand sides implemented by the layer; it does not denote a generic Sylvester equation solver. This precise naming exposes the exact assumptions used by the theory and implementation.

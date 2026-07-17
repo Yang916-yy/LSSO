@@ -15,7 +15,7 @@ class _GroupedLSSOBase(nn.Module):
     ``num_relation_groups`` controls how many independent relation fields and
     small linear systems are built.  Content channels remain distinct: heads
     assigned to the same relation group are concatenated as multiple right-hand
-    sides of one Sylvester solve.
+    sides of one structured low-rank solve.
     """
 
     use_rank_rotary = False

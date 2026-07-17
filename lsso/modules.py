@@ -1027,7 +1027,7 @@ def lsso(
 
 class LSSO(nn.Module):
     """
-    LSSO v1: Learnable Sylvester Solve Operator.
+    LSSO v1: Learnable Structured Solve Operator.
 
     Per head:
         (mu I + gamma U U^T) Y = C

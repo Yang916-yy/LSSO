@@ -1,6 +1,6 @@
 # LSSO
 
-LSSO (Learnable Sylvester Solve Operator) is a bidirectional token mixer for
+LSSO (Learnable Structured Solve Operator) is a bidirectional token mixer for
 encoder models. The current project is focused on computer vision: replace
 self-attention in a standard ViT block while keeping the patch embedding, MLP,
 residual structure, and training recipe fixed.

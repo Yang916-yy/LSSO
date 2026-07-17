@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lsso-operator"
 version = "0.2.0.dev0"
-description = "Bidirectional low-rank Sylvester-solve token mixers for vision encoders."
+description = "Bidirectional low-rank structured-solve token mixers for vision encoders."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -15,7 +15,7 @@ authors = [
 keywords = [
     "pytorch",
     "token-mixer",
-    "sylvester",
+    "structured-optimization",
     "efficient-transformer",
     "computer-vision",
     "vision-transformer",
