@@ -145,22 +145,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="")
     parser.add_argument("--mixer", choices=("mha", "lsso", "rrlsso"), default="rrlsso")
     parser.add_argument("--max-length", type=int, default=0)
-    parser.add_argument("--dim", type=int, default=128)
+    parser.add_argument("--dim", type=int, default=192)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--rank", type=int, default=16)
+    parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--position-rank", type=int, default=16)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=128)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--eval-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-eval-samples", type=int, default=0)
@@ -225,7 +227,7 @@ def main() -> None:
         make_loader(
             dataset,
             batch_size=args.batch_size if index == 0 else args.eval_batch_size,
-            workers=args.workers,
+            workers=args.workers if index == 0 else args.eval_workers,
             device=device,
             collate_fn=collate_values,
             train=index == 0,
@@ -244,6 +246,7 @@ def main() -> None:
             lr=args.lr,
             weight_decay=args.weight_decay,
             warmup_ratio=args.warmup_ratio,
+            grad_accum=args.grad_accum,
             patience=args.patience,
             seed=args.seed,
             resume=args.resume,
@@ -267,6 +270,9 @@ def main() -> None:
             "batch_size": args.batch_size,
             "eval_batch_size": args.eval_batch_size,
             "workers": args.workers,
+            "eval_workers": args.eval_workers,
+            "grad_accum": args.grad_accum,
+            "effective_batch_size": args.batch_size * args.grad_accum,
             "max_train_samples": args.max_train_samples,
             "max_eval_samples": args.max_eval_samples,
             "split_sizes": {

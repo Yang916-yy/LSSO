@@ -4,6 +4,8 @@ import json
 import math
 import os
 import random
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
@@ -258,11 +260,13 @@ def make_loader(
     collate_fn,
     train: bool,
     seed: int,
+    persistent_workers: bool | None = None,
 ) -> DataLoader:
+    keep_workers = train if persistent_workers is None else persistent_workers
     kwargs = dict(
         num_workers=workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=workers > 0,
+        persistent_workers=workers > 0 and keep_workers,
         collate_fn=collate_fn,
     )
     lengths = getattr(dataset, "lengths", None)
@@ -285,6 +289,26 @@ def atomic_save(state: dict, path: Path) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(state, temporary)
     os.replace(temporary, path)
+
+
+def source_revision() -> dict[str, str | bool | None]:
+    """Return lightweight Git provenance without making Git a runtime requirement."""
+
+    root = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"], cwd=root, text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+        return {"git_commit": commit, "git_dirty": dirty}
+    except (OSError, subprocess.SubprocessError):
+        return {"git_commit": None, "git_dirty": None}
 
 
 def _rng_state() -> dict:
@@ -468,6 +492,8 @@ def train_classifier(
     run_config = {
         **metadata,
         **asdict(config),
+        "argv": list(sys.argv),
+        "source_revision": source_revision(),
         "parameters": parameter_breakdown["total"],
         "parameter_breakdown": parameter_breakdown,
     }
@@ -592,6 +618,7 @@ def train_classifier(
             "metrics": metrics,
             "rng": _rng_state(),
             "train_loader": _loader_state(train_loader),
+            "run_config": run_config,
         }
         atomic_save(state, last_path)
         if improved:

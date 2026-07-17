@@ -260,12 +260,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=0)
     parser.add_argument("--eval-batch-size", type=int, default=0)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--eval-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-eval-samples", type=int, default=0)
@@ -337,7 +339,7 @@ def main() -> None:
         make_loader(
             dataset,
             batch_size=batch_size if index == 0 else eval_batch_size,
-            workers=args.workers,
+            workers=args.workers if index == 0 else args.eval_workers,
             device=device,
             collate_fn=collate,
             train=index == 0,
@@ -355,6 +357,7 @@ def main() -> None:
             lr=args.lr,
             weight_decay=args.weight_decay,
             warmup_ratio=args.warmup_ratio,
+            grad_accum=args.grad_accum,
             patience=args.patience,
             seed=args.seed,
             resume=args.resume,
@@ -376,6 +379,9 @@ def main() -> None:
             "batch_size": batch_size,
             "eval_batch_size": eval_batch_size,
             "workers": args.workers,
+            "eval_workers": args.eval_workers,
+            "grad_accum": args.grad_accum,
+            "effective_batch_size": batch_size * args.grad_accum,
             "max_train_samples": args.max_train_samples,
             "max_eval_samples": args.max_eval_samples,
             "split_sizes": {

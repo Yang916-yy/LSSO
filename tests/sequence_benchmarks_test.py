@@ -424,6 +424,8 @@ def test_shared_trainer_writes_and_resumes_checkpoints(tmp_path: Path, monkeypat
         train=False,
         seed=0,
     )
+    assert train.persistent_workers is False  # workers=0 always disables persistence
+    assert evaluation.persistent_workers is False
     encoder = SequenceMixerEncoder(
         8, max_length=4, pad_token_id=0, dim=8, depth=1,
         num_heads=2, mixer="rrlsso", rank=4, dropout=0.0,
@@ -443,6 +445,9 @@ def test_shared_trainer_writes_and_resumes_checkpoints(tmp_path: Path, monkeypat
     assert (tmp_path / "run" / "last.pt").exists()
     assert (tmp_path / "run" / "best.pt").exists()
     assert (tmp_path / "run" / "test_metrics.json").exists()
+    state = torch.load(tmp_path / "run" / "last.pt", map_location="cpu", weights_only=False)
+    assert state["run_config"]["source_revision"]["git_commit"]
+    assert isinstance(state["run_config"]["argv"], list)
     # A completed one-epoch run can be loaded and evaluated without retraining.
     train_classifier(
         model,

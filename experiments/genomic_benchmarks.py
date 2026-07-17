@@ -290,6 +290,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--eval-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-eval-samples", type=int, default=0)
@@ -414,11 +415,11 @@ def main() -> None:
         collate_fn=collate, train=True, seed=args.seed,
     )
     validation_loader = make_loader(
-        validation, batch_size=args.eval_batch_size, workers=args.workers, device=device,
+        validation, batch_size=args.eval_batch_size, workers=args.eval_workers, device=device,
         collate_fn=collate, train=False, seed=args.seed,
     )
     test_loader = None if test is None else make_loader(
-        test, batch_size=args.eval_batch_size, workers=args.workers, device=device,
+        test, batch_size=args.eval_batch_size, workers=args.eval_workers, device=device,
         collate_fn=collate, train=False, seed=args.seed,
     )
     if args.evaluate_checkpoint:
@@ -495,6 +496,7 @@ def main() -> None:
             "effective_batch_size": args.batch_size * args.grad_accum,
             "eval_batch_size": args.eval_batch_size,
             "workers": args.workers,
+            "eval_workers": args.eval_workers,
             "max_train_samples": args.max_train_samples,
             "max_eval_samples": args.max_eval_samples,
             "split_sizes": {

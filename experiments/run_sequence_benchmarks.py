@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--uea-data-root", default="data/uea")
     parser.add_argument("--download-aan", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--eval-workers", type=int, default=0)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--rerun-complete", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
@@ -98,6 +100,10 @@ def command_for(args: argparse.Namespace, suite: str, dataset: str, mixer: str, 
         str(seed),
         "--workers",
         str(args.workers),
+        "--eval-workers",
+        str(args.eval_workers),
+        "--grad-accum",
+        str(args.grad_accum),
         "--output",
         str(output),
     ]
