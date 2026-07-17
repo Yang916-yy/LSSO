@@ -1,21 +1,44 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import torch
 
-
-_LOADED = False
-_LOAD_ATTEMPTED = False
-_LOAD_ERROR: Exception | None = None
+from .backends import _loader
 
 
-def _default_library_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "build" / "mathdx" / "lib" / "lsso_mathdx.so"
+_FUSED_BASE_RHS_WIDTH = 64
+_FUSED_WIDE_RHS_WIDTH = 192
+_FUSED_WIDE_MAX_SYSTEMS = 128
+_FUSED_WIDE_MAX_SEQUENCE = 256
+_MATHDX_SOLVE_RANK_BUCKETS = (16, 32, 48, 64)
 
 
-def load_mathdx_backend(path: str | os.PathLike[str] | None = None) -> bool:
+def _fused_rhs_shape_eligible(
+    systems: int,
+    sequence: int,
+    rhs_width: int,
+) -> bool:
+    """Shape policy for the CTA-local stats/solve/readout kernels.
+
+    The CUDA implementation can iterate over arbitrary 32-column RHS tiles,
+    but wide systems become cuBLAS-favorable once either the system grid or K
+    dimension is large. Keep the common <=64 path unchanged and only use the
+    96--192 fast path in its measured short/moderate-batch regime.
+    """
+    if rhs_width <= _FUSED_BASE_RHS_WIDTH:
+        return True
+    return (
+        rhs_width <= _FUSED_WIDE_RHS_WIDTH
+        and systems <= _FUSED_WIDE_MAX_SYSTEMS
+        and sequence <= _FUSED_WIDE_MAX_SEQUENCE
+    )
+
+
+def _mathdx_solve_rank_bucket(rank: int) -> int | None:
+    """Return the smallest native solve rank that contains ``rank``."""
+    return next((bucket for bucket in _MATHDX_SOLVE_RANK_BUCKETS if rank <= bucket), None)
+
+
+def load_mathdx_backend(path=None) -> bool:
     """Load the optional WSL/Linux MathDx operator library.
 
     The backend is deliberately not compiled during package import. Build it
@@ -23,47 +46,24 @@ def load_mathdx_backend(path: str | os.PathLike[str] | None = None) -> bool:
     library path with ``LSSO_MATHDX_LIBRARY``.
     """
 
-    global _LOADED, _LOAD_ATTEMPTED, _LOAD_ERROR
-    if _LOADED:
-        return True
-    if os.environ.get("LSSO_DISABLE_MATHDX", "0").lower() in {"1", "true", "yes"}:
-        _LOAD_ATTEMPTED = True
-        _LOAD_ERROR = RuntimeError("MathDx backend disabled by LSSO_DISABLE_MATHDX")
-        return False
-    if _LOAD_ATTEMPTED and path is None:
-        return False
-
-    library = Path(
-        path
-        or os.environ.get("LSSO_MATHDX_LIBRARY", "")
-        or _default_library_path()
-    )
-    _LOAD_ATTEMPTED = True
-    try:
-        torch.ops.load_library(str(library))
-    except Exception as exc:  # optional backend; callers choose fallback policy
-        _LOAD_ERROR = exc
-        return False
-    _LOADED = True
-    _LOAD_ERROR = None
-    return True
+    return _loader.load(path)
 
 
 def mathdx_load_error() -> Exception | None:
-    return _LOAD_ERROR
+    return _loader.load_error()
 
 
 def is_mathdx_available() -> bool:
     """Return whether the optional native backend can be loaded."""
 
-    return load_mathdx_backend()
+    return _loader.is_available()
 
 
 def solve_spd(gram: torch.Tensor, rhs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Solve FP32 batched SPD systems with device-side Cholesky/POTRS."""
 
     if not load_mathdx_backend():
-        raise RuntimeError(f"failed to load LSSO MathDx backend: {_LOAD_ERROR}")
+        raise RuntimeError(f"failed to load LSSO MathDx backend: {_loader.load_error()}")
     return torch.ops.lsso_mathdx.solve_spd(gram, rhs)
 
 
@@ -77,22 +77,33 @@ def solve_spd_bpb(
     if batches_per_block not in (1, 2, 4):
         raise ValueError("batches_per_block must be 1, 2, or 4")
     if not load_mathdx_backend():
-        raise RuntimeError(f"failed to load LSSO MathDx backend: {_LOAD_ERROR}")
+        raise RuntimeError(f"failed to load LSSO MathDx backend: {_loader.load_error()}")
     return torch.ops.lsso_mathdx.solve_spd_bpb(
         gram, rhs, batches_per_block
     )
 
 
 def solve_spd_or_torch(gram: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    """Use cuSolverDx when supported, otherwise preserve the PyTorch path."""
+    """Use an exact/native rank bucket, otherwise preserve the Torch path.
 
+    Padding ``G`` to ``diag(G, I)`` and ``rhs`` to ``[rhs; 0]`` leaves the
+    leading solution exactly equal to ``G^{-1} rhs``. This lets arbitrary
+    ranks up to 64 reuse four compiled MathDx solvers without approximation.
+    """
+
+    rank = gram.shape[-1] if gram.ndim == 3 else -1
+    bucket = _mathdx_solve_rank_bucket(rank)
     eligible = (
         gram.is_cuda
         and rhs.is_cuda
         and gram.dtype == torch.float32
         and rhs.dtype == torch.float32
         and gram.ndim == 3
-        and gram.shape[-1] in (16, 32)
+        and rhs.ndim == 3
+        and gram.shape[0] == rhs.shape[0]
+        and gram.shape[1] == rank
+        and rhs.shape[1] == rank
+        and bucket is not None
     )
     if eligible and load_mathdx_backend():
         solution, _info = torch.ops.lsso_mathdx.solve_spd(
@@ -140,7 +151,7 @@ def stats_solve_spd(
     """Fused mixed-input ``U.T@U``, ``U.T@C``, and FP32 SPD solve."""
 
     if not load_mathdx_backend():
-        raise RuntimeError(f"failed to load LSSO MathDx backend: {_LOAD_ERROR}")
+        raise RuntimeError(f"failed to load LSSO MathDx backend: {_loader.load_error()}")
     return torch.ops.lsso_mathdx.stats_solve_spd(
         u.contiguous(), c.contiguous(), alpha.contiguous()
     )
@@ -155,7 +166,7 @@ def stats_solve_readout(
     """Fuse compact statistics, FP32 solve, and the Woodbury readout."""
 
     if not load_mathdx_backend():
-        raise RuntimeError(f"failed to load LSSO MathDx backend: {_LOAD_ERROR}")
+        raise RuntimeError(f"failed to load LSSO MathDx backend: {_loader.load_error()}")
     return torch.ops.lsso_mathdx.stats_solve_readout(
         u.contiguous(), c.contiguous(), alpha.contiguous(), inv_mu.contiguous()
     )
@@ -188,7 +199,7 @@ def try_stats_solve_spd(
         and alpha.ndim == 1
         and u.shape[2] in (16, 32)
         and u.shape[1] <= max_sequence
-        and c.shape[2] <= 64
+        and _fused_rhs_shape_eligible(u.shape[0], u.shape[1], c.shape[2])
     )
     if not eligible or not load_mathdx_backend():
         return None
@@ -231,7 +242,7 @@ def try_stats_solve_readout(
         and alpha.shape[0] == inv_mu.shape[0] == u.shape[0]
         and u.shape[2] in (16, 32)
         and u.shape[1] <= max_sequence
-        and c.shape[2] <= 64
+        and _fused_rhs_shape_eligible(u.shape[0], u.shape[1], c.shape[2])
     )
     if not eligible or not load_mathdx_backend():
         return None
@@ -305,7 +316,9 @@ def try_masked_stats_solve_spd(
         and alpha.shape[0] == u.shape[0] * u.shape[1]
         and u.shape[3] in (16, 32)
         and (max_sequence is None or u.shape[2] <= max_sequence)
-        and c.shape[3] <= 64
+        and _fused_rhs_shape_eligible(
+            u.shape[0] * u.shape[1], u.shape[2], c.shape[3]
+        )
     )
     if not eligible or not load_mathdx_backend():
         return None
@@ -370,7 +383,9 @@ def try_masked_stats_solve_readout(
         and alpha.shape[0] == inv_mu.shape[0] == u.shape[0] * u.shape[1]
         and u.shape[3] in (16, 32)
         and (max_sequence is None or u.shape[2] <= max_sequence)
-        and c.shape[3] <= 64
+        and _fused_rhs_shape_eligible(
+            u.shape[0] * u.shape[1], u.shape[2], c.shape[3]
+        )
     )
     if not eligible or not load_mathdx_backend():
         return None

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,39 +13,7 @@ from .mathdx_backend import (
     try_stats_solve_readout,
     try_stats_solve_spd,
 )
-
-
-@dataclass
-class LSSODiagnostics:
-    gamma_over_mu: torch.Tensor
-    effective_rank: torch.Tensor
-    correction_ratio: torch.Tensor
-
-
-@dataclass
-class LSSOAux:
-    UtU: torch.Tensor | None
-    local: torch.Tensor
-    correction: torch.Tensor
-    mu: torch.Tensor
-    gamma: torch.Tensor
-
-
-@dataclass
-class SolveStateCache:
-    """Compressed low-rank solve state.
-
-    The cache stores only aggregate low-rank statistics:
-
-        S = sum U_i^T U_i
-        P = sum U_i^T C_i
-
-    For RRLSSO, apply the rank rotary transform to ``U`` before updating the state.
-    """
-
-    S: torch.Tensor
-    P: torch.Tensor
-    length: int | torch.Tensor = 0
+from .types import LSSOAux, LSSODiagnostics, SolveStateCache
 
 
 def _solve_dtype(*tensors: torch.Tensor) -> torch.dtype:
@@ -649,19 +615,23 @@ class _LSSOAutograd(torch.autograd.Function):
             N >= _SPLIT_BACKWARD_MIN_SEQUENCE
             and B * H <= _SPLIT_BACKWARD_MAX_SYSTEMS
         )
-        YtU, PtU, grad_mu_flat = _backward_compact_statistics(
-            U_m,
-            Y_m,
-            P_m,
-            split_n=split_n,
-            chunk_size=_SPLIT_BACKWARD_CHUNK_SIZE,
-        )
-        YtU_readout = YtU.to(matmul_dtype)
-        PtU_readout = PtU.to(matmul_dtype)
-        grad_U_m = torch.bmm(P_m, YtU_readout)
-        # Accumulate the symmetric second term in the GEMM epilogue.  This
-        # avoids materializing another [B * H, N, r] tensor in backward.
-        grad_U_m.baddbmm_(Y_m, PtU_readout)
+        # A custom autograd backward inherits the caller's autocast state.
+        # Disable it here so FP32 fallback statistics cannot produce a BF16
+        # bmm output and then fail an in-place FP32 baddbmm epilogue.
+        with torch.autocast(device_type=U.device.type, enabled=False):
+            YtU, PtU, grad_mu_flat = _backward_compact_statistics(
+                U_m,
+                Y_m,
+                P_m,
+                split_n=split_n,
+                chunk_size=_SPLIT_BACKWARD_CHUNK_SIZE,
+            )
+            YtU_readout = YtU.to(matmul_dtype)
+            PtU_readout = PtU.to(matmul_dtype)
+            grad_U_m = torch.bmm(P_m, YtU_readout)
+            # Accumulate the symmetric second term in the GEMM epilogue.  This
+            # avoids materializing another [B * H, N, r] tensor in backward.
+            grad_U_m.baddbmm_(Y_m, PtU_readout)
         grad_U_m.mul_(gamma.expand(B, H, 1, 1).to(matmul_dtype).reshape(B * H, 1, 1))
         grad_U = grad_U_m.neg_().view(B, H, N, r).to(U.dtype)
 
@@ -846,17 +816,18 @@ class _MaskedLSSOAutograd(torch.autograd.Function):
             N >= _SPLIT_BACKWARD_MIN_SEQUENCE
             and B * H <= _SPLIT_BACKWARD_MAX_SYSTEMS
         )
-        YtU, PtU, grad_mu_flat = _backward_compact_statistics(
-            U_m,
-            Y_m,
-            P_m,
-            split_n=split_n,
-            chunk_size=_SPLIT_BACKWARD_CHUNK_SIZE,
-        )
-        YtU_readout = YtU.to(matmul_dtype)
-        PtU_readout = PtU.to(matmul_dtype)
-        grad_U_m = torch.bmm(P_m, YtU_readout)
-        grad_U_m.baddbmm_(Y_m, PtU_readout)
+        with torch.autocast(device_type=U.device.type, enabled=False):
+            YtU, PtU, grad_mu_flat = _backward_compact_statistics(
+                U_m,
+                Y_m,
+                P_m,
+                split_n=split_n,
+                chunk_size=_SPLIT_BACKWARD_CHUNK_SIZE,
+            )
+            YtU_readout = YtU.to(matmul_dtype)
+            PtU_readout = PtU.to(matmul_dtype)
+            grad_U_m = torch.bmm(P_m, YtU_readout)
+            grad_U_m.baddbmm_(Y_m, PtU_readout)
         scale2 = length_scale.square()[:, None].expand(B, H).reshape(B * H, 1, 1)
         coeff = gamma.expand(B, H, 1, 1).reshape(B * H, 1, 1) * scale2
         grad_U = grad_U_m.mul_(coeff.to(matmul_dtype)).neg_().view(B, H, N, r)

@@ -279,12 +279,14 @@ def test_masked_cuda_bfloat16_matches_cropped_prefix(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("padding_ratio_hint", [0.1, 0.9])
+@pytest.mark.parametrize("width", [32, 96, 192])
+@pytest.mark.parametrize("rank", [16, 40, 48, 64])
 def test_masked_cuda_nan_padding_cannot_leak_through_forward_or_backward(
-    padding_ratio_hint: float,
+    padding_ratio_hint: float, width: int, rank: int
 ) -> None:
     """Exercise the complete fused readout/backward path with poisoned padding."""
     torch.manual_seed(1708)
-    B, H, N, rank, width = 2, 2, 65, 16, 32
+    B, H, N = 2, 2, 65
     mask = torch.tensor(
         [[True] * N, [True] * 7 + [False] * (N - 7)], device="cuda"
     )
@@ -316,6 +318,56 @@ def test_masked_cuda_nan_padding_cannot_leak_through_forward_or_backward(
     assert torch.isfinite(u.grad).all() and torch.isfinite(c.grad).all()
     assert torch.count_nonzero(u.grad.masked_select(padding_u.expand_as(u.grad))) == 0
     assert torch.count_nonzero(c.grad.masked_select(padding_y)) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rank", [40, 48, 64])
+def test_rrlsso_bucketed_rank_wide_head_complete_module_forward_backward(
+    rank: int,
+) -> None:
+    torch.manual_seed(1710)
+    dim, heads, sequence = 384, 4, 33
+    layer = RRLSSO(
+        dim=dim,
+        num_heads=heads,
+        rank=rank,
+        bias=True,
+        length_normalize=True,
+    ).cuda().to(torch.bfloat16)
+    x = torch.randn(
+        2, sequence, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    mask = torch.tensor(
+        [[True] * sequence, [True] * 11 + [False] * (sequence - 11)],
+        device="cuda",
+    )
+    output = layer(x, valid_mask=mask, padding_ratio_hint=0.5)
+    assert output.shape == x.shape
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output[1, 11:]) == 0
+    output.float().square().mean().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad[1, 11:]) == 0
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in layer.parameters()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_long_masked_backward_fallback_is_safe_inside_bfloat16_autocast() -> None:
+    """The N>512 fallback must not inherit autocast for FP32 baddbmm."""
+    torch.manual_seed(1711)
+    layer = RRLSSO(dim=64, num_heads=2, rank=16).cuda().train()
+    x = torch.randn(2, 513, 64, device="cuda", requires_grad=True)
+    mask = torch.ones(2, 513, device="cuda", dtype=torch.bool)
+    mask[1, 400:] = False
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = layer(x, valid_mask=mask, padding_ratio_hint=0.1)
+        loss = output.float().square().mean()
+    loss.backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad[1, 400:]) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

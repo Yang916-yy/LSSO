@@ -1065,6 +1065,7 @@ __global__ void solve_spd_kernel(
     float* __restrict__ solution,
     int* __restrict__ info,
     int64_t batches,
+    int64_t input_rank,
     int64_t rhs_width) {
     using Traits = SolverTraits<Rank, RhsTile, Arch, BatchesPerBlock>;
     using Potrf = typename Traits::Potrf;
@@ -1095,7 +1096,9 @@ __global__ void solve_spd_kernel(
         const int col = matrix_linear - row * Rank;
         const int64_t batch = batch_base + local_batch;
         a[local_batch * a_elements + row * lda + col] =
-            gram[batch * Rank * Rank + matrix_linear];
+            row < input_rank && col < input_rank
+            ? gram[batch * input_rank * input_rank + row * input_rank + col]
+            : (row == col ? 1.0f : 0.0f);
     }
     __syncthreads();
 
@@ -1112,8 +1115,9 @@ __global__ void solve_spd_kernel(
             const int col = tile_linear - row * RhsTile;
             const int64_t global_col = rhs_start + col;
             const int64_t batch = batch_base + local_batch;
-            b[local_batch * Rank * ldb + row * ldb + col] = global_col < rhs_width
-                ? rhs[batch * Rank * rhs_width + row * rhs_width + global_col]
+            b[local_batch * Rank * ldb + row * ldb + col] =
+                row < input_rank && global_col < rhs_width
+                ? rhs[batch * input_rank * rhs_width + row * rhs_width + global_col]
                 : 0.0f;
         }
         __syncthreads();
@@ -1129,9 +1133,9 @@ __global__ void solve_spd_kernel(
             const int row = tile_linear / RhsTile;
             const int col = tile_linear - row * RhsTile;
             const int64_t global_col = rhs_start + col;
-            if (global_col < rhs_width) {
+            if (row < input_rank && global_col < rhs_width) {
                 const int64_t batch = batch_base + local_batch;
-                solution[batch * Rank * rhs_width + row * rhs_width + global_col] =
+                solution[batch * input_rank * rhs_width + row * rhs_width + global_col] =
                     b[local_batch * Rank * ldb + row * ldb + col];
             }
         }
@@ -1175,6 +1179,7 @@ void launch_solve_typed(
         solution.mutable_data_ptr<float>(),
         info.mutable_data_ptr<int>(),
         batches,
+        gram.size(1),
         rhs.size(2));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -1188,26 +1193,37 @@ void launch_solve(
     cudaStream_t stream,
     int requested_batches_per_block = 0) {
     const int64_t batches = gram.size(0);
-    // BPB=2/4 is architecture and shape dependent. Auto remains the safe
-    // one-system-per-CTA policy; an offline benchmark can install an
-    // architecture-specific choice through LSSO_MATHDX_BATCHES_PER_BLOCK.
-    if (requested_batches_per_block == 0) {
-        if (const char* mode = std::getenv("LSSO_MATHDX_BATCHES_PER_BLOCK")) {
-            const int configured = std::atoi(mode);
-            if (configured == 1 || configured == 2 || configured == 4) {
-                requested_batches_per_block = configured;
-            }
-        }
-    }
-    if (requested_batches_per_block == 4 && batches % 4 == 0) {
-        launch_solve_typed<Rank, Arch, 4>(
-            gram, rhs, solution, info, stream);
-    } else if (requested_batches_per_block == 2 && batches % 2 == 0) {
-        launch_solve_typed<Rank, Arch, 2>(
-            gram, rhs, solution, info, stream);
-    } else {
+    if constexpr (Rank >= 48) {
+        // A 48/64-square factor plus one rank-by-32 RHS tile already provides enough
+        // work and shared-memory pressure for a CTA. Avoid instantiating or
+        // launching BPB=2/4 variants, especially on 100-KiB SM86/89/120.
+        TORCH_CHECK(
+            requested_batches_per_block == 0 || requested_batches_per_block == 1,
+            "rank-48/64 MathDx solve supports batches_per_block=1 only");
         launch_solve_typed<Rank, Arch, 1>(
             gram, rhs, solution, info, stream);
+    } else {
+        // BPB=2/4 is architecture and shape dependent. Auto remains the safe
+        // one-system-per-CTA policy; an offline benchmark can install an
+        // architecture-specific choice through LSSO_MATHDX_BATCHES_PER_BLOCK.
+        if (requested_batches_per_block == 0) {
+            if (const char* mode = std::getenv("LSSO_MATHDX_BATCHES_PER_BLOCK")) {
+                const int configured = std::atoi(mode);
+                if (configured == 1 || configured == 2 || configured == 4) {
+                    requested_batches_per_block = configured;
+                }
+            }
+        }
+        if (requested_batches_per_block == 4 && batches % 4 == 0) {
+            launch_solve_typed<Rank, Arch, 4>(
+                gram, rhs, solution, info, stream);
+        } else if (requested_batches_per_block == 2 && batches % 2 == 0) {
+            launch_solve_typed<Rank, Arch, 2>(
+                gram, rhs, solution, info, stream);
+        } else {
+            launch_solve_typed<Rank, Arch, 1>(
+                gram, rhs, solution, info, stream);
+        }
     }
 }
 
@@ -1219,14 +1235,21 @@ void dispatch_rank(
     at::Tensor& info,
     cudaStream_t stream,
     int requested_batches_per_block = 0) {
-    if (gram.size(1) == 16) {
+    if (gram.size(1) <= 16) {
         launch_solve<16, Arch>(gram, rhs, solution, info, stream,
                                requested_batches_per_block);
-    } else if (gram.size(1) == 32) {
+    } else if (gram.size(1) <= 32) {
         launch_solve<32, Arch>(gram, rhs, solution, info, stream,
                                requested_batches_per_block);
+    } else if (gram.size(1) <= 48) {
+        launch_solve<48, Arch>(gram, rhs, solution, info, stream,
+                               requested_batches_per_block);
+    } else if (gram.size(1) <= 64) {
+        launch_solve<64, Arch>(gram, rhs, solution, info, stream,
+                               requested_batches_per_block);
     } else {
-        TORCH_CHECK(false, "MathDx backend supports rank 16 or 32, got ", gram.size(1));
+        TORCH_CHECK(false, "MathDx backend supports bucketed ranks 1 through 64, got ",
+                    gram.size(1));
     }
 }
 
@@ -1483,7 +1506,9 @@ std::tuple<at::Tensor, at::Tensor> solve_spd_impl(
     TORCH_CHECK(gram.size(0) == rhs.size(0), "gram and rhs batch dimensions differ");
     TORCH_CHECK(gram.size(1) == gram.size(2), "gram must be square");
     TORCH_CHECK(gram.size(1) == rhs.size(1), "gram rank and rhs rank differ");
-    TORCH_CHECK(gram.size(0) > 0 && rhs.size(2) > 0, "empty batches/RHS are unsupported");
+    TORCH_CHECK(
+        gram.size(0) > 0 && gram.size(1) > 0 && rhs.size(2) > 0,
+        "empty batches/ranks/RHS are unsupported");
     TORCH_CHECK(gram.get_device() == rhs.get_device(), "gram and rhs must be on the same GPU");
     TORCH_CHECK(
         requested_batches_per_block == 0 || requested_batches_per_block == 1 ||

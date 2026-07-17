@@ -7,12 +7,15 @@ from lsso.mathdx_backend import (
     load_mathdx_backend,
     mathdx_load_error,
     solve_spd,
+    solve_spd_autograd,
     solve_spd_bpb,
+    solve_spd_or_torch,
     stats_solve_readout,
     stats_solve_spd,
     try_lsso_backward_fused,
     try_masked_stats_solve_readout,
     try_masked_stats_solve_spd,
+    try_stats_solve_readout,
     try_prepare_basis,
     try_rank_rotary,
 )
@@ -37,7 +40,7 @@ from lsso.modules_v2 import apply_rank_rotary
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rank", [16, 32])
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
 @pytest.mark.parametrize("rhs_width", [1, 32, 64, 192])
 def test_mathdx_solve_spd_matches_torch(rank: int, rhs_width: int) -> None:
     if not load_mathdx_backend():
@@ -79,6 +82,70 @@ def test_mathdx_multi_system_cholesky_matches_torch(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rank", [48, 64])
+def test_mathdx_large_rank_rejects_multi_system_cta_schedule(rank: int) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+    gram = torch.eye(rank, device="cuda").expand(4, rank, rank).contiguous()
+    rhs = torch.randn(4, rank, 32, device="cuda")
+    with pytest.raises(RuntimeError, match="rank-48/64.*batches_per_block=1"):
+        solve_spd_bpb(gram, rhs, 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rank", [1, 7, 15, 17, 24, 31, 33, 40, 47, 49, 56, 63])
+def test_mathdx_arbitrary_rank_bucket_matches_torch(rank: int) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+    torch.manual_seed(1000 + rank)
+    a = torch.randn(5, rank, rank, device="cuda")
+    gram = a @ a.transpose(1, 2) + 0.5 * torch.eye(rank, device="cuda")
+    rhs = torch.randn(5, rank, 19, device="cuda")
+    with torch.no_grad():
+        actual = solve_spd_or_torch(gram, rhs)
+        expected = torch.linalg.solve(gram, rhs)
+    torch.testing.assert_close(actual, expected, rtol=5e-4, atol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rank", [7, 24, 40, 56])
+def test_mathdx_arbitrary_rank_bucket_autograd_matches_torch(rank: int) -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+    torch.manual_seed(2000 + rank)
+    a = torch.randn(3, rank, rank, device="cuda")
+    gram_value = a @ a.transpose(1, 2) + torch.eye(rank, device="cuda")
+    rhs_value = torch.randn(3, rank, 11, device="cuda")
+    probe = torch.randn_like(rhs_value)
+
+    gram = gram_value.detach().requires_grad_()
+    rhs = rhs_value.detach().requires_grad_()
+    actual = solve_spd_autograd(gram, rhs)
+    actual_grads = torch.autograd.grad((actual * probe).sum(), (gram, rhs))
+
+    gram_ref = gram_value.detach().requires_grad_()
+    rhs_ref = rhs_value.detach().requires_grad_()
+    expected = torch.linalg.solve(gram_ref, rhs_ref)
+    expected_grads = torch.autograd.grad(
+        (expected * probe).sum(), (gram_ref, rhs_ref)
+    )
+    torch.testing.assert_close(actual, expected, rtol=5e-4, atol=5e-4)
+    for value, reference in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(value, reference, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_rank_above_largest_bucket_uses_torch_fallback() -> None:
+    rank = 65
+    a = torch.randn(2, rank, rank, device="cuda")
+    gram = a @ a.transpose(1, 2) + torch.eye(rank, device="cuda")
+    rhs = torch.randn(2, rank, 9, device="cuda")
+    actual = solve_spd_or_torch(gram, rhs)
+    expected = torch.linalg.solve(gram, rhs)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
     ("rank", "sequence", "rhs_width"),
     [(16, 65, 64), (16, 196, 192), (32, 65, 64), (32, 196, 192)],
@@ -109,7 +176,7 @@ def test_mathdx_fused_stats_solve_matches_torch(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("rank", [16, 32])
-@pytest.mark.parametrize("rhs_width", [48, 64])
+@pytest.mark.parametrize("rhs_width", [48, 64, 96, 128, 192])
 def test_mathdx_stats_solve_readout_matches_torch(
     dtype: torch.dtype, rank: int, rhs_width: int
 ) -> None:
@@ -143,14 +210,15 @@ def test_mathdx_stats_solve_readout_matches_torch(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("rank", [16, 32])
+@pytest.mark.parametrize("rhs_width", [48, 96, 192])
 def test_mathdx_masked_stats_skips_padding_and_matches_torch(
-    dtype: torch.dtype, rank: int
+    dtype: torch.dtype, rank: int, rhs_width: int
 ) -> None:
     if not load_mathdx_backend():
         pytest.skip(str(mathdx_load_error()))
 
     torch.manual_seed(7)
-    B, H, N, dh = 3, 4, 129, 48
+    B, H, N, dh = 3, 4, 129, rhs_width
     u = (0.2 * torch.randn(B, H, N, rank, device="cuda")).to(dtype)
     c = torch.randn(B, H, N, dh, device="cuda").to(dtype)
     lengths = torch.tensor([129, 67, 13], device="cuda")
@@ -342,12 +410,15 @@ def test_mathdx_fused_basis_preparation_matches_torch(rotary: bool) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_masked_fused_readout_is_padding_safe(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("width", [48, 96, 192])
+def test_masked_fused_readout_is_padding_safe(
+    dtype: torch.dtype, width: int
+) -> None:
     if not load_mathdx_backend():
         pytest.skip(str(mathdx_load_error()))
 
     torch.manual_seed(91)
-    B, H, N, rank, width = 3, 2, 97, 16, 48
+    B, H, N, rank = 3, 2, 97, 16
     lengths = torch.tensor([97, 51, 7], device="cuda")
     mask = torch.arange(N, device="cuda")[None, :] < lengths[:, None]
     scale = torch.sqrt(torch.tensor(float(N), device="cuda") / lengths.float())
@@ -456,3 +527,30 @@ def test_fused_backward_respects_sequence_dispatch_cap() -> None:
         assert try_lsso_backward_fused(
             u, y, p, gamma, max_sequence=None
         ) is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_wide_rhs_forward_dispatch_policy() -> None:
+    if not load_mathdx_backend():
+        pytest.skip(str(mathdx_load_error()))
+
+    def attempt(systems: int, sequence: int, width: int):
+        u = torch.randn(
+            systems, sequence, 16, device="cuda", dtype=torch.bfloat16
+        )
+        c = torch.randn(
+            systems, sequence, width, device="cuda", dtype=torch.bfloat16
+        )
+        alpha = torch.full((systems,), 0.01, device="cuda")
+        inv_mu = torch.ones(systems, device="cuda")
+        with torch.no_grad():
+            return try_stats_solve_readout(u, c, alpha, inv_mu)
+
+    assert attempt(8, 197, 96) is not None
+    assert attempt(8, 197, 128) is not None
+    assert attempt(8, 197, 192) is not None
+    assert attempt(8, 197, 256) is None
+    assert attempt(129, 197, 96) is None
+    assert attempt(8, 257, 96) is None
+    # The established <=64 path keeps its original, less restrictive policy.
+    assert attempt(129, 257, 64) is not None
