@@ -258,9 +258,24 @@ python experiments/run_sequence_benchmarks.py --suite genomic --dry-run
 
 ## LRA data layout
 
-The original Google Cloud `lra_release.gz` link currently returns HTTP 403,
-so the code does not silently substitute a different dataset. Put the official
-or S4-compatible extracted data under `data/lra`:
+The original Google Cloud `lra_release.gz` link currently returns HTTP 403.
+The reproducible fallback uses the version-pinned Kaggle community mirror
+`a24998667/long-range-arena/versions/1` only for the two missing raw sources:
+ListOps and Pathfinder. It does not use the much larger processed-pickle
+repack. Download and audit it with:
+
+```bash
+pip install -e ".[sequence]"
+python tools/prepare_lra_data.py --data-root data/lra
+```
+
+The audit requires the official split sizes, checks all Pathfinder metadata
+references, hashes each ListOps split and the combined Pathfinder metadata,
+and writes `data/lra/source-manifest.json`. The downloaded data remains under
+the git-ignored `data/lra/_kaggle` tree and is never redistributed by this
+repository. If Kaggle requests authentication, set `KAGGLE_API_TOKEN` or use
+`kagglehub.login()` once. Existing official or S4-compatible data is still
+accepted under the original layout:
 
 ```text
 data/lra/
@@ -276,8 +291,16 @@ data/lra/
 ```
 
 IMDB is downloaded automatically. AAN may be fetched from the OpenNLPLab
-mirror with `--download-aan`; ListOps and Pathfinder remain explicit local
-inputs so their provenance stays auditable. Tokenized ListOps, IMDB, and AAN
+mirror with `--download-aan`. The four-task run can prepare both fallback
+sources automatically:
+
+```bash
+python experiments/run_sequence_benchmarks.py --suite lra \
+  --download-lra --download-aan --seeds 0
+```
+
+For a formal run, execute `tools/prepare_lra_data.py` first so integrity is
+checked before GPU time is consumed. Tokenized ListOps, IMDB, and AAN
 are written once as memory-mapped `uint16` caches under `data/lra_cache`.
 Every cache has a manifest containing its source identity, split, vocabulary
 fingerprint, preprocessing schema, and maximum length. A mismatch invalidates

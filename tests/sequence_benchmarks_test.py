@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -35,11 +36,15 @@ from experiments.sequence_benchmarks.common import (
 )
 from experiments.run_rrlsso_dna_program import choose_with_margin
 from experiments.sequence_benchmarks.lra_data import (
+    KAGGLE_LRA_HANDLE,
     CharacterVocabulary,
     PathfinderDataset,
     build_packed_pairs,
     build_packed_tokens,
+    download_kaggle_lra,
     iter_listops,
+    resolve_listops_files,
+    resolve_pathfinder_directory,
 )
 from experiments.uea_benchmark import UEACollectionDataset, fit_channel_normalizer
 from experiments.summarize_sequence_benchmarks import aggregate, average_ranks
@@ -218,6 +223,40 @@ def test_listops_vocabulary_and_memory_mapped_cache(tmp_path: Path):
     )
     assert len(pairs) == 2
     assert pairs[1][2] == 0
+
+
+def test_kaggle_lra_mirror_layout_resolves_without_copying_large_files(tmp_path: Path):
+    listops = tmp_path / "_kaggle" / "listops" / "listops"
+    listops.mkdir(parents=True)
+    for split in ("train", "val", "test"):
+        (listops / f"{split}.tsv").write_text("Source\tTarget\n[ MAX 1 2 ]\t2\n")
+    files = resolve_listops_files(tmp_path)
+    assert files["train"] == listops / "train.tsv"
+
+    pathfinder = (
+        tmp_path / "_kaggle" / "pathfinder" / "pathfinder" / "pathfinder32"
+    )
+    pathfinder.mkdir(parents=True)
+    assert resolve_pathfinder_directory(tmp_path, 32) == pathfinder
+
+
+def test_kaggle_lra_download_is_version_pinned_and_writes_source_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls = []
+
+    class FakeKaggleHub:
+        @staticmethod
+        def dataset_download(handle, **kwargs):
+            calls.append((handle, kwargs))
+            return kwargs["output_dir"]
+
+    monkeypatch.setitem(__import__("sys").modules, "kagglehub", FakeKaggleHub)
+    resolved = download_kaggle_lra(tmp_path)
+    assert resolved == tmp_path / "_kaggle"
+    assert calls[0][0] == KAGGLE_LRA_HANDLE
+    manifest = json.loads((resolved / ".lsso-source.json").read_text())
+    assert manifest["handle"] == KAGGLE_LRA_HANDLE
 
 
 def test_packed_cache_manifest_invalidates_stale_tokens(tmp_path: Path):

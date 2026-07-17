@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lra-cache", default="data/lra_cache")
     parser.add_argument("--uea-data-root", default="data/uea")
     parser.add_argument("--download-aan", action="store_true")
+    parser.add_argument("--download-lra", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--eval-workers", type=int, default=0)
     parser.add_argument("--grad-accum", type=int, default=1)
@@ -122,6 +123,8 @@ def command_for(args: argparse.Namespace, suite: str, dataset: str, mixer: str, 
         ]
         if args.download_aan:
             command.append("--download-aan")
+        if args.download_lra and dataset in {"listops", "pathfinder"}:
+            command.append("--download-lra")
     else:
         command += ["--dataset", dataset, "--data-root", args.uea_data_root]
     extra = list(args.extra)

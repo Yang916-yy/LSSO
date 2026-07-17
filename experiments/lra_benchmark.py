@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import random
 import sys
 from itertools import chain
@@ -38,8 +39,11 @@ from experiments.sequence_benchmarks.lra_data import (
     PathfinderDataset,
     build_packed_pairs,
     build_packed_tokens,
+    download_kaggle_lra,
     iter_aan,
     iter_listops,
+    resolve_listops_files,
+    resolve_pathfinder_directory,
     source_signature,
 )
 
@@ -50,6 +54,26 @@ TASK_DEFAULTS = {
     "retrieval": {"max_length": 4000, "epochs": 20, "batch_size": 64, "classes": 2},
     "pathfinder": {"max_length": 1024, "epochs": 200, "batch_size": 64, "classes": 2},
 }
+
+
+def _data_source_identity(task: str, data_root: Path) -> dict[str, object]:
+    if task == "text":
+        return {"repository": "stanfordnlp/imdb", "transport": "huggingface-datasets"}
+    if task == "retrieval":
+        return {"repository": "OpenNLPLab/lra", "subset": "data/aan"}
+    manifest_path = data_root / "source-manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        key = "listops" if task == "listops" else "pathfinder32_hard"
+        return {
+            "community_mirror": manifest.get("community_mirror"),
+            "upstream_definition": manifest.get("upstream_definition"),
+            "audit": manifest.get(key),
+        }
+    return {
+        "repository": "explicit-local-input",
+        "upstream_definition": "google-research/long-range-arena@cd31e5c6",
+    }
 
 
 def _limit(dataset, count: int, seed: int):
@@ -84,8 +108,7 @@ def _load_or_build_vocab(path: Path, builder) -> CharacterVocabulary:
 
 
 def prepare_listops(data_root: Path, cache_root: Path, max_length: int):
-    source = _find_directory(data_root, ("listops", "listops-1000"))
-    files = {split: source / f"basic_{split}.tsv" for split in ("train", "val", "test")}
+    files = resolve_listops_files(data_root)
     for path in files.values():
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -221,10 +244,7 @@ def prepare_retrieval(
 
 
 def prepare_pathfinder(data_root: Path, resolution: int, seed: int):
-    source = _find_directory(
-        data_root,
-        (f"pathfinder/pathfinder{resolution}", f"pathfinder{resolution}"),
-    )
+    source = resolve_pathfinder_directory(data_root, resolution)
     full = PathfinderDataset(source)
     generator = torch.Generator().manual_seed(seed)
     order = torch.randperm(len(full), generator=generator).tolist()
@@ -242,6 +262,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="data/lra")
     parser.add_argument("--cache-dir", default="data/lra_cache")
     parser.add_argument("--download-aan", action="store_true")
+    parser.add_argument(
+        "--download-lra",
+        action="store_true",
+        help="download pinned Kaggle mirror v1 for missing ListOps/Pathfinder data",
+    )
     parser.add_argument("--pathfinder-resolution", type=int, default=32)
     parser.add_argument(
         "--split-seed", type=int, default=0,
@@ -288,6 +313,8 @@ def main() -> None:
     eval_batch_size = args.eval_batch_size or batch_size
     output = args.output or f"runs/sequence/lra-{args.task}-{args.mixer}-s{args.seed}"
     data_root, cache_root = Path(args.data_root), Path(args.cache_dir)
+    if args.download_lra and args.task in {"listops", "pathfinder"}:
+        download_kaggle_lra(data_root)
     pair_task = False
     if args.task == "listops":
         train, validation, test, vocabulary = prepare_listops(data_root, cache_root, max_length)
@@ -391,6 +418,7 @@ def main() -> None:
             },
             "protocol": "native-pytorch-reported-baseline",
             "data_definition": "google-research/long-range-arena@cd31e5c6",
+            "data_source": _data_source_identity(args.task, data_root),
             "split_seed": args.split_seed,
         },
     )

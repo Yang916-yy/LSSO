@@ -1,14 +1,90 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+KAGGLE_LRA_HANDLE = "a24998667/long-range-arena/versions/1"
+
+LISTOPS_DIRECTORIES = (
+    "listops",
+    "listops-1000",
+    "listops/listops",
+    "_kaggle/listops/listops",
+)
+
+
+def resolve_listops_files(data_root: Path) -> dict[str, Path]:
+    for relative in LISTOPS_DIRECTORIES:
+        source = data_root / relative
+        if not source.is_dir():
+            continue
+        for names in (
+            {split: f"basic_{split}.tsv" for split in ("train", "val", "test")},
+            {split: f"{split}.tsv" for split in ("train", "val", "test")},
+        ):
+            files = {split: source / name for split, name in names.items()}
+            if all(path.is_file() for path in files.values()):
+                return files
+    searched = [str(data_root / relative) for relative in LISTOPS_DIRECTORIES]
+    raise FileNotFoundError(f"no complete ListOps split found under {searched}")
+
+
+def resolve_pathfinder_directory(data_root: Path, resolution: int) -> Path:
+    alternatives = (
+        f"pathfinder/pathfinder{resolution}",
+        f"pathfinder{resolution}",
+        f"pathfinder/pathfinder/pathfinder{resolution}",
+        f"_kaggle/pathfinder/pathfinder/pathfinder{resolution}",
+    )
+    for relative in alternatives:
+        candidate = data_root / relative
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"no Pathfinder-{resolution} directory found under "
+        f"{[str(data_root / relative) for relative in alternatives]}"
+    )
+
+
+def download_kaggle_lra(data_root: Path, force: bool = False) -> Path:
+    """Download the pinned community mirror without adding data to this repository."""
+    try:
+        import kagglehub
+    except ImportError as error:
+        raise RuntimeError(
+            "install the sequence extra to download the Kaggle LRA mirror"
+        ) from error
+
+    target = data_root / "_kaggle"
+    target.mkdir(parents=True, exist_ok=True)
+    resolved = Path(
+        kagglehub.dataset_download(
+            KAGGLE_LRA_HANDLE,
+            output_dir=str(target),
+            force_download=force,
+        )
+    )
+    manifest = {
+        "schema": 1,
+        "source": "kaggle-community-mirror",
+        "handle": KAGGLE_LRA_HANDLE,
+        "upstream_definition": "google-research/long-range-arena@cd31e5c6",
+        "resolved_path": str(resolved.resolve()),
+        "prepared_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    (target / ".lsso-source.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return resolved
 
 
 class CharacterVocabulary:
