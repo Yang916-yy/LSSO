@@ -367,7 +367,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--local-wds-dir",
         default="",
-        help="Local ImageNet shards made by tools/kaggle_imagenet_to_wds.py.",
+        help=(
+            "Optional local WebDataset directory prepared from data you are "
+            "authorized to access and process."
+        ),
     )
     parser.add_argument("--output", default="runs/imagenet1k/vision_llama_base_rrlsso_r32")
     parser.add_argument("--epochs", type=int, default=300)
