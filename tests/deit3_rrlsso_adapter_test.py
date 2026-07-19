@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+import timm
 
-from experiments.cv_vit_rrlsso_cifar100 import TimmRRLSSOAttention
+from examples.models.deit3_rrlsso import (
+    DEIT3_RRLSSO_MODELS,
+    TimmRRLSSOAttention,
+)
 
 
 def test_timm_rrlsso_attention_uses_ordinary_rank_rotary_and_backpropagates() -> None:
@@ -39,5 +43,28 @@ def test_timm_rrlsso_attention_rejects_causal_mode() -> None:
         length_normalize=True,
         length_reference=1.0,
     )
-    with pytest.raises(ValueError, match="not causal"):
+    with pytest.raises(ValueError, match="bidirectional"):
         module(torch.randn(1, 9, 32), is_causal=True)
+
+
+def test_all_deit3_rrlsso_models_are_registered() -> None:
+    assert set(DEIT3_RRLSSO_MODELS) == {
+        "deit3_small_patch16_192_rrlsso",
+        "deit3_base_patch16_192_rrlsso",
+        "deit3_large_patch16_192_rrlsso",
+    }
+    assert all(timm.is_model(name) for name in DEIT3_RRLSSO_MODELS)
+
+
+def test_registered_small_model_replaces_every_attention_block() -> None:
+    model = timm.create_model(
+        "deit3_small_patch16_192_rrlsso",
+        img_size=32,
+        num_classes=7,
+        rank=8,
+    )
+    assert len(model.blocks) == 12
+    assert model.rrlsso_config["replaced_layers"] == 12
+    assert model.rrlsso_config["rank_rotary"] == "ordinary-1d"
+    assert all(isinstance(block.attn, TimmRRLSSOAttention) for block in model.blocks)
+    assert model(torch.randn(1, 3, 32, 32)).shape == (1, 7)

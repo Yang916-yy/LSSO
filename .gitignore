@@ -31,6 +31,7 @@ notebooks/
 !notebooks/
 notebooks/*
 !notebooks/imagenet1k_wds_formal_training.ipynb
+!notebooks/imagenet1k_deit3_rrlsso_formal_training.ipynb
 scripts/
 train_*.py
 cache_tiny_latents.py

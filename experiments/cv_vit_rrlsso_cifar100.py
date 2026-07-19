@@ -20,88 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from examples.models.deit3_rrlsso import (
+    TimmRRLSSOAttention,
+    replace_timm_attention_with_rrlsso,
+)
 from lsso import GroupedRRLSSO, LSSO, RRLSSO
-
-
-class TimmRRLSSOAttention(nn.Module):
-    """RRLSSO replacement for a timm ViT attention module."""
-
-    def __init__(
-        self,
-        *,
-        embed_dim: int,
-        num_heads: int,
-        rank: int,
-        dropout: float,
-        bias: bool,
-        gain_init: float,
-        alpha_init: float,
-        solve_parameterization: str = "gain_alpha",
-        alpha_max: float = 3.0,
-        basis_normalization: str = "trace",
-        length_normalize: bool,
-        length_reference: float,
-    ) -> None:
-        super().__init__()
-        self.rrlsso = RRLSSO(
-            dim=embed_dim,
-            num_heads=num_heads,
-            rank=rank,
-            dropout=dropout,
-            bias=bias,
-            gain_init=gain_init,
-            alpha_init=alpha_init,
-            solve_parameterization=solve_parameterization,
-            alpha_max=alpha_max,
-            basis_normalization=basis_normalization,
-            length_normalize=length_normalize,
-            length_reference=length_reference,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        if attn_mask is not None:
-            raise ValueError("the DeiT-III Food101 path does not use an attention mask")
-        if is_causal:
-            raise ValueError("the bidirectional RRLSSO replacement is not causal")
-        return self.rrlsso(x)
-
-
-def replace_timm_attention_with_rrlsso(
-    model: nn.Module,
-    *,
-    rank: int,
-    gain_init: float,
-    alpha_init: float,
-    solve_parameterization: str = "gain_alpha",
-    alpha_max: float = 3.0,
-    basis_normalization: str = "trace",
-    length_normalize: bool,
-    length_reference: float,
-) -> int:
-    count = 0
-    for block in model.blocks:
-        old = block.attn
-        block.attn = TimmRRLSSOAttention(
-            embed_dim=int(old.qkv.in_features),
-            num_heads=int(old.num_heads),
-            rank=rank,
-            dropout=float(old.attn_drop.p),
-            bias=old.qkv.bias is not None,
-            gain_init=gain_init,
-            alpha_init=alpha_init,
-            solve_parameterization=solve_parameterization,
-            alpha_max=alpha_max,
-            basis_normalization=basis_normalization,
-            length_normalize=length_normalize,
-            length_reference=length_reference,
-        )
-        count += 1
-    return count
 
 
 class RRLSSOSelfAttention(nn.Module):

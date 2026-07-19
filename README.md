@@ -98,6 +98,12 @@ yielding a measured `1.83×` end-to-end training speedup. Large-scale vision
 classification, detection, and segmentation experiments are in progress; the
 repository does not claim those results before they are complete.
 
+The maintained ImageNet program registers RRLSSO versions of the standard
+DeiT-III Small, Base, and Large backbones. It follows a two-stage `192px / 800
+epochs` then `224px / 20 epochs` protocol with independent resumable
+checkpoints. See [`docs/imagenet_deit3_rrlsso.md`](docs/imagenet_deit3_rrlsso.md)
+for model names, parameter counts, the recipe, and launch commands.
+
 ## Install
 
 ```bash

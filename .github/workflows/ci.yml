@@ -24,7 +24,7 @@ jobs:
       - name: Install CPU PyTorch
         run: python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
       - name: Install package and test tools
-        run: python -m pip install -e . pytest build
+        run: python -m pip install -e '.[experiments]' pytest build
       - name: Check repository hygiene
         run: python tools/check_repository_hygiene.py
       - name: Check Python sources
@@ -38,5 +38,7 @@ jobs:
           tests/rank_rotary_test.py
           tests/public_api_test.py
           tests/trace_normalization_test.py
+          tests/deit3_rrlsso_adapter_test.py
+          tests/imagenet_deit3_train_test.py
       - name: Build wheel and source distribution
         run: python -m build
