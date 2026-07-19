@@ -131,3 +131,24 @@ restores the stage's saved EMA. Each stage has independent atomic `last.pt` and
 `best.pt` checkpoints, including model, EMA, optimizer, scheduler, GradScaler,
 completed epoch, update count, gain gauge reference, and RNG state. Streaming
 order after a restart remains newly stochastic.
+
+### Checkpoint state machine
+
+Initialization and resume are separate operations, not two aliases for loading a
+checkpoint:
+
+| Intended operation | Required arguments | Gain reference |
+|---|---|---|
+| New pretraining | no stage checkpoint exists | zero (`g_ref=1`) |
+| Resume pretraining | `--resume`, with this stage's `last.pt` | restored zero reference |
+| New refinement | `--no-resume --init-checkpoint PREVIOUS/best.pt` | captured from the loaded raw model |
+| Resume refinement | `--resume`, with this stage's `last.pt`; no initializer | restored unchanged |
+
+The official path deliberately initializes refinement from the raw model rather
+than EMA. A fresh refinement EMA is then created from exactly those raw weights,
+so its gain reference and trained model agree. Checkpoints carry a schema and
+stage/model/resolution/rank/alpha metadata; resume fails loudly on incompatible
+or legacy state rather than silently moving the gauge anchor. Likewise,
+`--init-checkpoint` together with `--resume` is rejected. `--overwrite-output`
+is required to replace an existing stage checkpoint and is intended only for
+deliberate smoke reruns or discarded experiments.

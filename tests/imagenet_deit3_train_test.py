@@ -5,12 +5,16 @@ import pytest
 
 from experiments.imagenet_wds_train import (
     apply_virtual_group_mixup,
+    checkpoint_metadata,
     create_model_ema,
     create_official_optimizer,
     create_training_model,
     parse_args,
+    resolve_run_mode,
     resize_position_embedding,
     shard_commands,
+    validate_initialization_checkpoint,
+    validate_resume_checkpoint,
 )
 
 
@@ -100,7 +104,7 @@ def test_position_embedding_is_resized_from_192_to_224() -> None:
     target_args = parse_args(
         [
             "--model", "deit3_base_patch16_rrlsso", "--stage", "finetune224",
-            "--init-checkpoint", "dummy.pt",
+            "--init-checkpoint", "dummy.pt", "--no-resume",
         ]
     )
     source = create_training_model(source_args)
@@ -174,3 +178,58 @@ def test_solve_scalars_are_excluded_from_ordinary_weight_decay() -> None:
     ]
     assert solve_scalars
     assert all(decay_by_parameter[id(parameter)] == 0.0 for parameter in solve_scalars)
+
+
+def test_checkpoint_modes_are_explicit_and_non_overwriting(tmp_path) -> None:
+    pretrain = parse_args(["--output", str(tmp_path / "pretrain")])
+    pretrain_last = tmp_path / "pretrain" / "last.pt"
+    assert resolve_run_mode(pretrain, pretrain_last) == "new_pretrain"
+    pretrain_last.parent.mkdir(parents=True)
+    pretrain_last.touch()
+    assert resolve_run_mode(pretrain, pretrain_last) == "resume_pretrain"
+
+    init = tmp_path / "pretrain-best.pt"
+    init.touch()
+    finetune = parse_args(
+        [
+            "--stage", "finetune224", "--output", str(tmp_path / "finetune"),
+            "--init-checkpoint", str(init), "--no-resume",
+        ]
+    )
+    finetune_last = tmp_path / "finetune" / "last.pt"
+    assert resolve_run_mode(finetune, finetune_last) == "init_finetune"
+    finetune_last.parent.mkdir(parents=True)
+    finetune_last.touch()
+    with pytest.raises(FileExistsError, match="already exists"):
+        resolve_run_mode(finetune, finetune_last)
+
+    resumed = parse_args(
+        ["--stage", "finetune224", "--output", str(tmp_path / "finetune")]
+    )
+    assert resolve_run_mode(resumed, finetune_last) == "resume_finetune"
+
+
+def test_checkpoint_cli_rejects_ambiguous_initialization() -> None:
+    with pytest.raises(ValueError, match="requires --no-resume"):
+        parse_args(["--stage", "finetune224", "--init-checkpoint", "pretrain.pt"])
+    with pytest.raises(ValueError, match="only valid for refinement"):
+        parse_args(["--stage", "pretrain", "--init-checkpoint", "pretrain.pt", "--no-resume"])
+
+
+def test_checkpoint_metadata_preserves_gain_reference_contract() -> None:
+    pretrain = parse_args([])
+    metadata = checkpoint_metadata(pretrain, gain_reference_origin="pretrain_zero")
+    checkpoint = {"run_metadata": metadata, "rrlsso_gain_reference": {"x": torch.zeros(1)}}
+    assert validate_resume_checkpoint(checkpoint, pretrain) == metadata
+
+    bad = {**checkpoint, "rrlsso_gain_reference": None}
+    with pytest.raises(RuntimeError, match="persistent gain reference"):
+        validate_resume_checkpoint(bad, pretrain)
+
+    finetune = parse_args(["--stage", "finetune224"])
+    validate_initialization_checkpoint({"model": {}, "run_metadata": metadata}, finetune)
+    wrong_stage = {**metadata, "training_stage": "finetune224"}
+    with pytest.raises(RuntimeError, match="metadata mismatch"):
+        validate_initialization_checkpoint(
+            {"model": {}, "run_metadata": wrong_stage}, finetune
+        )

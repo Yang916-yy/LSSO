@@ -55,6 +55,7 @@ TRAIN_SAMPLES = 1_281_167
 VAL_SAMPLES = 50_000
 TRAIN_SHARDS = 1024
 VAL_SHARDS = 64
+CHECKPOINT_SCHEMA = 2
 
 
 def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
@@ -430,6 +431,125 @@ def solve_update_norms(
     return result
 
 
+def resolve_run_mode(args: argparse.Namespace, last: Path) -> str:
+    """Resolve one unambiguous checkpoint state before mutating the output."""
+
+    has_last = last.is_file()
+    best = last.with_name("best.pt")
+    has_checkpoint = has_last or best.is_file()
+    existing_checkpoint = last if has_last else best
+    if args.init_checkpoint:
+        if args.resume:
+            raise ValueError(
+                "--init-checkpoint starts a new refinement and requires --no-resume"
+            )
+        if args.stage == "pretrain":
+            raise ValueError("--init-checkpoint is only valid for refinement stages")
+        if not Path(args.init_checkpoint).is_file():
+            raise FileNotFoundError(f"initialization checkpoint not found: {args.init_checkpoint}")
+        if has_checkpoint and not args.overwrite_output:
+            raise FileExistsError(
+                f"{existing_checkpoint} already exists; resume it, choose another output, or pass "
+                "--overwrite-output explicitly"
+            )
+        return "init_finetune"
+    if args.resume and has_last:
+        return "resume_pretrain" if args.stage == "pretrain" else "resume_finetune"
+    if args.stage != "pretrain":
+        raise FileNotFoundError(
+            f"no resumable checkpoint at {last}; start refinement with "
+            "--no-resume --init-checkpoint PRETRAIN.pt"
+        )
+    if has_checkpoint and not args.overwrite_output:
+        raise FileExistsError(
+            f"--no-resume would overwrite {existing_checkpoint}; pass "
+            "--overwrite-output explicitly"
+        )
+    return "new_pretrain"
+
+
+def checkpoint_metadata(
+    args: argparse.Namespace,
+    *,
+    gain_reference_origin: str,
+) -> dict[str, Any]:
+    return {
+        "schema": CHECKPOINT_SCHEMA,
+        "training_stage": args.stage,
+        "model_name": args.model,
+        "image_size": args.image_size,
+        "rank": args.rank,
+        "alpha_max": args.alpha_max,
+        "init_weights": "raw",
+        "gain_reference_origin": gain_reference_origin,
+    }
+
+
+def validate_resume_checkpoint(
+    checkpoint: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    metadata = checkpoint.get("run_metadata")
+    if not isinstance(metadata, dict) or metadata.get("schema") != CHECKPOINT_SCHEMA:
+        raise RuntimeError(
+            f"resume requires checkpoint schema {CHECKPOINT_SCHEMA}; restart this stage "
+            "from its preceding-stage initialization checkpoint"
+        )
+    expected = {
+        "training_stage": args.stage,
+        "model_name": args.model,
+        "image_size": args.image_size,
+        "rank": args.rank,
+        "alpha_max": args.alpha_max,
+        "init_weights": "raw",
+    }
+    mismatches = {
+        key: (metadata.get(key), value)
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    expected_origin = "pretrain_zero" if args.stage == "pretrain" else "raw_finetune_init"
+    if metadata.get("gain_reference_origin") != expected_origin:
+        mismatches["gain_reference_origin"] = (
+            metadata.get("gain_reference_origin"),
+            expected_origin,
+        )
+    if mismatches:
+        raise RuntimeError(f"resume checkpoint metadata mismatch: {mismatches}")
+    if checkpoint.get("rrlsso_gain_reference") is None:
+        raise RuntimeError("resume checkpoint is missing its persistent gain reference")
+    return metadata
+
+
+def validate_initialization_checkpoint(
+    checkpoint: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if "model" not in checkpoint:
+        raise RuntimeError("initialization checkpoint has no raw model state")
+    metadata = checkpoint.get("run_metadata")
+    if metadata is None:
+        return
+    expected_source_stage = {
+        "finetune224": "pretrain",
+        "finetune384": "finetune224",
+    }[args.stage]
+    expected = {
+        "training_stage": expected_source_stage,
+        "model_name": args.model,
+        "rank": args.rank,
+        "alpha_max": args.alpha_max,
+        "init_weights": "raw",
+    }
+    mismatches = {
+        key: (metadata.get(key), expected_value)
+        for key, expected_value in expected.items()
+        if metadata.get(key) != expected_value
+    }
+    if mismatches:
+        raise RuntimeError(f"initialization checkpoint metadata mismatch: {mismatches}")
+
+
 def train(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("formal ImageNet training requires CUDA")
@@ -453,6 +573,10 @@ def train(args: argparse.Namespace) -> None:
             f"got {args.batch_size} x {args.grad_accum} = {actual_effective_batch}"
         )
     amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
+    output = Path(args.output)
+    last = output / "last.pt"
+    run_mode = resolve_run_mode(args, last)
+    print(f"checkpoint_mode={run_mode}", flush=True)
 
     train_loader, val_loader = make_loaders(args)
     model = create_training_model(args).to(device)
@@ -486,27 +610,12 @@ def train(args: argparse.Namespace) -> None:
     )
     official_updates = TRAIN_SAMPLES // args.effective_batch
     steps_per_epoch = args.steps_per_epoch or official_updates * args.grad_accum
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    config = vars(args) | {
-        "parameter_count": parameter_count,
-        "optimizer_impl": optimizer_impl,
-        "actual_effective_batch": actual_effective_batch,
-        "official_updates_per_epoch": official_updates,
-        "virtual_groups_per_update": (
-            actual_effective_batch // args.runtime_augmentation_group_size
-        ),
-    }
-    (output / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True), encoding="utf-8"
-    )
-
     start_epoch = global_update = 0
     best_acc = -1.0
-    last = output / "last.pt"
     resume_checkpoint: dict[str, Any] | None = None
-    if args.resume and last.is_file():
+    if run_mode in {"resume_pretrain", "resume_finetune"}:
         resume_checkpoint = torch.load(last, map_location="cpu", weights_only=False)
+        run_metadata = validate_resume_checkpoint(resume_checkpoint, args)
         model.load_state_dict(resume_checkpoint["model"])
         optimizer.load_state_dict(resume_checkpoint["optimizer"])
         scheduler.load_state_dict(resume_checkpoint["scheduler"])
@@ -516,18 +625,19 @@ def train(args: argparse.Namespace) -> None:
         best_acc = float(resume_checkpoint["best_acc"])
         restore_rng_state(resume_checkpoint.get("rng_state"))
         print(f"resumed epoch={start_epoch} update={global_update}", flush=True)
-    elif args.init_checkpoint:
+    elif run_mode == "init_finetune":
         initialization = torch.load(
             args.init_checkpoint, map_location="cpu", weights_only=False
         )
+        validate_initialization_checkpoint(initialization, args)
         model_state = resize_position_embedding(initialization["model"], model)
         model.load_state_dict(model_state)
         print(f"initialized model from {args.init_checkpoint}", flush=True)
-    elif args.stage != "pretrain":
-        raise FileNotFoundError(
-            f"no resumable checkpoint at {last}; pass the preceding stage's best.pt "
-            "with --init-checkpoint"
+        run_metadata = checkpoint_metadata(
+            args, gain_reference_origin="raw_finetune_init"
         )
+    else:
+        run_metadata = checkpoint_metadata(args, gain_reference_origin="pretrain_zero")
     model_ema = create_model_ema(
         model,
         enabled=args.ema,
@@ -539,15 +649,25 @@ def train(args: argparse.Namespace) -> None:
         if resume_checkpoint is not None
         else None
     )
-    if resume_checkpoint is not None and saved_gain_reference is None and args.stage != "pretrain":
-        raise RuntimeError(
-            "the refinement checkpoint predates persistent gain references; "
-            "restart refinement from its pretraining checkpoint"
-        )
     gain_reference = make_rrlsso_gain_reference(
         model,
         anchor_to_current=args.stage != "pretrain",
         state=saved_gain_reference,
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    config = vars(args) | {
+        "checkpoint_mode": run_mode,
+        "run_metadata": run_metadata,
+        "parameter_count": parameter_count,
+        "optimizer_impl": optimizer_impl,
+        "actual_effective_batch": actual_effective_batch,
+        "official_updates_per_epoch": official_updates,
+        "virtual_groups_per_update": (
+            actual_effective_batch // args.runtime_augmentation_group_size
+        ),
+    }
+    (output / "config.json").write_text(
+        json.dumps(config, indent=2, sort_keys=True), encoding="utf-8"
     )
 
     print(
@@ -721,6 +841,7 @@ def train(args: argparse.Namespace) -> None:
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
                 "model_ema": model_ema.module.state_dict() if model_ema is not None else None,
+                "run_metadata": run_metadata,
                 "rrlsso_gain_reference": {
                     key: value.detach().cpu() for key, value in gain_reference.items()
                 },
@@ -774,6 +895,12 @@ def apply_stage_defaults(args: argparse.Namespace) -> argparse.Namespace:
     if not args.output:
         suffix = f"pretrain{args.image_size}" if args.stage == "pretrain" else args.stage
         args.output = str(Path("runs/imagenet1k") / args.model / suffix)
+    if args.init_checkpoint and args.resume:
+        raise ValueError(
+            "--init-checkpoint starts a new refinement and requires --no-resume"
+        )
+    if args.stage == "pretrain" and args.init_checkpoint:
+        raise ValueError("--init-checkpoint is only valid for refinement stages")
     if args.stage != "pretrain" and not args.resume and not args.init_checkpoint:
         raise ValueError("the finetune stage requires --init-checkpoint when --no-resume is used")
     return args
@@ -820,6 +947,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--overwrite-output", action="store_true")
     parser.add_argument("--require-mathdx", action="store_true")
     return apply_stage_defaults(parser.parse_args(argv))
 
