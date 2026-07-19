@@ -143,21 +143,16 @@ def test_registered_model_configuration_is_trace_normalized() -> None:
     assert torch.isfinite(model.pos_embed).all()
 
 
-def test_pretraining_never_silently_drops_fused_lamb() -> None:
+def test_pretraining_never_silently_drops_fused_lamb(monkeypatch) -> None:
     model = torch.nn.Linear(2, 2)
     args = parse_args(["--model", "deit3_base_patch16_rrlsso", "--epochs", "1"])
-    try:
-        import apex  # noqa: F401
-    except ImportError:
-        with pytest.raises(RuntimeError, match="requires NVIDIA Apex FusedLAMB"):
-            create_official_optimizer(model, args)
-    else:
-        _, implementation = create_official_optimizer(model, args)
-        assert implementation == "apex_fusedlamb"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="requires CUDA and NVIDIA Apex FusedLAMB"):
+        create_official_optimizer(model, args)
 
     args.allow_unfused_lamb = True
     _, implementation = create_official_optimizer(model, args)
-    assert implementation in {"apex_fusedlamb", "lamb"}
+    assert implementation == "lamb"
 
 
 def test_solve_scalars_are_excluded_from_ordinary_weight_decay() -> None:

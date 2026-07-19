@@ -292,7 +292,15 @@ def create_official_optimizer(
 ) -> tuple[torch.optim.Optimizer, str]:
     optimizer_name = args.optimizer
     if optimizer_name == "fusedlamb":
-        try:
+        apex_available = False
+        if torch.cuda.is_available():
+            try:
+                import apex.optimizers  # noqa: F401
+            except ImportError:
+                pass
+            else:
+                apex_available = True
+        if apex_available:
             optimizer = create_optimizer_v2(
                 model,
                 opt="fusedlamb",
@@ -301,12 +309,13 @@ def create_official_optimizer(
                 eps=1e-8,
             )
             return optimizer, "apex_fusedlamb"
-        except ImportError as error:
+        else:
             if not args.allow_unfused_lamb:
                 raise RuntimeError(
-                    "official DeiT-III pre-training requires NVIDIA Apex FusedLAMB; "
-                    "install Apex or use --allow-unfused-lamb only for local smoke tests"
-                ) from error
+                    "official DeiT-III pre-training requires CUDA and NVIDIA Apex "
+                    "FusedLAMB; install Apex or use --allow-unfused-lamb only for "
+                    "local smoke tests"
+                )
             optimizer_name = "lamb"
     optimizer = create_optimizer_v2(
         model,
