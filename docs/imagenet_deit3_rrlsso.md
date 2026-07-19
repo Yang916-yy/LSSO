@@ -13,9 +13,10 @@ The registered names are resolution-independent:
 | `deit3_base_patch16_rrlsso` | 768 | 12 | 12 | 75,954,952 |
 | `deit3_large_patch16_rrlsso` | 1024 | 24 | 16 | 266,589,928 |
 
-All three use Meta's constant stochastic-depth layout and LayerScale
-initialization `1e-4`, not timm's depth-wise drop-path schedule and `1e-6`
-default. RRLSSO uses ordinary one-dimensional Rank Rotary.
+All three use Meta's constant stochastic-depth layout, LayerScale initialization
+`1e-4`, and truncated-normal class-token initialization with standard deviation
+`0.02`, rather than current timm defaults. RRLSSO uses ordinary one-dimensional
+Rank Rotary.
 
 ## Size-specific official recipes
 
@@ -37,6 +38,21 @@ Finetuning uses RandAugment `rand-m9-mstd0.5-inc1`, no repeated augmentation,
 Mixup/CutMix, smoothing 0.1, no random erasing, weight decay 0.1, and five
 warmup epochs. Validation uses the official crop ratio 1.0.
 
+### Virtual-device augmentation groups
+
+Large physical batches do not change the official per-GPU augmentation
+semantics. Each physical batch is divided into virtual groups before batch-mode
+Mixup/CutMix: 256 samples for Small/Base pretraining, 64 for Large pretraining
+and 224px refinement, and 64/32/16 for Small/Base/Large at 384px. Each group
+draws its own Mixup/CutMix parameters, while all groups are concatenated for one
+large forward pass.
+
+Repeated augmentation is arranged by group rather than by sample. Three views
+of one image are emitted into three different virtual groups, so no group
+contains duplicate views of the same source image. This reproduces the relevant
+semantics of Meta's distributed RASampler without sacrificing single-GPU
+throughput.
+
 ## RRLSSO-specific safeguards
 
 Two optional regularizers are intentionally zero at initialization:
@@ -50,7 +66,9 @@ for the exact recipe ablation.
 ## Formal launch
 
 The default Base command chooses physical batch 512 and accumulation 4 to
-reproduce effective batch 2048 on one large GPU:
+reproduce effective batch 2048 on one large GPU. Every physical batch contains
+two independent 256-sample virtual augmentation groups, yielding the official
+eight group-level augmentation draws per optimizer update:
 
 ```bash
 export HF_TOKEN=...
@@ -76,7 +94,9 @@ python experiments/imagenet_wds_train.py \
   --cache-dir /content/imagenet-wds --require-mathdx --no-resume
 ```
 
-The position embedding is bicubically resized between patch grids. Each stage
-has independent atomic `last.pt` and `best.pt` checkpoints, including model,
-EMA, optimizer, scheduler, GradScaler, completed epoch, update count, and RNG
-state. Streaming order after a restart remains newly stochastic.
+The position embedding is bicubically resized between patch grids. A refinement
+stage initializes a fresh EMA from the resized main model; only an actual resume
+restores the stage's saved EMA. Each stage has independent atomic `last.pt` and
+`best.pt` checkpoints, including model, EMA, optimizer, scheduler, GradScaler,
+completed epoch, update count, and RNG state. Streaming order after a restart
+remains newly stochastic.

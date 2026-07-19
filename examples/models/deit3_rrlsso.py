@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import timm
-from timm.layers import DropPath
+from timm.layers import DropPath, trunc_normal_
 from timm.models import register_model
 
 from lsso import RRLSSO
@@ -136,6 +136,10 @@ def _create_deit3_rrlsso(
     kwargs.setdefault("init_values", 1e-4)
     drop_path_rate = float(kwargs.pop("drop_path_rate", 0.0))
     model = timm.create_model(base_model, pretrained=False, **kwargs)
+    # Meta's implementation initializes the class token with the same
+    # truncated-normal std=0.02 used for learned positional embeddings. Current
+    # timm initializes it near zero (std=1e-6).
+    trunc_normal_(model.cls_token, std=0.02)
     for block in model.blocks:
         drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
         block.drop_path1 = drop_path
@@ -150,6 +154,7 @@ def _create_deit3_rrlsso(
         "replaced_layers": replaced,
         "rank_rotary": "ordinary-1d",
         "layerscale_init": 1e-4,
+        "cls_token_init_std": 0.02,
         "constant_drop_path_rate": drop_path_rate,
         **mixer_kwargs,
     }

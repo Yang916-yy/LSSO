@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import random
 from dataclasses import dataclass
 from typing import Iterable, Iterator, TypeVar
@@ -33,6 +34,7 @@ class DeiT3Recipe:
     drop_path_rate: float
     optimizer: str
     effective_batch: int
+    augmentation_group_size: int
     repeated_aug: int
     bce_loss: bool
     label_smoothing: float
@@ -42,35 +44,35 @@ class DeiT3Recipe:
 DEIT3_OFFICIAL_RECIPES: dict[tuple[str, str], DeiT3Recipe] = {
     ("small", "pretrain"): DeiT3Recipe(
         "small", "pretrain", 224, 800, 4e-3, 1e-5, 1e-6, 5,
-        0.05, 0.05, "fusedlamb", 2048, 3, True, 0.0, "three_augment",
+        0.05, 0.05, "fusedlamb", 2048, 256, 3, True, 0.0, "three_augment",
     ),
     ("base", "pretrain"): DeiT3Recipe(
         "base", "pretrain", 192, 800, 3e-3, 1e-5, 1e-6, 5,
-        0.05, 0.20, "fusedlamb", 2048, 3, True, 0.0, "three_augment",
+        0.05, 0.20, "fusedlamb", 2048, 256, 3, True, 0.0, "three_augment",
     ),
     ("large", "pretrain"): DeiT3Recipe(
         "large", "pretrain", 192, 800, 3e-3, 1e-5, 1e-6, 5,
-        0.05, 0.45, "fusedlamb", 2048, 3, True, 0.0, "three_augment",
+        0.05, 0.45, "fusedlamb", 2048, 64, 3, True, 0.0, "three_augment",
     ),
     ("base", "finetune224"): DeiT3Recipe(
         "base", "finetune224", 224, 20, 1e-5, 1e-5, 1e-6, 5,
-        0.10, 0.20, "adamw", 512, 1, False, 0.1, "randaugment",
+        0.10, 0.20, "adamw", 512, 64, 1, False, 0.1, "randaugment",
     ),
     ("large", "finetune224"): DeiT3Recipe(
         "large", "finetune224", 224, 20, 1e-5, 1e-5, 1e-6, 5,
-        0.10, 0.45, "adamw", 512, 1, False, 0.1, "randaugment",
+        0.10, 0.45, "adamw", 512, 64, 1, False, 0.1, "randaugment",
     ),
     ("small", "finetune384"): DeiT3Recipe(
         "small", "finetune384", 384, 20, 1e-5, 1e-5, 1e-6, 5,
-        0.10, 0.00, "adamw", 512, 1, False, 0.1, "randaugment",
+        0.10, 0.00, "adamw", 512, 64, 1, False, 0.1, "randaugment",
     ),
     ("base", "finetune384"): DeiT3Recipe(
         "base", "finetune384", 384, 20, 1e-5, 1e-5, 1e-6, 5,
-        0.10, 0.15, "adamw", 512, 1, False, 0.1, "randaugment",
+        0.10, 0.15, "adamw", 512, 32, 1, False, 0.1, "randaugment",
     ),
     ("large", "finetune384"): DeiT3Recipe(
         "large", "finetune384", 384, 20, 1e-5, 1e-5, 1e-6, 5,
-        0.10, 0.40, "adamw", 512, 1, False, 0.1, "randaugment",
+        0.10, 0.40, "adamw", 512, 16, 1, False, 0.1, "randaugment",
     ),
 }
 
@@ -152,12 +154,28 @@ def validation_transform(image_size: int) -> transforms.Compose:
     )
 
 
-def repeat_samples(source: Iterable[T], repeats: int) -> Iterator[T]:
+def virtual_group_repeated_samples(
+    source: Iterable[T], *, repeats: int, group_size: int
+) -> Iterator[T]:
+    """Emit independent RA views in virtual-device-sized groups.
+
+    Each source block is replayed as a whole rather than repeating individual
+    samples consecutively.  Consequently, no virtual augmentation group contains
+    two views of the same source sample.  The stage belongs before image decoding
+    so its bounded buffer stores compressed WebDataset records.
+    """
+
     if repeats < 1:
         raise ValueError(f"repeats must be positive, got {repeats}")
-    for sample in source:
+    if group_size < 1:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+    iterator = iter(source)
+    while True:
+        block = list(itertools.islice(iterator, group_size))
+        if len(block) != group_size:
+            return
         for _ in range(repeats):
-            yield sample
+            yield from block
 
 
 def rrlsso_regularization(
@@ -198,7 +216,7 @@ __all__ = [
     "model_size",
     "official_recipe",
     "randaugment_finetune_transform",
-    "repeat_samples",
+    "virtual_group_repeated_samples",
     "rrlsso_regularization",
     "three_augment_transform",
     "validation_transform",

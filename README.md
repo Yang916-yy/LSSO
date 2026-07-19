@@ -101,8 +101,9 @@ repository does not claim those results before they are complete.
 The maintained ImageNet program registers RRLSSO versions of the standard
 DeiT-III Small, Base, and Large backbones. It reproduces Meta's size-specific
 DeiT-III recipe, including constant stochastic depth, LayerScale `1e-4`,
-3-Augment, repeated augmentation, BCE, EMA, and Apex FusedLAMB pretraining,
-plus the published 224/384 refinement stages. See
+official class-token initialization, virtual-device grouped Mixup/CutMix,
+distributed-style repeated augmentation, BCE, EMA, and Apex FusedLAMB
+pretraining, plus the published 224/384 refinement stages. See
 [`docs/imagenet_deit3_rrlsso.md`](docs/imagenet_deit3_rrlsso.md) for model
 names, parameter counts, exact recipes, and launch commands.
 

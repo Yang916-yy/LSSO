@@ -42,10 +42,10 @@ from examples.models.deit3_rrlsso import DEIT3_RRLSSO_MODELS  # noqa: E402
 from experiments.deit3_official_recipe import (  # noqa: E402
     official_recipe,
     randaugment_finetune_transform,
-    repeat_samples,
     rrlsso_regularization,
     three_augment_transform,
     validation_transform,
+    virtual_group_repeated_samples,
 )
 from lsso.mathdx_backend import is_mathdx_available, mathdx_load_error  # noqa: E402
 
@@ -140,9 +140,13 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         seed=args.seed,
     ).compose(
         wds.detshuffle(args.shuffle_buffer, seed=args.seed + 1009),
+        partial(
+            virtual_group_repeated_samples,
+            repeats=args.repeated_aug,
+            group_size=args.runtime_augmentation_group_size,
+        ),
         wds.decode("pil"),
         wds.to_tuple("jpg;jpeg;png", "cls"),
-        partial(repeat_samples, repeats=args.repeated_aug),
         wds.map_tuple(train_transform, int),
         wds.batched(args.batch_size, partial=False),
     )
@@ -310,6 +314,46 @@ def create_official_optimizer(
     return optimizer, optimizer_name
 
 
+def apply_virtual_group_mixup(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    mixup: Mixup,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply batch-mode Mixup/CutMix as independent virtual GPU groups."""
+
+    if images.shape[0] != labels.shape[0]:
+        raise ValueError("images and labels must have the same batch dimension")
+    if images.shape[0] % group_size:
+        raise ValueError(
+            f"physical batch {images.shape[0]} is not divisible by virtual group {group_size}"
+        )
+    mixed_labels = []
+    for start in range(0, images.shape[0], group_size):
+        stop = start + group_size
+        # timm Mixup mutates the image slice in place, so no image concatenation is needed.
+        _, group_labels = mixup(images[start:stop], labels[start:stop])
+        mixed_labels.append(group_labels)
+    return images, torch.cat(mixed_labels, dim=0)
+
+
+def create_model_ema(
+    model: torch.nn.Module,
+    *,
+    enabled: bool,
+    decay: float,
+    resume_checkpoint: dict[str, Any] | None = None,
+) -> ModelEmaV2 | None:
+    """Create a stage-local EMA, restoring it only for a true stage resume."""
+
+    if not enabled:
+        return None
+    model_ema = ModelEmaV2(model, decay=decay)
+    if resume_checkpoint is not None and resume_checkpoint.get("model_ema") is not None:
+        model_ema.module.load_state_dict(resume_checkpoint["model_ema"])
+    return model_ema
+
+
 def train(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("formal ImageNet training requires CUDA")
@@ -373,6 +417,9 @@ def train(args: argparse.Namespace) -> None:
         "optimizer_impl": optimizer_impl,
         "actual_effective_batch": actual_effective_batch,
         "official_updates_per_epoch": official_updates,
+        "virtual_groups_per_update": (
+            actual_effective_batch // args.runtime_augmentation_group_size
+        ),
     }
     (output / "config.json").write_text(
         json.dumps(config, indent=2, sort_keys=True), encoding="utf-8"
@@ -381,21 +428,23 @@ def train(args: argparse.Namespace) -> None:
     start_epoch = global_update = 0
     best_acc = -1.0
     last = output / "last.pt"
-    checkpoint: dict[str, Any] | None = None
+    resume_checkpoint: dict[str, Any] | None = None
     if args.resume and last.is_file():
-        checkpoint = torch.load(last, map_location="cpu", weights_only=False)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        scaler.load_state_dict(checkpoint.get("scaler", {}))
-        start_epoch = int(checkpoint["epoch"])
-        global_update = int(checkpoint["global_update"])
-        best_acc = float(checkpoint["best_acc"])
-        restore_rng_state(checkpoint.get("rng_state"))
+        resume_checkpoint = torch.load(last, map_location="cpu", weights_only=False)
+        model.load_state_dict(resume_checkpoint["model"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer"])
+        scheduler.load_state_dict(resume_checkpoint["scheduler"])
+        scaler.load_state_dict(resume_checkpoint.get("scaler", {}))
+        start_epoch = int(resume_checkpoint["epoch"])
+        global_update = int(resume_checkpoint["global_update"])
+        best_acc = float(resume_checkpoint["best_acc"])
+        restore_rng_state(resume_checkpoint.get("rng_state"))
         print(f"resumed epoch={start_epoch} update={global_update}", flush=True)
     elif args.init_checkpoint:
-        checkpoint = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
-        model_state = resize_position_embedding(checkpoint["model"], model)
+        initialization = torch.load(
+            args.init_checkpoint, map_location="cpu", weights_only=False
+        )
+        model_state = resize_position_embedding(initialization["model"], model)
         model.load_state_dict(model_state)
         print(f"initialized model from {args.init_checkpoint}", flush=True)
     elif args.stage != "pretrain":
@@ -403,14 +452,18 @@ def train(args: argparse.Namespace) -> None:
             f"no resumable checkpoint at {last}; pass the preceding stage's best.pt "
             "with --init-checkpoint"
         )
-    model_ema = ModelEmaV2(model, decay=args.ema_decay) if args.ema else None
-    if checkpoint is not None and model_ema is not None and checkpoint.get("model_ema") is not None:
-        model_ema.module.load_state_dict(checkpoint["model_ema"])
+    model_ema = create_model_ema(
+        model,
+        enabled=args.ema,
+        decay=args.ema_decay,
+        resume_checkpoint=resume_checkpoint,
+    )
 
     print(
         f"recipe=official_deit3 optimizer={optimizer_impl} lr={args.lr:g} "
         f"drop_path={args.drop_path_rate:g} repeated_aug={args.repeated_aug} "
         f"amp={args.amp_dtype} effective_batch={actual_effective_batch} "
+        f"virtual_group={args.runtime_augmentation_group_size} "
         f"rrlsso_reg=(gain={args.rrlsso_gain_reg:g},alpha={args.rrlsso_alpha_reg:g})",
         flush=True,
     )
@@ -438,7 +491,12 @@ def train(args: argparse.Namespace) -> None:
                 observed_steps = step + 1
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                images, labels = mixup(images, labels)
+                images, labels = apply_virtual_group_mixup(
+                    images,
+                    labels,
+                    mixup,
+                    args.runtime_augmentation_group_size,
+                )
                 if args.bce_loss:
                     labels = labels.gt(0.0).to(labels.dtype)
                 with torch.autocast("cuda", dtype=amp_dtype):
@@ -528,6 +586,7 @@ def apply_stage_defaults(args: argparse.Namespace) -> argparse.Namespace:
     for name in (
         "image_size", "peak_lr", "min_lr", "warmup_lr", "warmup_epochs",
         "weight_decay", "drop_path_rate", "optimizer", "effective_batch",
+        "augmentation_group_size",
         "repeated_aug", "bce_loss", "label_smoothing", "augmentation",
     ):
         value = getattr(recipe, name)
@@ -547,6 +606,15 @@ def apply_stage_defaults(args: argparse.Namespace) -> argparse.Namespace:
                 f"batch {args.effective_batch}"
             )
         args.grad_accum = args.effective_batch // args.batch_size
+    if args.batch_size % args.augmentation_group_size:
+        if not args.allow_batch_mismatch:
+            raise ValueError(
+                f"physical batch {args.batch_size} must be a multiple of the official "
+                f"virtual augmentation group {args.augmentation_group_size}"
+            )
+        args.runtime_augmentation_group_size = args.batch_size
+    else:
+        args.runtime_augmentation_group_size = args.augmentation_group_size
     if args.eval_batch_size is None:
         args.eval_batch_size = args.batch_size
     if not args.output:

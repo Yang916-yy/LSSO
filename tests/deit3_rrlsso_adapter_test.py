@@ -72,7 +72,9 @@ def test_registered_small_model_replaces_every_attention_block() -> None:
     assert model.rrlsso_config["replaced_layers"] == 12
     assert model.rrlsso_config["rank_rotary"] == "ordinary-1d"
     assert model.rrlsso_config["layerscale_init"] == 1e-4
+    assert model.rrlsso_config["cls_token_init_std"] == 0.02
     assert model.rrlsso_config["constant_drop_path_rate"] == 0.05
+    assert model.cls_token.std().item() == pytest.approx(0.02, rel=0.2)
     assert model.blocks[0].ls1.gamma[0].item() == pytest.approx(1e-4)
     assert model.blocks[0].drop_path1.drop_prob == pytest.approx(0.05)
     assert model.blocks[-1].drop_path1.drop_prob == pytest.approx(0.05)
