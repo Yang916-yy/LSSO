@@ -291,7 +291,6 @@ def rrlsso_parameter_diagnostics(
     return {
         "gain_log_mean": gains.mean(),
         "gain_log_std": gains.std(unbiased=False),
-        "gain_log_max_abs": gains.abs().max(),
         "gain_anchor_rms": deltas.square().mean().sqrt(),
         "alpha_ratio_mean": ratios.mean(),
         "alpha_ratio_std": ratios.std(unbiased=False),

@@ -25,6 +25,7 @@ def test_stage_defaults_cover_low_resolution_and_refinement() -> None:
     assert pretrain.augmentation_group_size == 256
     assert pretrain.runtime_augmentation_group_size == 256
     assert pretrain.batch_size // pretrain.augmentation_group_size == 2
+    assert not pretrain.rrlsso_extended_diagnostics
 
     finetune = parse_args(
         [
@@ -48,6 +49,11 @@ def test_large_profile_preserves_physical_batch_with_virtual_groups() -> None:
     assert (args.batch_size, args.grad_accum) == (128, 16)
     assert args.augmentation_group_size == 64
     assert args.batch_size // args.augmentation_group_size == 2
+
+
+def test_extended_solve_diagnostics_are_explicitly_opt_in() -> None:
+    args = parse_args(["--rrlsso-extended-diagnostics"])
+    assert args.rrlsso_extended_diagnostics
 
 
 def test_virtual_group_mixup_draws_once_per_official_local_batch() -> None:

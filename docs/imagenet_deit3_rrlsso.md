@@ -82,10 +82,17 @@ disabled with zero weights for the exact-recipe ablation. The scalar parameters
 are excluded from ordinary optimizer weight decay, so the gain constraint is
 not duplicated.
 
-At each epoch boundary, `metrics.csv` records log-gain drift, alpha-ratio mean
-and spread, fractions above 0.8 and 0.95, solve-scalar gradient norms,
-regularizer/total-gradient ratios, and actual optimizer update norms. Sampling
-once per epoch avoids continuous host-device synchronization.
+At each epoch boundary, `metrics.csv` records the core interpretable statistics:
+log-gain mean/spread and reference-relative RMS drift, alpha-ratio mean/spread,
+fractions above 0.8 and 0.95, and alpha-barrier magnitude. The redundant raw
+gain penalty is omitted because it is exactly the square of gain-anchor RMS;
+single-head extrema are left to post-hoc checkpoint analysis.
+
+`--rrlsso-extended-diagnostics` additionally records solve-scalar gradient
+norms, regularizer/total-gradient ratios, and actual optimizer update norms.
+This developer diagnostic is off by default, so formal training does not invoke
+an extra `autograd.grad`, force a diagnostic GradScaler unscale, or snapshot
+parameters at every epoch boundary.
 
 ## Formal launch
 

@@ -563,13 +563,16 @@ def train(args: argparse.Namespace) -> None:
     mode = "a" if start_epoch and metrics.exists() else "w"
     fields = (
         "epoch", "train_loss", "train_data_loss", "train_regularization", "lr",
-        "gain_penalty", "alpha_penalty", "gain_log_mean", "gain_log_std",
-        "gain_log_max_abs", "gain_anchor_rms", "alpha_ratio_mean", "alpha_ratio_std",
-        "alpha_fraction_gt_080", "alpha_fraction_gt_095", "gain_grad_norm",
-        "alpha_grad_norm", "gain_reg_grad_ratio", "alpha_reg_grad_ratio",
-        "gain_update_norm", "alpha_update_norm", "global_update", "val_loss",
-        "val_acc", "seconds", "peak_gb",
+        "alpha_penalty", "gain_log_mean", "gain_log_std", "gain_anchor_rms",
+        "alpha_ratio_mean", "alpha_ratio_std", "alpha_fraction_gt_080",
+        "alpha_fraction_gt_095", "global_update", "val_loss", "val_acc",
+        "seconds", "peak_gb",
     )
+    if args.rrlsso_extended_diagnostics:
+        fields = fields + (
+            "gain_grad_norm", "alpha_grad_norm", "gain_reg_grad_ratio",
+            "alpha_reg_grad_ratio", "gain_update_norm", "alpha_update_norm",
+        )
     with metrics.open(mode, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         if mode == "w":
@@ -580,7 +583,7 @@ def train(args: argparse.Namespace) -> None:
             started = time.time()
             torch.cuda.reset_peak_memory_stats()
             loss_sum = data_loss_sum = regularization_sum = 0.0
-            gain_penalty_sum = alpha_penalty_sum = 0.0
+            alpha_penalty_sum = 0.0
             sampled_regularizer_gradients = None
             sampled_total_gradients = None
             sampled_updates = None
@@ -611,7 +614,7 @@ def train(args: argparse.Namespace) -> None:
                     )
                     total_loss = data_loss + regularization
                     loss = total_loss / args.grad_accum
-                if step + 1 == steps_per_epoch:
+                if args.rrlsso_extended_diagnostics and step + 1 == steps_per_epoch:
                     sampled_regularizer_gradients = regularization_gradient_norms(
                         regularization, model
                     )
@@ -619,10 +622,12 @@ def train(args: argparse.Namespace) -> None:
                 loss_sum += total_loss.detach().item()
                 data_loss_sum += data_loss.detach().item()
                 regularization_sum += regularization.detach().item()
-                gain_penalty_sum += regularization_components["gain_anchor"].detach().item()
                 alpha_penalty_sum += regularization_components["alpha_saturation"].detach().item()
                 if (step + 1) % args.grad_accum == 0:
-                    sample_diagnostics = step + 1 == steps_per_epoch
+                    sample_diagnostics = (
+                        args.rrlsso_extended_diagnostics
+                        and step + 1 == steps_per_epoch
+                    )
                     if args.clip_grad or sample_diagnostics:
                         scaler.unscale_(optimizer)
                     if sample_diagnostics:
@@ -648,14 +653,17 @@ def train(args: argparse.Namespace) -> None:
             if observed_steps == 0:
                 raise RuntimeError("ImageNet training stream produced no batches")
             if observed_steps % args.grad_accum:
-                scaler.unscale_(optimizer)
-                sampled_total_gradients = solve_gradient_norms(model)
-                sampled_parameters_before = solve_parameter_snapshot(model)
+                if args.clip_grad or args.rrlsso_extended_diagnostics:
+                    scaler.unscale_(optimizer)
+                if args.rrlsso_extended_diagnostics:
+                    sampled_total_gradients = solve_gradient_norms(model)
+                    sampled_parameters_before = solve_parameter_snapshot(model)
                 if args.clip_grad:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 scaler.step(optimizer)
                 scaler.update()
-                sampled_updates = solve_update_norms(model, sampled_parameters_before)
+                if args.rrlsso_extended_diagnostics:
+                    sampled_updates = solve_update_norms(model, sampled_parameters_before)
                 optimizer.zero_grad(set_to_none=True)
                 global_update += 1
                 if model_ema is not None:
@@ -665,35 +673,26 @@ def train(args: argparse.Namespace) -> None:
                 model, val_loader, device, amp_dtype, args.max_val_steps
             )
             parameter_diagnostics = rrlsso_parameter_diagnostics(model, gain_reference)
-            if sampled_regularizer_gradients is None:
-                sampled_regularizer_gradients = {
-                    "gain": parameter_diagnostics["gain_log_mean"].new_zeros(()),
-                    "alpha": parameter_diagnostics["gain_log_mean"].new_zeros(()),
-                }
-            if sampled_total_gradients is None:
-                sampled_total_gradients = {
-                    key: value.new_zeros(())
-                    for key, value in sampled_regularizer_gradients.items()
-                }
-            if sampled_updates is None:
-                sampled_updates = {
-                    key: value.new_zeros(()) for key, value in sampled_total_gradients.items()
-                }
             diagnostic_values = {
                 key: float(value.item()) for key, value in parameter_diagnostics.items()
             }
-            gradient_values = {
-                "gain_grad_norm": float(sampled_total_gradients["gain"].item()),
-                "alpha_grad_norm": float(sampled_total_gradients["alpha"].item()),
-                "gain_reg_grad_ratio": float(
-                    (sampled_regularizer_gradients["gain"] / sampled_total_gradients["gain"].clamp_min(1e-30)).item()
-                ),
-                "alpha_reg_grad_ratio": float(
-                    (sampled_regularizer_gradients["alpha"] / sampled_total_gradients["alpha"].clamp_min(1e-30)).item()
-                ),
-                "gain_update_norm": float(sampled_updates["gain"].item()),
-                "alpha_update_norm": float(sampled_updates["alpha"].item()),
-            }
+            gradient_values = {}
+            if args.rrlsso_extended_diagnostics:
+                assert sampled_regularizer_gradients is not None
+                assert sampled_total_gradients is not None
+                assert sampled_updates is not None
+                gradient_values = {
+                    "gain_grad_norm": float(sampled_total_gradients["gain"].item()),
+                    "alpha_grad_norm": float(sampled_total_gradients["alpha"].item()),
+                    "gain_reg_grad_ratio": float(
+                        (sampled_regularizer_gradients["gain"] / sampled_total_gradients["gain"].clamp_min(1e-30)).item()
+                    ),
+                    "alpha_reg_grad_ratio": float(
+                        (sampled_regularizer_gradients["alpha"] / sampled_total_gradients["alpha"].clamp_min(1e-30)).item()
+                    ),
+                    "gain_update_norm": float(sampled_updates["gain"].item()),
+                    "alpha_update_norm": float(sampled_updates["alpha"].item()),
+                }
             current_lr = float(optimizer.param_groups[0]["lr"])
             row = {
                 "epoch": epoch + 1,
@@ -701,7 +700,6 @@ def train(args: argparse.Namespace) -> None:
                 "train_data_loss": data_loss_sum / observed_steps,
                 "train_regularization": regularization_sum / observed_steps,
                 "lr": current_lr,
-                "gain_penalty": gain_penalty_sum / observed_steps,
                 "alpha_penalty": alpha_penalty_sum / observed_steps,
                 **diagnostic_values,
                 **gradient_values,
@@ -816,6 +814,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rrlsso-gain-reg", type=float, default=1e-4)
     parser.add_argument("--rrlsso-alpha-reg", type=float, default=1e-4)
     parser.add_argument("--rrlsso-alpha-saturation", type=float, default=0.8)
+    parser.add_argument("--rrlsso-extended-diagnostics", action="store_true")
     parser.add_argument("--allow-unfused-lamb", action="store_true")
     parser.add_argument("--allow-batch-mismatch", action="store_true")
     parser.add_argument("--log-interval", type=int, default=100)
