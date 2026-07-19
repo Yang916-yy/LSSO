@@ -1,8 +1,9 @@
 """Single-GPU DeiT-III/RRLSSO ImageNet-1K training over WebDataset shards.
 
-The default protocol is an 800-epoch 192px stage followed by an independent
-20-epoch 224px refinement stage.  Both stages save atomic ``last.pt`` and
-``best.pt`` checkpoints and can resume at epoch boundaries.
+The stage profiles reproduce Meta's per-size DeiT-III recipes: Small is
+pre-trained at 224px, while Base/Large are pre-trained at 192px and optionally
+refined at 224px or 384px.  Every stage saves atomic ``last.pt`` and ``best.pt``
+checkpoints and can resume at epoch boundaries.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import random
 import shlex
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +26,12 @@ import torch
 import torch.nn.functional as F
 import webdataset as wds
 from timm import create_model
-from timm.data import Mixup, create_transform
+from timm.data import Mixup
 from timm.loss import SoftTargetCrossEntropy
+from timm.optim import create_optimizer_v2
+from timm.scheduler import CosineLRScheduler
+from timm.utils import ModelEmaV2
 from torch.utils.data import DataLoader
-from torchvision import transforms
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -35,6 +39,14 @@ if str(ROOT) not in sys.path:
 
 import examples.models  # noqa: E402,F401  registers project models
 from examples.models.deit3_rrlsso import DEIT3_RRLSSO_MODELS  # noqa: E402
+from experiments.deit3_official_recipe import (  # noqa: E402
+    official_recipe,
+    randaugment_finetune_transform,
+    repeat_samples,
+    rrlsso_regularization,
+    three_augment_transform,
+    validation_transform,
+)
 from lsso.mathdx_backend import is_mathdx_available, mathdx_load_error  # noqa: E402
 
 TRAIN_SAMPLES = 1_281_167
@@ -71,7 +83,7 @@ def local_webdataset(
 ) -> wds.DataPipeline:
     pipeline: list[object] = [wds.SimpleShardList(shards, seed=seed)]
     if shardshuffle:
-        pipeline.append(wds.shuffle(int(shardshuffle), seed=seed))
+        pipeline.append(wds.detshuffle(int(shardshuffle), seed=seed))
     pipeline.extend(
         [wds.split_by_worker, wds.tarfile_to_samples(handler=wds.reraise_exception)]
     )
@@ -93,29 +105,12 @@ def local_shards(root: Path, split: str) -> list[str]:
 
 
 def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
-    train_transform = create_transform(
-        input_size=args.image_size,
-        is_training=True,
-        color_jitter=0.4,
-        auto_augment="rand-m9-mstd0.5-inc1",
-        interpolation="bicubic",
-        re_prob=0.25,
-        re_mode="pixel",
-        re_count=1,
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
+    train_transform = (
+        three_augment_transform(args.image_size)
+        if args.augmentation == "three_augment"
+        else randaugment_finetune_transform(args.image_size)
     )
-    resize = int(round(args.image_size / 0.875))
-    val_transform = transforms.Compose(
-        [
-            transforms.Resize(resize, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(args.image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-            ),
-        ]
-    )
+    val_transform = validation_transform(args.image_size)
     if args.local_wds_dir:
         local_root = Path(args.local_wds_dir)
         train_shards = local_shards(local_root, "train")
@@ -131,6 +126,7 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
                 shards,
                 resampled=False,
                 shardshuffle=shardshuffle,
+                detshuffle=True,
                 seed=seed,
                 handler=wds.reraise_exception,
             )
@@ -143,9 +139,10 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         shardshuffle=min(100, len(train_shards)) if len(train_shards) > 1 else False,
         seed=args.seed,
     ).compose(
-        wds.shuffle(args.shuffle_buffer),
+        wds.detshuffle(args.shuffle_buffer, seed=args.seed + 1009),
         wds.decode("pil"),
         wds.to_tuple("jpg;jpeg;png", "cls"),
+        partial(repeat_samples, repeats=args.repeated_aug),
         wds.map_tuple(train_transform, int),
         wds.batched(args.batch_size, partial=False),
     )
@@ -155,7 +152,8 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         wds.map_tuple(val_transform, int),
         wds.batched(args.eval_batch_size, partial=True),
     )
-    steps = args.steps_per_epoch or TRAIN_SAMPLES // args.batch_size
+    official_updates = TRAIN_SAMPLES // args.effective_batch
+    steps = args.steps_per_epoch or official_updates * args.grad_accum
     train_loader = wds.WebLoader(
         train,
         batch_size=None,
@@ -198,13 +196,6 @@ def restore_rng_state(state: dict[str, Any] | None) -> None:
     torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def cosine_lr(update: int, total: int, warmup: int, peak: float, floor: float) -> float:
-    if update < warmup:
-        return peak * (update + 1) / max(1, warmup)
-    progress = min(1.0, (update - warmup) / max(1, total - warmup))
-    return floor + 0.5 * (peak - floor) * (1 + math.cos(math.pi * progress))
-
-
 def resize_position_embedding(
     state: dict[str, torch.Tensor], model: torch.nn.Module
 ) -> dict[str, torch.Tensor]:
@@ -239,6 +230,7 @@ def create_training_model(args: argparse.Namespace) -> torch.nn.Module:
         "pretrained": False,
         "img_size": args.image_size,
         "num_classes": 1000,
+        "drop_path_rate": args.drop_path_rate,
     }
     if args.model in DEIT3_RRLSSO_MODELS:
         kwargs.update(
@@ -264,6 +256,7 @@ def evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
+    amp_dtype: torch.dtype,
     max_steps: int = 0,
 ) -> tuple[float, float]:
     model.eval()
@@ -273,7 +266,7 @@ def evaluate(
             break
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=amp_dtype):
             logits = model(images)
             loss = F.cross_entropy(logits, labels)
         count = labels.numel()
@@ -284,6 +277,37 @@ def evaluate(
     if not total:
         raise RuntimeError("ImageNet validation stream produced no batches")
     return loss_sum / total, correct / total
+
+
+def create_official_optimizer(
+    model: torch.nn.Module, args: argparse.Namespace
+) -> tuple[torch.optim.Optimizer, str]:
+    optimizer_name = args.optimizer
+    if optimizer_name == "fusedlamb":
+        try:
+            optimizer = create_optimizer_v2(
+                model,
+                opt="fusedlamb",
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                eps=1e-8,
+            )
+            return optimizer, "apex_fusedlamb"
+        except ImportError as error:
+            if not args.allow_unfused_lamb:
+                raise RuntimeError(
+                    "official DeiT-III pre-training requires NVIDIA Apex FusedLAMB; "
+                    "install Apex or use --allow-unfused-lamb only for local smoke tests"
+                ) from error
+            optimizer_name = "lamb"
+    optimizer = create_optimizer_v2(
+        model,
+        opt=optimizer_name,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        eps=1e-8,
+    )
+    return optimizer, optimizer_name
 
 
 def train(args: argparse.Namespace) -> None:
@@ -302,13 +326,13 @@ def train(args: argparse.Namespace) -> None:
     )
     if args.require_mathdx and not mathdx_available:
         raise RuntimeError("--require-mathdx was set but its backend is unavailable")
-    if args.lr <= 0:
-        effective_batch = args.batch_size * args.grad_accum
-        args.lr = 4e-3 * effective_batch / 4096
-        print(
-            f"auto_lr={args.lr:.8g} effective_batch={effective_batch} reference=4e-3@4096",
-            flush=True,
+    actual_effective_batch = args.batch_size * args.grad_accum
+    if actual_effective_batch != args.effective_batch and not args.allow_batch_mismatch:
+        raise ValueError(
+            f"official {args.model}/{args.stage} effective batch is {args.effective_batch}, "
+            f"got {args.batch_size} x {args.grad_accum} = {actual_effective_batch}"
         )
+    amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
 
     train_loader, val_loader = make_loaders(args)
     model = create_training_model(args).to(device)
@@ -318,9 +342,16 @@ def train(args: argparse.Namespace) -> None:
         f"stage={args.stage}",
         flush=True,
     )
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay
+    optimizer, optimizer_impl = create_official_optimizer(model, args)
+    scheduler = CosineLRScheduler(
+        optimizer,
+        t_initial=args.epochs,
+        lr_min=args.min_lr,
+        warmup_t=args.warmup_epochs,
+        warmup_lr_init=args.warmup_lr,
+        t_in_epochs=True,
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
     mixup = Mixup(
         mixup_alpha=args.mixup,
         cutmix_alpha=args.cutmix,
@@ -330,14 +361,19 @@ def train(args: argparse.Namespace) -> None:
         label_smoothing=args.label_smoothing,
         num_classes=1000,
     )
-    criterion = SoftTargetCrossEntropy()
-    steps_per_epoch = args.steps_per_epoch or TRAIN_SAMPLES // args.batch_size
-    updates_per_epoch = math.ceil(steps_per_epoch / args.grad_accum)
-    total_updates = updates_per_epoch * args.epochs
-    warmup_updates = updates_per_epoch * args.warmup_epochs
+    criterion: torch.nn.Module = (
+        torch.nn.BCEWithLogitsLoss() if args.bce_loss else SoftTargetCrossEntropy()
+    )
+    official_updates = TRAIN_SAMPLES // args.effective_batch
+    steps_per_epoch = args.steps_per_epoch or official_updates * args.grad_accum
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    config = vars(args) | {"parameter_count": parameter_count}
+    config = vars(args) | {
+        "parameter_count": parameter_count,
+        "optimizer_impl": optimizer_impl,
+        "actual_effective_batch": actual_effective_batch,
+        "official_updates_per_epoch": official_updates,
+    }
     (output / "config.json").write_text(
         json.dumps(config, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -345,10 +381,13 @@ def train(args: argparse.Namespace) -> None:
     start_epoch = global_update = 0
     best_acc = -1.0
     last = output / "last.pt"
+    checkpoint: dict[str, Any] | None = None
     if args.resume and last.is_file():
         checkpoint = torch.load(last, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        scaler.load_state_dict(checkpoint.get("scaler", {}))
         start_epoch = int(checkpoint["epoch"])
         global_update = int(checkpoint["global_update"])
         best_acc = float(checkpoint["best_acc"])
@@ -359,15 +398,29 @@ def train(args: argparse.Namespace) -> None:
         model_state = resize_position_embedding(checkpoint["model"], model)
         model.load_state_dict(model_state)
         print(f"initialized model from {args.init_checkpoint}", flush=True)
-    elif args.stage == "finetune":
+    elif args.stage != "pretrain":
         raise FileNotFoundError(
-            f"no resumable checkpoint at {last}; pass the 192px best.pt with "
-            "--init-checkpoint"
+            f"no resumable checkpoint at {last}; pass the preceding stage's best.pt "
+            "with --init-checkpoint"
         )
+    model_ema = ModelEmaV2(model, decay=args.ema_decay) if args.ema else None
+    if checkpoint is not None and model_ema is not None and checkpoint.get("model_ema") is not None:
+        model_ema.module.load_state_dict(checkpoint["model_ema"])
+
+    print(
+        f"recipe=official_deit3 optimizer={optimizer_impl} lr={args.lr:g} "
+        f"drop_path={args.drop_path_rate:g} repeated_aug={args.repeated_aug} "
+        f"amp={args.amp_dtype} effective_batch={actual_effective_batch} "
+        f"rrlsso_reg=(gain={args.rrlsso_gain_reg:g},alpha={args.rrlsso_alpha_reg:g})",
+        flush=True,
+    )
 
     metrics = output / "metrics.csv"
     mode = "a" if start_epoch and metrics.exists() else "w"
-    fields = ("epoch", "train_loss", "val_loss", "val_acc", "seconds", "peak_gb")
+    fields = (
+        "epoch", "train_loss", "train_data_loss", "train_regularization", "lr",
+        "val_loss", "val_acc", "seconds", "peak_gb",
+    )
     with metrics.open(mode, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         if mode == "w":
@@ -377,54 +430,71 @@ def train(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             started = time.time()
             torch.cuda.reset_peak_memory_stats()
-            loss_sum = 0.0
+            loss_sum = data_loss_sum = regularization_sum = 0.0
             observed_steps = 0
             for step, (images, labels) in enumerate(train_loader):
                 if step >= steps_per_epoch:
                     break
                 observed_steps = step + 1
-                images, labels = mixup(images, labels)
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss = criterion(model(images), labels) / args.grad_accum
-                loss.backward()
-                loss_sum += loss.item() * args.grad_accum
+                images, labels = mixup(images, labels)
+                if args.bce_loss:
+                    labels = labels.gt(0.0).to(labels.dtype)
+                with torch.autocast("cuda", dtype=amp_dtype):
+                    data_loss = criterion(model(images), labels)
+                    regularization, _ = rrlsso_regularization(
+                        model,
+                        gain_anchor_weight=args.rrlsso_gain_reg,
+                        alpha_saturation_weight=args.rrlsso_alpha_reg,
+                        alpha_saturation_fraction=args.rrlsso_alpha_saturation,
+                    )
+                    total_loss = data_loss + regularization
+                    loss = total_loss / args.grad_accum
+                scaler.scale(loss).backward()
+                loss_sum += total_loss.detach().item()
+                data_loss_sum += data_loss.detach().item()
+                regularization_sum += regularization.detach().item()
                 if (step + 1) % args.grad_accum == 0:
                     if args.clip_grad:
+                        scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                    lr = cosine_lr(
-                        global_update, total_updates, warmup_updates, args.lr, args.min_lr
-                    )
-                    for group in optimizer.param_groups:
-                        group["lr"] = lr
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad(set_to_none=True)
                     global_update += 1
+                    if model_ema is not None:
+                        model_ema.update(model)
                 if (step + 1) % args.log_interval == 0:
                     print(
                         f"epoch={epoch + 1} step={step + 1}/{steps_per_epoch} "
-                        f"loss={loss_sum / (step + 1):.4f}",
+                        f"loss={loss_sum / (step + 1):.4f} "
+                        f"reg={regularization_sum / (step + 1):.6g}",
                         flush=True,
                     )
             if observed_steps == 0:
                 raise RuntimeError("ImageNet training stream produced no batches")
             if observed_steps % args.grad_accum:
                 if args.clip_grad:
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                lr = cosine_lr(
-                    global_update, total_updates, warmup_updates, args.lr, args.min_lr
-                )
-                for group in optimizer.param_groups:
-                    group["lr"] = lr
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 global_update += 1
+                if model_ema is not None:
+                    model_ema.update(model)
 
-            val_loss, val_acc = evaluate(model, val_loader, device, args.max_val_steps)
+            val_loss, val_acc = evaluate(
+                model, val_loader, device, amp_dtype, args.max_val_steps
+            )
+            current_lr = float(optimizer.param_groups[0]["lr"])
             row = {
                 "epoch": epoch + 1,
                 "train_loss": loss_sum / observed_steps,
+                "train_data_loss": data_loss_sum / observed_steps,
+                "train_regularization": regularization_sum / observed_steps,
+                "lr": current_lr,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
                 "seconds": time.time() - started,
@@ -435,9 +505,13 @@ def train(args: argparse.Namespace) -> None:
             print(row, flush=True)
             is_best = val_acc > best_acc
             best_acc = max(best_acc, val_acc)
+            scheduler.step(epoch + 1)
             state = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "model_ema": model_ema.module.state_dict() if model_ema is not None else None,
                 "epoch": epoch + 1,
                 "global_update": global_update,
                 "best_acc": best_acc,
@@ -450,22 +524,35 @@ def train(args: argparse.Namespace) -> None:
 
 
 def apply_stage_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    pretrain = args.stage == "pretrain"
-    args.epochs = args.epochs if args.epochs is not None else (800 if pretrain else 20)
-    args.image_size = args.image_size if args.image_size is not None else (192 if pretrain else 224)
-    args.warmup_epochs = (
-        args.warmup_epochs if args.warmup_epochs is not None else (20 if pretrain else 5)
-    )
-    args.weight_decay = (
-        args.weight_decay if args.weight_decay is not None else (0.05 if pretrain else 0.1)
-    )
-    args.min_lr = args.min_lr if args.min_lr is not None else (1e-5 if pretrain else 1e-6)
-    if args.lr is None:
-        args.lr = 0.0 if pretrain else 1e-5
+    recipe = official_recipe(args.model, args.stage)
+    for name in (
+        "image_size", "peak_lr", "min_lr", "warmup_lr", "warmup_epochs",
+        "weight_decay", "drop_path_rate", "optimizer", "effective_batch",
+        "repeated_aug", "bce_loss", "label_smoothing", "augmentation",
+    ):
+        value = getattr(recipe, name)
+        setattr(args, "lr" if name == "peak_lr" else name, value)
+    args.epochs = args.epochs if args.epochs is not None else recipe.epochs
+    if args.batch_size is None:
+        if args.stage == "pretrain":
+            args.batch_size = 128 if recipe.size == "large" else 512
+        elif args.stage == "finetune384":
+            args.batch_size = {"small": 64, "base": 32, "large": 16}[recipe.size]
+        else:
+            args.batch_size = 128 if recipe.size == "large" else 512
+    if args.grad_accum is None:
+        if args.effective_batch % args.batch_size:
+            raise ValueError(
+                f"physical batch {args.batch_size} does not divide official effective "
+                f"batch {args.effective_batch}"
+            )
+        args.grad_accum = args.effective_batch // args.batch_size
+    if args.eval_batch_size is None:
+        args.eval_batch_size = args.batch_size
     if not args.output:
-        suffix = "pretrain192" if pretrain else "finetune224"
+        suffix = f"pretrain{args.image_size}" if args.stage == "pretrain" else args.stage
         args.output = str(Path("runs/imagenet1k") / args.model / suffix)
-    if not pretrain and not args.resume and not args.init_checkpoint:
+    if args.stage != "pretrain" and not args.resume and not args.init_checkpoint:
         raise ValueError("the finetune stage requires --init-checkpoint when --no-resume is used")
     return args
 
@@ -473,9 +560,11 @@ def apply_stage_defaults(args: argparse.Namespace) -> argparse.Namespace:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model", default="deit3_base_patch16_192_rrlsso", choices=tuple(DEIT3_RRLSSO_MODELS)
+        "--model", default="deit3_base_patch16_rrlsso", choices=tuple(DEIT3_RRLSSO_MODELS)
     )
-    parser.add_argument("--stage", choices=("pretrain", "finetune"), default="pretrain")
+    parser.add_argument(
+        "--stage", choices=("pretrain", "finetune224", "finetune384"), default="pretrain"
+    )
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--gain-init", type=float, default=1.0)
     parser.add_argument("--alpha-init", type=float, default=1.2)
@@ -486,24 +575,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", default="")
     parser.add_argument("--init-checkpoint", default="")
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--eval-batch-size", type=int, default=256)
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--eval-batch-size", type=int, default=None)
+    parser.add_argument("--grad-accum", type=int, default=None)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--eval-workers", type=int, default=2)
     parser.add_argument("--shuffle-buffer", type=int, default=10000)
     parser.add_argument("--shard-limit", type=int, default=0)
     parser.add_argument("--steps-per-epoch", type=int, default=0)
     parser.add_argument("--max-val-steps", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--min-lr", type=float, default=None)
-    parser.add_argument("--warmup-epochs", type=int, default=None)
-    parser.add_argument("--weight-decay", type=float, default=None)
-    parser.add_argument("--mixup", type=float, default=0.8)
-    parser.add_argument("--cutmix", type=float, default=1.0)
-    parser.add_argument("--label-smoothing", type=float, default=0.1)
-    parser.add_argument("--clip-grad", type=float, default=5.0)
+    parser.set_defaults(mixup=0.8, cutmix=1.0)
+    parser.add_argument("--clip-grad", type=float, default=0.0)
+    parser.add_argument("--amp-dtype", choices=("fp16", "bf16"), default="fp16")
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ema-decay", type=float, default=0.99996)
+    parser.add_argument("--rrlsso-gain-reg", type=float, default=1e-4)
+    parser.add_argument("--rrlsso-alpha-reg", type=float, default=1e-4)
+    parser.add_argument("--rrlsso-alpha-saturation", type=float, default=0.8)
+    parser.add_argument("--allow-unfused-lamb", action="store_true")
+    parser.add_argument("--allow-batch-mismatch", action="store_true")
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)

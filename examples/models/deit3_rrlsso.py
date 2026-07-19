@@ -7,15 +7,16 @@ from typing import Any
 import torch
 import torch.nn as nn
 import timm
+from timm.layers import DropPath
 from timm.models import register_model
 
 from lsso import RRLSSO
 
 
 DEIT3_RRLSSO_MODELS = {
-    "deit3_small_patch16_192_rrlsso": "deit3_small_patch16_224",
-    "deit3_base_patch16_192_rrlsso": "deit3_base_patch16_224",
-    "deit3_large_patch16_192_rrlsso": "deit3_large_patch16_224",
+    "deit3_small_patch16_rrlsso": "deit3_small_patch16_224",
+    "deit3_base_patch16_rrlsso": "deit3_base_patch16_224",
+    "deit3_large_patch16_rrlsso": "deit3_large_patch16_224",
 }
 
 
@@ -127,8 +128,18 @@ def _create_deit3_rrlsso(
         "length_normalize": bool(kwargs.pop("length_normalize", True)),
         "length_reference": float(kwargs.pop("length_reference", 1.0)),
     }
-    kwargs.setdefault("img_size", 192)
+    # Meta's released DeiT-III implementation uses LayerScale=1e-4 and a
+    # constant stochastic-depth rate in every block. timm's current DeiT-III
+    # defaults use 1e-6 and a depth-wise schedule, so make the official
+    # training architecture explicit here.
+    kwargs.setdefault("img_size", 224)
+    kwargs.setdefault("init_values", 1e-4)
+    drop_path_rate = float(kwargs.pop("drop_path_rate", 0.0))
     model = timm.create_model(base_model, pretrained=False, **kwargs)
+    for block in model.blocks:
+        drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
+        block.drop_path1 = drop_path
+        block.drop_path2 = drop_path
     replaced = replace_timm_attention_with_rrlsso(
         model,
         rank=rank,
@@ -138,13 +149,15 @@ def _create_deit3_rrlsso(
         "rank": rank,
         "replaced_layers": replaced,
         "rank_rotary": "ordinary-1d",
+        "layerscale_init": 1e-4,
+        "constant_drop_path_rate": drop_path_rate,
         **mixer_kwargs,
     }
     return model
 
 
 @register_model
-def deit3_small_patch16_192_rrlsso(
+def deit3_small_patch16_rrlsso(
     pretrained: bool = False, **kwargs: Any
 ) -> nn.Module:
     return _create_deit3_rrlsso(
@@ -153,7 +166,7 @@ def deit3_small_patch16_192_rrlsso(
 
 
 @register_model
-def deit3_base_patch16_192_rrlsso(
+def deit3_base_patch16_rrlsso(
     pretrained: bool = False, **kwargs: Any
 ) -> nn.Module:
     return _create_deit3_rrlsso(
@@ -162,7 +175,7 @@ def deit3_base_patch16_192_rrlsso(
 
 
 @register_model
-def deit3_large_patch16_192_rrlsso(
+def deit3_large_patch16_rrlsso(
     pretrained: bool = False, **kwargs: Any
 ) -> nn.Module:
     return _create_deit3_rrlsso(
@@ -173,8 +186,8 @@ def deit3_large_patch16_192_rrlsso(
 __all__ = [
     "DEIT3_RRLSSO_MODELS",
     "TimmRRLSSOAttention",
-    "deit3_base_patch16_192_rrlsso",
-    "deit3_large_patch16_192_rrlsso",
-    "deit3_small_patch16_192_rrlsso",
+    "deit3_base_patch16_rrlsso",
+    "deit3_large_patch16_rrlsso",
+    "deit3_small_patch16_rrlsso",
     "replace_timm_attention_with_rrlsso",
 ]

@@ -49,22 +49,32 @@ def test_timm_rrlsso_attention_rejects_causal_mode() -> None:
 
 def test_all_deit3_rrlsso_models_are_registered() -> None:
     assert set(DEIT3_RRLSSO_MODELS) == {
-        "deit3_small_patch16_192_rrlsso",
-        "deit3_base_patch16_192_rrlsso",
-        "deit3_large_patch16_192_rrlsso",
+        "deit3_small_patch16_rrlsso",
+        "deit3_base_patch16_rrlsso",
+        "deit3_large_patch16_rrlsso",
     }
     assert all(timm.is_model(name) for name in DEIT3_RRLSSO_MODELS)
+    assert not any(
+        timm.is_model(f"deit3_{size}_patch16_192_rrlsso")
+        for size in ("small", "base", "large")
+    )
 
 
 def test_registered_small_model_replaces_every_attention_block() -> None:
     model = timm.create_model(
-        "deit3_small_patch16_192_rrlsso",
+        "deit3_small_patch16_rrlsso",
         img_size=32,
         num_classes=7,
         rank=8,
+        drop_path_rate=0.05,
     )
     assert len(model.blocks) == 12
     assert model.rrlsso_config["replaced_layers"] == 12
     assert model.rrlsso_config["rank_rotary"] == "ordinary-1d"
+    assert model.rrlsso_config["layerscale_init"] == 1e-4
+    assert model.rrlsso_config["constant_drop_path_rate"] == 0.05
+    assert model.blocks[0].ls1.gamma[0].item() == pytest.approx(1e-4)
+    assert model.blocks[0].drop_path1.drop_prob == pytest.approx(0.05)
+    assert model.blocks[-1].drop_path1.drop_prob == pytest.approx(0.05)
     assert all(isinstance(block.attn, TimmRRLSSOAttention) for block in model.blocks)
     assert model(torch.randn(1, 3, 32, 32)).shape == (1, 7)
