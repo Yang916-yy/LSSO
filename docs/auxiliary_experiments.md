@@ -6,9 +6,10 @@ whether RRLSSO transfers beyond vision without requiring the project to
 reproduce every competing operator.
 
 The previous MS MARCO/BEIR retrieval and FLIP AAV protein experiments are no
-longer part of the paper plan. Their implementations remain in `experiments/`
-as archived prototypes; they must not be included in the formal experiment
-matrix or GPU budget unless the plan is explicitly revised.
+longer part of the paper plan. Their historical implementations live under
+`archive/retired_auxiliary_benchmarks/`; they are not supported launchers and
+must not be included in the formal experiment matrix or GPU budget unless the
+plan is explicitly revised.
 
 ## Formal suite
 
@@ -78,34 +79,23 @@ when the official configuration is matched exactly. LRA is retained as a
 standardized operator comparison, not treated as conclusive proof of genuine
 long-range reasoning.
 
-### 3. UEA-30 multivariate time-series classification
+### 3. Excluded probe: UEA-30 multivariate time series
 
-Run the complete 30-dataset UEA multivariate archive using the official
-training and test splits. Do not select datasets after observing results.
-Each input channel is projected to the shared model width; padding masks must
-exclude missing/padded timesteps from both the structured solve and pooling.
-
-Use accuracy per dataset and report:
-
-- mean rank over all 30 datasets;
-- average accuracy as a secondary summary;
-- wins/ties/losses against each reference method;
-- a critical-difference diagram when the number of complete methods permits;
-- peak memory and throughput on representative short, medium, and long series.
-
-The reference table should include standard published results for DTW,
-ROCKET-family methods, InceptionTime, ConvTran, and a Transformer baseline.
-Published numbers using the same archive version, official split, and metric
-may appear in a clearly labelled **reported baselines** block even when their
-method-specific preprocessing differs. They are not controlled reproductions.
-Results based on resampled or altered splits are contextual references only.
+UEA-30 is no longer a formal paper benchmark. A complete seed-0 RRLSSO probe
+was retained locally, but its many tiny training sets are mismatched to the
+current wide solve encoder. The 30-task mean was 67.67%, and a controlled
+multiscale-local-stem/meanmax refinement remained below the same-scaffold MHA
+anchor on AtrialFibrillation, DuckDuckGeese, and EthanolConcentration. These
+results define a useful sample-efficiency boundary; they are not included in
+the headline auxiliary table or cross-domain claim. The retired UEA runner is
+preserved only as a historical snapshot under `archive/`.
 
 ## Minimum self-run policy
 
 The main CV experiments remain the controlled MHA/LSSO/RRLSSO comparison.
 The auxiliary suite minimizes new training as follows:
 
-1. Run RRLSSO on every task in the three formal suites.
+1. Run RRLSSO on every task in the two formal auxiliary suites.
 2. Use published baselines wherever the protocol is exactly compatible.
 3. Run one internal MHA anchor per suite only if needed to validate that the
    local data pipeline reproduces the published protocol. Do not run the full
@@ -141,8 +131,8 @@ From the repository root:
 pip install -e ".[sequence]"
 ```
 
-`datasets` loads the GenomicBenchmarks author mirrors and IMDB, `aeon`
-downloads the official UEA train/test archives, and Pillow reads Pathfinder.
+`datasets` loads the GenomicBenchmarks author mirrors and IMDB, and Pillow
+reads Pathfinder.
 The optional `genomic-benchmarks` package is only a fallback and is not needed
 when the Hugging Face mirrors are available.
 
@@ -187,7 +177,7 @@ After selecting Base+motif-7, run the low-budget HyenaDNA-flavored recipe
 transfer with:
 
 ```bash
-python experiments/run_genomic_recipe_probe.py
+python experiments/search/run_genomic_recipe_probe.py
 ```
 
 It changes only architecture-agnostic training choices on Non-TATA and OCR:
@@ -202,8 +192,8 @@ probability 0.002 for epochs 0--79, then disables mutation for a 20-epoch clean
 fine-tuning tail:
 
 ```bash
-python experiments/run_genomic_recipe_probe.py --posthoc-rc-eval --tasks TASK...
-python experiments/run_genomic_recipe_probe.py --rc-mutation --tasks TASK...
+python experiments/search/run_genomic_recipe_probe.py --posthoc-rc-eval --tasks TASK...
+python experiments/search/run_genomic_recipe_probe.py --rc-mutation --tasks TASK...
 ```
 
 The first two stages pass `--validation-only`; those run directories contain
@@ -232,8 +222,8 @@ python experiments/genomic_benchmarks.py \
 python experiments/lra_benchmark.py --task listops --epochs 1 \
   --max-train-samples 64 --max-eval-samples 64 --max-train-batches 2
 
-python experiments/uea_benchmark.py --dataset BasicMotions --epochs 1 \
-  --max-train-batches 2 --workers 0
+python experiments/lra_benchmark.py --task text --epochs 1 \
+  --max-train-samples 64 --max-eval-samples 64 --max-train-batches 2
 ```
 
 Run the complete RRLSSO matrix sequentially for seeds 0/1/2:
@@ -299,6 +289,14 @@ python experiments/run_sequence_benchmarks.py --suite lra \
   --download-lra --download-aan --seeds 0
 ```
 
+The AAN training TSV is a multi-gigabyte LFS object. If an interrupted Hub
+snapshot leaves a stale local tree manifest, use the fixed-revision HTTP
+fallback, which resumes `.partial` files and renames them atomically:
+
+```bash
+python tools/download_lra_aan.py --data-root data/lra
+```
+
 For a formal run, execute `tools/prepare_lra_data.py` first so integrity is
 checked before GPU time is consumed. Tokenized ListOps, IMDB, and AAN
 are written once as memory-mapped `uint16` caches under `data/lra_cache`.
@@ -322,7 +320,5 @@ counts are retained in the CSV outputs. An optional reported-baseline CSV can be
 Ranks use only the intersection of datasets completed by every included model,
 so missing results cannot improve a model's rank.
 
-UEA defaults to a rank-16 factorized learned absolute position table. This is
-still a trainable absolute position embedding, but its parameter cost is
-`length * 16 + 16 * model_dim` instead of `length * model_dim`. Passing
-`--position-rank 0` restores the full learned table.
+The excluded UEA implementation is archived separately from the formal
+auxiliary suite.

@@ -6,38 +6,61 @@ import torch.nn.functional as F
 
 from .modules import LSSO
 from .modules_v2 import RRLSSO
-from .rotary_2d import (
-    apply_2d_rotary,
-    apply_rotary_factors,
-    build_2d_rotary_factors,
-)
 
 
 class RotaryMHA(nn.Module):
-    """Batch-first MHA with optional separable 2-D RoPE and SDPA backend."""
+    """Batch-first MHA with optional 1-D/2-D RoPE and SDPA backend."""
 
-    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        rotary_1d: bool = False,
+    ):
         super().__init__()
         if dim % num_heads:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         self.dim, self.num_heads = dim, num_heads
         self.head_dim = dim // num_heads
         self.dropout = float(dropout)
+        self.rotary_1d = bool(rotary_1d)
+        if self.rotary_1d and self.head_dim % 2:
+            raise ValueError("1-D RoPE requires an even head dimension")
         self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
         self.proj = nn.Linear(dim, dim, bias=bias)
-        self.register_buffer("_rotary_cos", torch.empty(0), persistent=False)
-        self.register_buffer("_rotary_sin", torch.empty(0), persistent=False)
-        self._rotary_cache_key: tuple | None = None
+        self.register_buffer("_rotary_1d_cos", torch.empty(0), persistent=False)
+        self.register_buffer("_rotary_1d_sin", torch.empty(0), persistent=False)
+        self._rotary_1d_cache_key: tuple | None = None
 
-    def _grid_factors(self, x: torch.Tensor, spatial_shape, num_prefix_tokens):
-        key = (spatial_shape, num_prefix_tokens, self.head_dim, x.device, x.dtype)
-        if self._rotary_cache_key != key or self._rotary_cos.is_inference() != x.is_inference():
-            self._rotary_cos, self._rotary_sin = build_2d_rotary_factors(
-                self.head_dim, spatial_shape=spatial_shape,
-                num_prefix_tokens=num_prefix_tokens, device=x.device, dtype=x.dtype,
+    def _sequence_factors(self, x: torch.Tensor, length: int):
+        key = (length, self.head_dim, x.device, x.dtype)
+        if (
+            self._rotary_1d_cache_key != key
+            or self._rotary_1d_cos.is_inference() != x.is_inference()
+        ):
+            calc_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+            half = self.head_dim // 2
+            inv_freq = 10000.0 ** (
+                -torch.arange(half, device=x.device, dtype=calc_dtype) / half
             )
-            self._rotary_cache_key = key
-        return self._rotary_cos, self._rotary_sin
+            positions = torch.arange(length, device=x.device, dtype=calc_dtype)
+            angles = positions[:, None] * inv_freq[None, :]
+            self._rotary_1d_cos = angles.cos().to(x.dtype).view(1, 1, length, half)
+            self._rotary_1d_sin = angles.sin().to(x.dtype).view(1, 1, length, half)
+            self._rotary_1d_cache_key = key
+        return self._rotary_1d_cos, self._rotary_1d_sin
+
+    @staticmethod
+    def _apply_1d_rotary(
+        value: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        even, odd = value[..., 0::2], value[..., 1::2]
+        output = torch.empty_like(value)
+        output[..., 0::2] = even * cos - odd * sin
+        output[..., 1::2] = even * sin + odd * cos
+        return output
 
     def forward(
         self,
@@ -45,21 +68,15 @@ class RotaryMHA(nn.Module):
         *,
         valid_mask: torch.Tensor | None = None,
         padding_ratio_hint: float | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        position_coords: torch.Tensor | None = None,
-        num_prefix_tokens: int = 0,
     ) -> torch.Tensor:
         B, N, D = x.shape
         qkv = self.qkv(x).view(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
-        if spatial_shape is not None and position_coords is None:
-            cos, sin = self._grid_factors(x, spatial_shape, num_prefix_tokens)
-            q = apply_rotary_factors(q, cos, sin)
-            k = apply_rotary_factors(k, cos, sin)
-        elif position_coords is not None:
-            q = apply_2d_rotary(q, position_coords=position_coords)
-            k = apply_2d_rotary(k, position_coords=position_coords)
+        if self.rotary_1d:
+            cos, sin = self._sequence_factors(x, N)
+            q = self._apply_1d_rotary(q, cos, sin)
+            k = self._apply_1d_rotary(k, cos, sin)
         attn_mask = None
         if valid_mask is not None:
             if valid_mask.shape != (B, N):
@@ -88,18 +105,23 @@ class MixerAdapter(nn.Module):
         rank: int = 32,
         dropout: float = 0.0,
         bias: bool = True,
-        rotary_2d: bool = True,
+        rotary_1d: bool = False,
         **lsso_kwargs,
     ) -> None:
         super().__init__()
         name = mixer.lower().replace("_", "-")
         self.mixer_name = name
-        self.rotary_2d = bool(rotary_2d)
         if name == "mha":
-            self.mixer = RotaryMHA(dim, num_heads, dropout=dropout, bias=bias)
+            self.mixer = RotaryMHA(
+                dim,
+                num_heads,
+                dropout=dropout,
+                bias=bias,
+                rotary_1d=rotary_1d,
+            )
         elif name == "lsso":
             self.mixer = LSSO(dim, num_heads, rank=rank, dropout=dropout, bias=bias, **lsso_kwargs)
-        elif name in {"rrlsso", "rope-lsso"}:
+        elif name == "rrlsso":
             self.mixer = RRLSSO(dim, num_heads, rank=rank, dropout=dropout, bias=bias, **lsso_kwargs)
         else:
             raise ValueError(f"unknown mixer {mixer!r}; expected mha, lsso, or rrlsso")
@@ -110,17 +132,10 @@ class MixerAdapter(nn.Module):
         *,
         valid_mask: torch.Tensor | None = None,
         padding_ratio_hint: float | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        position_coords: torch.Tensor | None = None,
-        num_prefix_tokens: int = 0,
     ) -> torch.Tensor:
-        positional = spatial_shape is not None or position_coords is not None
         if self.mixer_name == "mha":
             return self.mixer(
                 x, valid_mask=valid_mask,
-                spatial_shape=spatial_shape if self.rotary_2d else None,
-                position_coords=position_coords if self.rotary_2d else None,
-                num_prefix_tokens=num_prefix_tokens,
             )
         if self.mixer_name == "lsso":
             return self.mixer(
@@ -132,7 +147,4 @@ class MixerAdapter(nn.Module):
             x,
             valid_mask=valid_mask,
             padding_ratio_hint=padding_ratio_hint,
-            spatial_shape=spatial_shape if self.rotary_2d and positional else None,
-            position_coords=position_coords if self.rotary_2d and positional else None,
-            num_prefix_tokens=num_prefix_tokens,
         )

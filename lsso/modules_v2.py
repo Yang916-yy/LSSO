@@ -4,9 +4,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .mathdx_backend import try_prepare_basis, try_rank_rotary
-from .modules import LSSODiagnostics, lsso
-from .rotary_2d import apply_2d_rank_rotary, apply_rotary_factors, build_2d_rotary_factors
+from .mathdx_backend import (
+    try_rank_rotary,
+)
+from .modules import (
+    DEFAULT_ALPHA_INIT,
+    DEFAULT_ALPHA_MAX,
+    DEFAULT_GAIN_INIT,
+    LSSODiagnostics,
+    _initialize_solve_parameters,
+    _legacy_solve_state_dict_pre_hook,
+    _fold_fixed_gain_into_output,
+    _solve_parameters,
+    _sync_alpha_max_after_load,
+    lsso_gain_alpha,
+)
 
 
 def apply_rank_rotary(
@@ -70,17 +82,6 @@ def apply_rank_rotary(
     return out
 
 
-def apply_rank_rope(
-    U: torch.Tensor,
-    position_ids: torch.Tensor | None = None,
-    *,
-    base: float = 10000.0,
-    scale: float = 1.0,
-) -> torch.Tensor:
-    """Backward-compatible name for :func:`apply_rank_rotary`."""
-    return apply_rank_rotary(U, position_ids, base=base, scale=scale)
-
-
 class RRLSSO(nn.Module):
     """
     Rank-Rotary LSSO.
@@ -95,9 +96,8 @@ class RRLSSO(nn.Module):
 
         K_ij = u_i^T R(p_j - p_i) u_j
 
-    Despite the historical RoPE-LSSO name, this transform is not a learned or
-    absolute position embedding. It only rotates U inside the bidirectional
-    LSSO operator.
+    Rank Rotary acts only on the solve basis ``U`` inside the bidirectional
+    operator; it is independent of token position embeddings.
     """
 
     def __init__(
@@ -107,14 +107,17 @@ class RRLSSO(nn.Module):
         rank: int = 16,
         dropout: float = 0.0,
         eps: float = 1e-5,
-        gamma_max: float = 1.2,
-        theta_gamma_init: float = 0.5,
+        gain_init: float = DEFAULT_GAIN_INIT,
+        alpha_init: float = DEFAULT_ALPHA_INIT,
+        solve_parameterization: str = "gain_alpha",
+        alpha_max: float = DEFAULT_ALPHA_MAX,
         no_global: bool = False,
         normalize_u: bool = True,
+        basis_normalization: str = "trace",
         length_normalize: bool = True,
         length_reference: float = 1.0,
-        rope_base: float = 10000.0,
-        rope_scale: float = 1.0,
+        rotary_base: float = 10000.0,
+        rotary_scale: float = 1.0,
         bias: bool = False,
     ) -> None:
         super().__init__()
@@ -128,15 +131,20 @@ class RRLSSO(nn.Module):
         self.head_dim = dim // num_heads
         self.rank = rank
         self.eps = eps
-        self.gamma_max = gamma_max
         self.no_global = no_global
         self.normalize_u = normalize_u
+        if basis_normalization not in {"trace", "token_rms"}:
+            raise ValueError(
+                "basis_normalization must be 'trace' or 'token_rms', "
+                f"got {basis_normalization!r}"
+            )
+        self.basis_normalization = basis_normalization
         self.length_normalize = length_normalize
         if length_reference <= 0:
             raise ValueError(f"length_reference must be positive, got {length_reference}")
         self.length_reference = float(length_reference)
-        self.rope_base = rope_base
-        self.rope_scale = rope_scale
+        self.rotary_base = rotary_base
+        self.rotary_scale = rotary_scale
 
         self.uc_dim = num_heads * rank + dim
         self.w_uc = nn.Linear(dim, self.uc_dim, bias=bias)
@@ -146,21 +154,42 @@ class RRLSSO(nn.Module):
             torch.eye(rank).view(1, 1, rank, rank),
             persistent=False,
         )
-        self.register_buffer("_rope_cos_cache", torch.empty(0), persistent=False)
-        self.register_buffer("_rope_sin_cache", torch.empty(0), persistent=False)
-        self.register_buffer("_rope_2d_cos_cache", torch.empty(0), persistent=False)
-        self.register_buffer("_rope_2d_sin_cache", torch.empty(0), persistent=False)
-        self._rope_2d_cache_key: tuple | None = None
+        self.register_buffer("_rotary_cos_cache", torch.empty(0), persistent=False)
+        self.register_buffer("_rotary_sin_cache", torch.empty(0), persistent=False)
 
-        self.theta_mu = nn.Parameter(torch.zeros(num_heads))
-        self.theta_gamma = nn.Parameter(
-            torch.full((num_heads,), float(theta_gamma_init), dtype=torch.float32)
+        _initialize_solve_parameters(
+            self,
+            num_heads,
+            solve_parameterization=solve_parameterization,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            alpha_max=alpha_max,
+        )
+        self.register_load_state_dict_pre_hook(_legacy_solve_state_dict_pre_hook)
+        self.register_load_state_dict_post_hook(_sync_alpha_max_after_load)
+        _fold_fixed_gain_into_output(
+            self,
+            groups=num_heads,
+            group_width=self.head_dim,
         )
 
         self.dropout_p = dropout
         self.record_diagnostics = False
         self.prune_rank_keep: int | None = None
         self.last_diagnostics: LSSODiagnostics | None = None
+
+    def effective_gain_alpha(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the positive output gain and relative solve strength."""
+
+        return _solve_parameters(self)
+
+    def fold_fixed_gain_into_output(self, *, force: bool = False) -> None:
+        _fold_fixed_gain_into_output(
+            self,
+            groups=self.num_heads,
+            group_width=self.head_dim,
+            force=force,
+        )
 
     def forward(
         self,
@@ -169,148 +198,79 @@ class RRLSSO(nn.Module):
         position_ids: torch.Tensor | None = None,
         *,
         padding_ratio_hint: float | None = None,
-        spatial_shape: tuple[int, int] | None = None,
-        position_coords: torch.Tensor | None = None,
-        num_prefix_tokens: int = 0,
     ) -> torch.Tensor:
         B, N, D = x.shape
         H = self.num_heads
         dh = self.head_dim
         r = self.rank
-        head_mask = None
-        if valid_mask is not None:
-            head_mask = valid_mask[:, None, :, None].to(
-                device=x.device,
-                dtype=x.dtype,
-            )
-
         UC = self.w_uc(x)
         U, C = UC.split((H * r, D), dim=-1)
-        U = U.view(B, N, H, r).transpose(1, 2).contiguous()
-        C = C.view(B, N, H, dh).transpose(1, 2).contiguous()
+        # The native Rank Rotary kernel consumes this token-major strided view
+        # and writes the rotated basis directly in head-major order. Avoid an
+        # otherwise redundant full U layout copy before rotation.
+        U = U.view(B, N, H, r).transpose(1, 2)
+        C = C.view(B, N, H, dh).transpose(1, 2)
 
-        use_2d_rotary = spatial_shape is not None or position_coords is not None
-        if use_2d_rotary and position_ids is not None:
-            raise ValueError("position_ids cannot be combined with 2-D rotary coordinates")
         pruning_active = self.prune_rank_keep is not None and 0 < self.prune_rank_keep < r
-        fused_basis = False
-        if use_2d_rotary:
-            if spatial_shape is not None and position_coords is None:
-                cache_key = (spatial_shape, num_prefix_tokens, r, U.device, U.dtype)
-                if (
-                    self._rope_2d_cache_key != cache_key
-                    or (
-                        torch.is_grad_enabled()
-                        and torch.is_inference(self._rope_2d_cos_cache)
-                    )
-                ):
-                    self._rope_2d_cos_cache, self._rope_2d_sin_cache = build_2d_rotary_factors(
-                        r, spatial_shape=spatial_shape,
-                        num_prefix_tokens=num_prefix_tokens, base=self.rope_base,
-                        scale=self.rope_scale, device=U.device, dtype=U.dtype,
-                    )
-                    self._rope_2d_cache_key = cache_key
-                if (
-                    self.normalize_u
-                    and self.length_normalize
-                    and valid_mask is None
-                    and not pruning_active
-                ):
-                    prepared = try_prepare_basis(
-                        U,
-                        eps=self.eps,
-                        length_scale=(self.length_reference / N) ** 0.5,
-                        cos=self._rope_2d_cos_cache,
-                        sin=self._rope_2d_sin_cache,
-                    )
-                    if prepared is not None:
-                        U = prepared
-                        fused_basis = True
-                if not fused_basis:
-                    if self.normalize_u:
-                        U = U * torch.rsqrt(
-                            torch.mean(U * U, dim=-1, keepdim=True) + self.eps
-                        )
-                    U = apply_rotary_factors(
-                        U, self._rope_2d_cos_cache, self._rope_2d_sin_cache
-                    )
-            else:
-                if self.normalize_u:
-                    U = U * torch.rsqrt(
-                        torch.mean(U * U, dim=-1, keepdim=True) + self.eps
-                    )
-                U = apply_2d_rank_rotary(
-                    U, position_coords=position_coords,
-                    base=self.rope_base, scale=self.rope_scale,
-                )
-        elif position_ids is None:
+        token_rms = self.normalize_u and self.basis_normalization == "token_rms"
+        trace_basis = self.normalize_u and self.basis_normalization == "trace"
+        if position_ids is None:
             expected_shape = (1, 1, N, r // 2)
             cache_valid = (
-                self._rope_cos_cache.shape == expected_shape
-                and self._rope_cos_cache.device == U.device
-                and self._rope_cos_cache.dtype == U.dtype
+                self._rotary_cos_cache.shape == expected_shape
+                and self._rotary_cos_cache.device == U.device
+                and self._rotary_cos_cache.dtype == U.dtype
                 and not (
                     torch.is_grad_enabled()
-                    and torch.is_inference(self._rope_cos_cache)
+                    and torch.is_inference(self._rotary_cos_cache)
                 )
             )
             if not cache_valid:
                 calc_dtype = torch.float64 if U.dtype == torch.float64 else torch.float32
-                inv_freq = self.rope_base ** (
+                inv_freq = self.rotary_base ** (
                     -torch.arange(0, r // 2, device=U.device, dtype=calc_dtype)
                     / (r // 2)
                 )
                 positions = torch.arange(N, device=U.device, dtype=calc_dtype)
-                angles = self.rope_scale * positions[:, None] * inv_freq[None, :]
-                self._rope_cos_cache = angles.cos().to(U.dtype).view(expected_shape)
-                self._rope_sin_cache = angles.sin().to(U.dtype).view(expected_shape)
-            cos = self._rope_cos_cache
-            sin = self._rope_sin_cache
-            if (
-                self.normalize_u
-                and self.length_normalize
-                and valid_mask is None
-                and not pruning_active
-            ):
-                prepared = try_prepare_basis(
-                    U,
-                    eps=self.eps,
-                    length_scale=(self.length_reference / N) ** 0.5,
-                    cos=cos,
-                    sin=sin,
+                angles = self.rotary_scale * positions[:, None] * inv_freq[None, :]
+                self._rotary_cos_cache = angles.cos().to(U.dtype).view(expected_shape)
+                self._rotary_sin_cache = angles.sin().to(U.dtype).view(expected_shape)
+            cos = self._rotary_cos_cache
+            sin = self._rotary_sin_cache
+            # Token-RMS is a PyTorch-only ablation. The maintained native
+            # preprocessing path contains only the orthogonal rank rotation.
+            if token_rms:
+                U = U * torch.rsqrt(
+                    torch.mean(U * U, dim=-1, keepdim=True) + self.eps
                 )
-                if prepared is not None:
-                    U = prepared
-                    fused_basis = True
-            if not fused_basis:
-                if self.normalize_u:
-                    U = U * torch.rsqrt(
-                        torch.mean(U * U, dim=-1, keepdim=True) + self.eps
-                    )
-                rotated = try_rank_rotary(U, cos, sin)
-                if rotated is None:
-                    even = U[..., 0::2]
-                    odd = U[..., 1::2]
-                    rotated = torch.empty_like(U)
-                    rotated[..., 0::2] = even * cos - odd * sin
-                    rotated[..., 1::2] = even * sin + odd * cos
-                U = rotated
+            rotated = try_rank_rotary(U, cos, sin)
+            if rotated is None:
+                even = U[..., 0::2]
+                odd = U[..., 1::2]
+                rotated = torch.empty_like(U)
+                rotated[..., 0::2] = even * cos - odd * sin
+                rotated[..., 1::2] = even * sin + odd * cos
+            U = rotated
         else:
-            if self.normalize_u:
+            if token_rms:
                 U = U * torch.rsqrt(
                     torch.mean(U * U, dim=-1, keepdim=True) + self.eps
                 )
             U = apply_rank_rotary(
                 U,
                 position_ids,
-                base=self.rope_base,
-                scale=self.rope_scale,
+                base=self.rotary_base,
+                scale=self.rotary_scale,
             )
 
         solve_eye = self._eye
         if pruning_active:
             keep = int(self.prune_rank_keep)
-            if head_mask is not None:
+            if valid_mask is not None:
+                head_mask = valid_mask[:, None, :, None].to(
+                    device=x.device,
+                    dtype=x.dtype,
+                )
                 U = U * head_mask
             if keep % 2 != 0:
                 raise ValueError("RRLSSO rank pruning must keep an even number of channels")
@@ -320,37 +280,38 @@ class RRLSSO(nn.Module):
             U = U.gather(-1, indices[:, :, None, :].expand(B, H, N, keep))
             solve_eye = None
 
-        mu = F.softplus(self.theta_mu) + self.eps
-        gamma = self.gamma_max * torch.sigmoid(self.theta_gamma)
-        if self.no_global:
-            gamma = torch.zeros_like(gamma)
+        gain, alpha = _solve_parameters(self)
 
-        mu = mu.view(1, H, 1, 1)
-        gamma = gamma.view(1, H, 1, 1)
+        gain = gain.view(1, H, 1, 1)
+        alpha = alpha.view(1, H, 1, 1)
         if self.record_diagnostics:
-            Y, aux = lsso(
+            Y, aux = lsso_gain_alpha(
                 U,
                 C,
-                mu,
-                gamma,
+                gain,
+                alpha,
                 eye=solve_eye,
-                no_global=self.no_global or self.gamma_max == 0.0,
+                no_global=self._global_disabled,
                 return_aux=True,
-                length_normalize=self.length_normalize and not fused_basis,
+                length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
+                trace_normalize=trace_basis,
+                normalization_eps=self.eps,
                 valid_mask=valid_mask,
                 padding_ratio_hint=padding_ratio_hint,
             )
         else:
-            Y = lsso(
+            Y = lsso_gain_alpha(
                 U,
                 C,
-                mu,
-                gamma,
+                gain,
+                alpha,
                 eye=solve_eye,
-                no_global=self.no_global or self.gamma_max == 0.0,
-                length_normalize=self.length_normalize and not fused_basis,
+                no_global=self._global_disabled,
+                length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
+                trace_normalize=trace_basis,
+                normalization_eps=self.eps,
                 valid_mask=valid_mask,
                 padding_ratio_hint=padding_ratio_hint,
             )
@@ -369,7 +330,7 @@ class RRLSSO(nn.Module):
 
         Y = Y.transpose(1, 2).contiguous().view(B, N, D)
         Y = self.w_o(Y)
-        if valid_mask is not None:
+        if valid_mask is not None and self.w_o.bias is not None:
             Y = Y * valid_mask[:, :, None].to(device=Y.device, dtype=Y.dtype)
         return Y
 
@@ -391,13 +352,10 @@ class RRLSSO(nn.Module):
             local_norm = local.float().norm(dim=(-2, -1)).clamp_min(self.eps)
             correction_ratio = correction_norm / local_norm
 
-            gamma_over_mu = (gamma / mu).view(-1).detach().float().cpu()
+            alpha = (gamma / mu).view(-1).detach().float().cpu()
 
         return LSSODiagnostics(
-            gamma_over_mu=gamma_over_mu,
+            alpha=alpha,
             effective_rank=effective_rank.detach().float().cpu(),
             correction_ratio=correction_ratio.detach().float().cpu(),
         )
-
-
-RoPELSSO = RRLSSO

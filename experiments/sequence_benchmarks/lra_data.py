@@ -111,6 +111,16 @@ class CharacterVocabulary:
         values.append(self.eos_token_id)
         return values
 
+    def encode_bytes(self, text: str, max_length: int) -> list[int]:
+        """Encode UTF-8 bytes, matching the byte-level LRA text tasks."""
+        room = max(0, max_length - 1)
+        values = [
+            self.lookup.get(chr(value), self.unk_token_id)
+            for value in text.encode("utf-8")[:room]
+        ]
+        values.append(self.eos_token_id)
+        return values
+
     def encode_listops(self, text: str, max_length: int) -> list[int]:
         normalized = text.translate({ord("]"): ord("X"), ord("("): None, ord(")"): None})
         room = max(0, max_length - 1)
@@ -138,6 +148,10 @@ class CharacterVocabulary:
             counts.update(text)
         tokens = sorted(token for token, count in counts.items() if count >= min_frequency)
         return cls(tokens)
+
+    @classmethod
+    def from_bytes(cls) -> "CharacterVocabulary":
+        return cls(chr(value) for value in range(256))
 
     @classmethod
     def from_listops(cls, texts: Iterable[str]) -> "CharacterVocabulary":
@@ -170,8 +184,14 @@ def iter_aan(path: Path) -> Iterator[tuple[str, str, int]]:
                 continue
             label, _, _, first, second = columns
             try:
-                yield first, second, int(label)
-            except ValueError:
+                numeric_label = float(label)
+                if not numeric_label.is_integer():
+                    continue
+                integer_label = int(numeric_label)
+                if integer_label not in (0, 1):
+                    continue
+                yield first, second, integer_label
+            except (OverflowError, ValueError):
                 continue
 
 

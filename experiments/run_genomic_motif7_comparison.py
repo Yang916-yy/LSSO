@@ -70,6 +70,14 @@ def command_for(
 ) -> list[str]:
     size = frozen["size"]
     recipe = frozen["recipe"]
+    solve = frozen.get(
+        "solve",
+        {
+            "gain_init": 1.4426742274994273,
+            "alpha_init": 1.0776072417497349,
+            "alpha_max": 2.0,
+        },
+    )
     command = [
         sys.executable,
         str(ROOT / "experiments" / "genomic_benchmarks.py"),
@@ -83,6 +91,9 @@ def command_for(
         "--depth", str(size["depth"]),
         "--heads", str(size["heads"]),
         "--rank", str(size["rank"]),
+        "--gain-init", str(solve["gain_init"]),
+        "--alpha-init", str(solve["alpha_init"]),
+        "--alpha-max", str(solve["alpha_max"]),
         "--max-parameters", str(size["max_parameters"]),
         "--pooling", str(recipe["pooling"]),
         "--reverse-complement-probability",

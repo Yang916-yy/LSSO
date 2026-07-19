@@ -42,6 +42,35 @@ Multiplying the inner inverse by $\gamma$ gives \cref{eq:woodbury}. The resultin
 
 The proposition separates two notions that are sometimes conflated. The induced correction is low-rank, but the rank-space computation is not an approximation: it evaluates the full inverse operator exactly.
 
+\subsection{Trace-Normalized Relation Basis}
+
+Let $Z\in\R^{N\times r}$ be the raw relation projection and set $\tau=rL_{\mathrm{ref}}$. We define
+\begin{equation}
+  U=\mathcal N_{\mathrm{tr}}(Z)
+  =\frac{\sqrt{\tau}}{\lVert Z\rVert_F}Z,
+  \label{eq:trace_normalization}
+\end{equation}
+with masked entries excluded from the norm and set to zero. The implementation adds the usual RMS-style epsilon to the squared norm for the degenerate neighborhood of $Z=0$.
+
+\begin{proposition}[Minimal scale fixing]
+Among positive scalar maps $\widehat Z=a(Z)Z$ that preserve every token-to-token norm ratio and satisfy $\lVert\widehat Z\rVert_F^2=\tau$, \cref{eq:trace_normalization} is unique. Moreover,
+\begin{equation}
+  \operatorname{tr}(UU^\top)=\tau,
+  \qquad
+  \lambda_{\max}(UU^\top)\leq\tau.
+\end{equation}
+\end{proposition}
+\begin{proof}
+The trace constraint gives $a(Z)^2\lVert Z\rVert_F^2=\tau$, whose unique positive solution is $a(Z)=\sqrt{\tau}/\lVert Z\rVert_F$. The trace identity follows from $\operatorname{tr}(UU^\top)=\lVert U\rVert_F^2$, and the spectral bound follows because a positive-semidefinite matrix's largest eigenvalue does not exceed its trace.
+\end{proof}
+
+Unlike row-wise RMS normalization, this removes only the single global scale that is non-identifiable with $\gamma$: replacing $Z$ by $aZ$ and $\gamma$ by $\gamma/a^2$ leaves the solve unchanged. It preserves the radial allocation
+\[
+  (UU^\top)_{ii}
+  =\tau\frac{\lVert z_i\rVert_2^2}{\lVert Z\rVert_F^2},
+\]
+so token-dependent relation strength remains expressible. Finally, row-wise orthogonal rank rotations commute with $\mathcal N_{\mathrm{tr}}$ because they preserve $\lVert Z\rVert_F$.
+
 \subsection{Spectral Response, Stability, and Signed Mixing}
 
 Let $UU^\top=Q\Lambda Q^\top$ over its $k$ nonzero eigen-directions, where $Q^\top Q=\I_k$ and $\Lambda=\diag(\lambda_1,\ldots,\lambda_k)$ with $\lambda_i>0$. Define $P_\perp=\I_N-QQ^\top$.
@@ -86,7 +115,7 @@ Since $A\succeq\mu\I$, $\lVert A^{-1}\rVert_2\leq\mu^{-1}$, proving \cref{eq:nor
 which gives \cref{eq:condition_bound}. The multi-head result follows by summing squared head-wise bounds and applying submultiplicativity to $W_O$.
 \end{proof}
 
-These are conditional bounds for the linear map at fixed $U$; because both $U$ and $C$ depend on $X$, they are not by themselves a global Lipschitz bound for the complete nonlinear layer. Row-wise RMS normalization controls individual relation-vector scale, while \cref{eq:length_norm} controls the accumulation scale of $U^\top U$. Neither should be confused with a hard dimension-free bound on $\lVert U\rVert_2$.
+These are conditional bounds for the linear map at fixed $U$; because both $U$ and $C$ depend on $X$, they are not by themselves a global Lipschitz bound for the complete nonlinear layer. Trace normalization gives the explicit bound $\lVert U\rVert_2^2\leq rL_{\mathrm{ref}}$ without forcing every token to have the same radius.
 
 Although $UU^\top$ and $A^{-1}$ are positive semidefinite and positive definite respectively, their off-diagonal entries need not be nonnegative. For example, with two tokens and rank one, $U=[1,1]^\top$ yields a negative off-diagonal entry in $A^{-1}$, whereas $U=[1,-1]^\top$ yields a positive one. Thus the effective mixing operator supports signed cross-token coefficients and is not constrained to be a row-stochastic nonnegative matrix. Positive definiteness constrains the global quadratic form, not the sign of every pairwise interaction.
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from lsso import LSSO, RoPELSSO
+from lsso import LSSO, RRLSSO
 
 from .common import EncoderBlock
 
@@ -22,8 +22,8 @@ class VisionEncoder(nn.Module):
         rank: int = 16,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        gamma_max: float = 1.2,
-        theta_gamma_init: float = 0.5,
+        gain_init: float = 1.0,
+        alpha_init: float = 1.2,
         normalize_u: bool = True,
     ) -> None:
         super().__init__()
@@ -52,8 +52,8 @@ class VisionEncoder(nn.Module):
                     rank=rank,
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
-                    gamma_max=gamma_max,
-                    theta_gamma_init=theta_gamma_init,
+                    gain_init=gain_init,
+                    alpha_init=alpha_init,
                     normalize_u=normalize_u,
                 )
                 for _ in range(depth)
@@ -86,6 +86,6 @@ class VisionEncoder(nn.Module):
         layers = []
         for block in self.blocks:
             mixer = getattr(block, "mixer", None)
-            if isinstance(mixer, (LSSO, RoPELSSO)):
+            if isinstance(mixer, (LSSO, RRLSSO)):
                 layers.append(mixer)
         return layers

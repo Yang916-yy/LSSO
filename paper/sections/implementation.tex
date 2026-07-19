@@ -17,7 +17,7 @@ The final output is computed as
 \begin{equation}
   Y=\mu^{-1}(C-\alpha UK).
 \end{equation}
-Because $G$ is symmetric positive definite, it can be factorized with Cholesky. The statistics and small solve are accumulated in float32 under half-precision or bfloat16 autocast, while projection and readout remain in the activation dtype. The $U$ and $C$ projections are fused into one linear map. In the optimized path, RMS normalization, length scaling, and rank rotation are fused when their standard unmasked layout is used, and the final rank-space scaling is folded into the readout matrix multiplication.
+Because $G$ is symmetric positive definite, it can be factorized with Cholesky. The statistics and small solve are accumulated in float32 under half-precision or bfloat16 autocast, while projection and readout remain in the activation dtype. The $Z$ and $C$ projections are fused into one linear map. Trace normalization is absorbed through $gamma_{mathrm{eff}}=gamma	au/(lVert ZVert_F^2+epsilon rL)$, so the implementation never materializes a normalized relation basis. Rank rotation preserves the Frobenius norm and may therefore be applied before this scalar is evaluated. The final rank-space scaling is folded into the readout matrix multiplication.
 
 \subsection{Implicit Backward}
 
@@ -41,6 +41,21 @@ The backward pass therefore uses the same positive-definite Woodbury solve as th
   &=-\langle U^\top P,U^\top Y\rangle.
 \end{align}
 This avoids differentiating through a dense token-space inverse and makes the algebraic structure of forward and backward consistent.
+
+For the trace-normalized implementation, let $d=lVert ZVert_F^2+epsilon rL$, $s=	au/d$, and $delta=gamma s$. Holding $delta$ fixed gives
+\[
+  G_Z^{(0)}=-\delta(PY^\top+YP^\top)Z,
+  \qquad
+  g_\delta=-\langle Z^\top P,Z^\top Y\rangle.
+\]
+The complete chain rule is
+\begin{align}
+  \frac{\partial\mathcal L}{\partial Z}
+  &=G_Z^{(0)}-\frac{2\delta g_\delta}{d}Z,\\
+  \frac{\partial\mathcal L}{\partial\gamma}
+  &=s g_\delta.
+\end{align}
+The radial term is required: when $\epsilon=0$, it ensures $\langle \partial\mathcal L/\partial Z,Z\rangle_F=0$, matching the exact global scale invariance.
 
 \subsection{Arithmetic and Memory Complexity}
 

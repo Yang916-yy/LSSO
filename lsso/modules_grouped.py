@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .modules import LSSODiagnostics, lsso
+from .modules import (
+    DEFAULT_ALPHA_INIT,
+    DEFAULT_ALPHA_MAX,
+    DEFAULT_GAIN_INIT,
+    LSSODiagnostics,
+    _initialize_solve_parameters,
+    _legacy_solve_state_dict_pre_hook,
+    _fold_fixed_gain_into_output,
+    _solve_parameters,
+    _sync_alpha_max_after_load,
+    lsso_gain_alpha,
+)
 from .modules_v2 import apply_rank_rotary
 
 
@@ -28,14 +38,17 @@ class _GroupedLSSOBase(nn.Module):
         rank: int = 16,
         dropout: float = 0.0,
         eps: float = 1e-5,
-        gamma_max: float = 1.2,
-        theta_gamma_init: float = 0.5,
+        gain_init: float = DEFAULT_GAIN_INIT,
+        alpha_init: float = DEFAULT_ALPHA_INIT,
+        solve_parameterization: str = "gain_alpha",
+        alpha_max: float = DEFAULT_ALPHA_MAX,
         no_global: bool = False,
         normalize_u: bool = True,
+        basis_normalization: str = "trace",
         length_normalize: bool = True,
         length_reference: float = 1.0,
-        rope_base: float = 10000.0,
-        rope_scale: float = 1.0,
+        rotary_base: float = 10000.0,
+        rotary_scale: float = 1.0,
         bias: bool = False,
     ) -> None:
         super().__init__()
@@ -63,15 +76,20 @@ class _GroupedLSSOBase(nn.Module):
         self.group_dim = dim // num_relation_groups
         self.rank = rank
         self.eps = eps
-        self.gamma_max = gamma_max
         self.no_global = no_global
         self.normalize_u = normalize_u
+        if basis_normalization not in {"trace", "token_rms"}:
+            raise ValueError(
+                "basis_normalization must be 'trace' or 'token_rms', "
+                f"got {basis_normalization!r}"
+            )
+        self.basis_normalization = basis_normalization
         self.length_normalize = length_normalize
         if length_reference <= 0:
             raise ValueError(f"length_reference must be positive, got {length_reference}")
         self.length_reference = float(length_reference)
-        self.rope_base = rope_base
-        self.rope_scale = rope_scale
+        self.rotary_base = rotary_base
+        self.rotary_scale = rotary_scale
 
         self.uc_dim = num_relation_groups * rank + dim
         self.w_uc = nn.Linear(dim, self.uc_dim, bias=bias)
@@ -82,15 +100,39 @@ class _GroupedLSSOBase(nn.Module):
             persistent=False,
         )
 
-        self.theta_mu = nn.Parameter(torch.zeros(num_relation_groups))
-        self.theta_gamma = nn.Parameter(
-            torch.full((num_relation_groups,), float(theta_gamma_init), dtype=torch.float32)
+        _initialize_solve_parameters(
+            self,
+            num_relation_groups,
+            solve_parameterization=solve_parameterization,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            alpha_max=alpha_max,
+        )
+        self.register_load_state_dict_pre_hook(_legacy_solve_state_dict_pre_hook)
+        self.register_load_state_dict_post_hook(_sync_alpha_max_after_load)
+        _fold_fixed_gain_into_output(
+            self,
+            groups=num_relation_groups,
+            group_width=self.group_dim,
         )
 
         self.dropout_p = dropout
         self.record_diagnostics = False
         self.prune_rank_keep: int | None = None
         self.last_diagnostics: LSSODiagnostics | None = None
+
+    def effective_gain_alpha(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the positive output gain and relative solve strength."""
+
+        return _solve_parameters(self)
+
+    def fold_fixed_gain_into_output(self, *, force: bool = False) -> None:
+        _fold_fixed_gain_into_output(
+            self,
+            groups=self.num_relation_groups,
+            group_width=self.group_dim,
+            force=force,
+        )
 
     @property
     def solve_reduction(self) -> float:
@@ -146,7 +188,9 @@ class _GroupedLSSOBase(nn.Module):
         U = U.view(B, N, G, r).transpose(1, 2).contiguous()
         C = C.view(B, N, G, gd).transpose(1, 2).contiguous()
 
-        if self.normalize_u:
+        token_rms = self.normalize_u and self.basis_normalization == "token_rms"
+        trace_basis = self.normalize_u and self.basis_normalization == "trace"
+        if token_rms:
             U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + self.eps)
         U = self._prepare_relation_basis(U, position_ids)
 
@@ -158,36 +202,37 @@ class _GroupedLSSOBase(nn.Module):
             U = self._prune_relation_basis(U, keep)
             solve_eye = None
 
-        mu = F.softplus(self.theta_mu) + self.eps
-        gamma = self.gamma_max * torch.sigmoid(self.theta_gamma)
-        if self.no_global:
-            gamma = torch.zeros_like(gamma)
+        gain, alpha = _solve_parameters(self)
 
-        mu = mu.view(1, G, 1, 1)
-        gamma = gamma.view(1, G, 1, 1)
+        gain = gain.view(1, G, 1, 1)
+        alpha = alpha.view(1, G, 1, 1)
         if self.record_diagnostics:
-            Y, aux = lsso(
+            Y, aux = lsso_gain_alpha(
                 U,
                 C,
-                mu,
-                gamma,
+                gain,
+                alpha,
                 eye=solve_eye,
-                no_global=self.no_global or self.gamma_max == 0.0,
+                no_global=self._global_disabled,
                 return_aux=True,
                 length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
+                trace_normalize=trace_basis,
+                normalization_eps=self.eps,
                 valid_mask=valid_mask,
             )
         else:
-            Y = lsso(
+            Y = lsso_gain_alpha(
                 U,
                 C,
-                mu,
-                gamma,
+                gain,
+                alpha,
                 eye=solve_eye,
-                no_global=self.no_global or self.gamma_max == 0.0,
+                no_global=self._global_disabled,
                 length_normalize=self.length_normalize,
                 length_reference=self.length_reference,
+                trace_normalize=trace_basis,
+                normalization_eps=self.eps,
                 valid_mask=valid_mask,
             )
             aux = None
@@ -226,10 +271,10 @@ class _GroupedLSSOBase(nn.Module):
             correction_norm = correction.float().norm(dim=(-2, -1))
             local_norm = local.float().norm(dim=(-2, -1)).clamp_min(self.eps)
             correction_ratio = correction_norm / local_norm
-            gamma_over_mu = (gamma / mu).view(-1).detach().float().cpu()
+            alpha = (gamma / mu).view(-1).detach().float().cpu()
 
         return LSSODiagnostics(
-            gamma_over_mu=gamma_over_mu,
+            alpha=alpha,
             effective_rank=effective_rank.detach().float().cpu(),
             correction_ratio=correction_ratio.detach().float().cpu(),
         )
@@ -269,8 +314,8 @@ class GroupedRRLSSO(_GroupedLSSOBase):
         return apply_rank_rotary(
             U,
             position_ids,
-            base=self.rope_base,
-            scale=self.rope_scale,
+            base=self.rotary_base,
+            scale=self.rotary_scale,
         )
 
     def _prune_relation_basis(self, U: torch.Tensor, keep: int) -> torch.Tensor:

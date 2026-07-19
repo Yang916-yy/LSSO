@@ -27,6 +27,7 @@ class TrainingConfig:
     weight_decay: float = 0.01
     warmup_ratio: float = 0.05
     min_lr_ratio: float = 0.0
+    local_spatial_lr_multiplier: float = 1.0
     posthoc_rc_eval: bool = False
     grad_accum: int = 1
     grad_clip: float = 1.0
@@ -37,6 +38,7 @@ class TrainingConfig:
     max_train_batches: int = 0
     max_eval_batches: int = 0
     max_parameters: int = 0
+    select_last: bool = False
 
 
 def seed_all(seed: int) -> None:
@@ -67,6 +69,30 @@ def stratified_split_indices(
         train.extend(indices[count:])
     if not validation:
         raise ValueError("cannot form a validation split from singleton classes")
+    rng.shuffle(train)
+    rng.shuffle(validation)
+    return train, validation
+
+
+def stratified_fold_indices(
+    labels: Sequence[int], folds: int, fold_index: int, seed: int
+) -> tuple[list[int], list[int]]:
+    """Return one deterministic stratified fold without touching the test set."""
+    if folds < 2:
+        raise ValueError("folds must be at least two")
+    if not 0 <= fold_index < folds:
+        raise ValueError("fold_index must be in [0, folds)")
+    groups: dict[int, list[int]] = defaultdict(list)
+    for index, label in enumerate(labels):
+        groups[int(label)].append(index)
+    if any(len(indices) < folds for indices in groups.values()):
+        raise ValueError("every class must contain at least one sample per fold")
+    rng = random.Random(seed)
+    train, validation = [], []
+    for indices in groups.values():
+        rng.shuffle(indices)
+        for offset, index in enumerate(indices):
+            (validation if offset % folds == fold_index else train).append(index)
     rng.shuffle(train)
     rng.shuffle(validation)
     return train, validation
@@ -477,7 +503,11 @@ def train_classifier(
         ),
         "local_motif_stem": sum(
             parameter.numel() for name, parameter in named_parameters
-            if "local_motif_" in name
+            if "local_motif_" in name or "local_temporal_stem" in name
+        ),
+        "local_spatial": sum(
+            parameter.numel() for name, parameter in named_parameters
+            if "local_spatial_blocks" in name
         ),
         "pooling": sum(
             parameter.numel() for name, parameter in named_parameters
@@ -500,8 +530,29 @@ def train_classifier(
     (output / "config.json").write_text(
         json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
     )
+    if config.local_spatial_lr_multiplier <= 0.0:
+        raise ValueError("local_spatial_lr_multiplier must be positive")
+    if config.local_spatial_lr_multiplier == 1.0:
+        optimizer_parameters = [parameter for _, parameter in named_parameters]
+    else:
+        local_parameters = [
+            parameter for name, parameter in named_parameters
+            if "local_spatial_blocks" in name
+        ]
+        base_parameters = [
+            parameter for name, parameter in named_parameters
+            if "local_spatial_blocks" not in name
+        ]
+        optimizer_parameters = [{"params": base_parameters, "lr": config.lr}]
+        if local_parameters:
+            optimizer_parameters.append(
+                {
+                    "params": local_parameters,
+                    "lr": config.lr * config.local_spatial_lr_multiplier,
+                }
+            )
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        optimizer_parameters,
         lr=config.lr,
         weight_decay=config.weight_decay,
         fused=device.type == "cuda",
@@ -585,9 +636,14 @@ def train_classifier(
             config.max_eval_batches,
         )
         score = validation["accuracy"]
-        improved = score > best or not (output / "best.pt").exists()
+        improved = (
+            config.select_last
+            or score > best
+            or not (output / "best.pt").exists()
+        )
         if improved:
-            best, stale_epochs = score, 0
+            best = score if config.select_last else max(best, score)
+            stale_epochs = 0
         else:
             stale_epochs += 1
         metrics = {
@@ -623,7 +679,7 @@ def train_classifier(
         atomic_save(state, last_path)
         if improved:
             atomic_save(state, output / "best.pt")
-        if config.patience and stale_epochs >= config.patience:
+        if not config.select_last and config.patience and stale_epochs >= config.patience:
             break
     best_state = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best_state["model"])

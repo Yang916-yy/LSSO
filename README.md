@@ -36,14 +36,14 @@ low-rank relation basis `U` and content target `C`, then solves the token-space
 equilibrium
 
 ```text
-(mu I + gamma U U^T) Y = C .
+Y = g (I + alpha U U^T)^-1 C .
 ```
 
 The same computation has an exact rank-space learning interpretation:
 
 ```text
 Z* = argmin_Z  1/2 ||Z||_F^2 + alpha/2 ||UZ - C||_F^2,
-Y  = mu^-1 (C - UZ*),                 alpha = gamma / mu.
+Y  = g (C - UZ*).
 ```
 
 `Z*` is a set of **sample-conditioned temporary fast weights**. The
@@ -64,14 +64,9 @@ tag: it reshapes the covariance, conditioning, effective rank, and adaptation
 directions of the sample-specific regression problem while preserving row
 norms, total relation energy, and positive-semidefinite Gram structure.
 
-For vision, the default configuration combines:
-
-```text
-learned absolute position embedding + 2D Rank Rotary + RRLSSO
-```
-
-The learned embedding supplies flexible absolute spatial information, while
-rank rotary structures relative geometry inside the inner learner.
+The maintained implementation uses ordinary one-dimensional Rank Rotary over
+the token order. The retired axial 2-D construction is not part of the current
+operator or experimental baseline.
 
 ## Why LSSO?
 
@@ -114,7 +109,26 @@ python -m pip install -e .
 The core package requires PyTorch. The native CUDA/MathDx backend is optional;
 unsupported devices and shapes retain the portable PyTorch path. See
 [`docs/mathdx_backend.md`](docs/mathdx_backend.md) for build and dispatch
-details.
+details. The retained/retired kernel rationale and verification record are in
+[`docs/cuda_path_audit.md`](docs/cuda_path_audit.md).
+
+LSSO 0.2.0 freezes CUDA backend ABI 1. Precompiled Linux x86-64 runtime wheels
+for PyTorch 2.11 + CUDA 12.8 and CUDA 13.0 are published with the GitHub
+release; install the wheel matching `torch.version.cuda` to skip local NVCC and
+MathDx compilation. Other configurations build from source or use the portable
+PyTorch fallback.
+
+```bash
+# Check first: python -c "import torch; print(torch.__version__, torch.version.cuda)"
+# PyTorch 2.11 + CUDA 12.8 (recommended)
+pip install 'https://github.com/Yang916-yy/LSSO/releases/download/v0.2.0/lsso_mathdx_runtime-0.2.0%2Btorch2110cu128-py3-none-linux_x86_64.whl'
+
+# PyTorch 2.11 + CUDA 13.0 / MathDx 26.06
+pip install 'https://github.com/Yang916-yy/LSSO/releases/download/v0.2.0/lsso_mathdx_runtime-0.2.0%2Btorch2110cu130-py3-none-linux_x86_64.whl'
+```
+Experiment checkpoints are disposable local artifacts; the retention and
+directory rules are in
+[`docs/experiment_outputs.md`](docs/experiment_outputs.md).
 
 ## Minimal use
 
@@ -136,9 +150,9 @@ X = X + RRLSSO(LN(X))
 X = X + MLP(LN(X))
 ```
 
-Reusable integrations include plain VisionLLaMA backbones, timm registration,
-and MMDetection/MMSegmentation adapters. The public package surface is exposed
-through `lsso`, `lsso.ops`, `lsso.nn`, and `lsso.backends`.
+The public package surface is exposed through `lsso`, `lsso.ops`, `lsso.nn`,
+and `lsso.backends`. Maintained examples use standard encoder backbones so the
+operator can be evaluated without inheriting a bespoke vision architecture.
 
 ## Repository map
 
@@ -147,11 +161,11 @@ lsso/          installable operators, modules, and backend facades
 csrc/mathdx/   fused CUDA/MathDx implementation
 examples/      model integration references
 experiments/   reproducible vision and sequence programs
-integrations/  timm, MMDetection, and MMSegmentation adapters
 benchmarks/    performance and complexity measurement
 tests/         numerical, dispatch, integration, and regression checks
 docs/          architecture, recipes, and research notes
 paper/         manuscript sources and compact experimental tables
+archive/       unsupported historical prototypes, excluded from the package
 ```
 
 See [`docs/repository_architecture.md`](docs/repository_architecture.md) for

@@ -48,38 +48,6 @@ def test_split_n_backward_statistics_matches_single_gemm() -> None:
         torch.testing.assert_close(value, reference, rtol=5e-14, atol=3e-15)
 
 
-def test_padding_ratio_hint_is_reused_by_custom_backward(monkeypatch) -> None:
-    hints = []
-
-    def fake_native(*args, padding_ratio_hint=None, **kwargs):
-        hints.append(padding_ratio_hint)
-        return None
-
-    monkeypatch.setattr(
-        lsso_modules, "try_masked_stats_solve_spd", fake_native
-    )
-    B, H, N, r, dh = 2, 2, 7, 4, 5
-    U = torch.randn(B, H, N, r, requires_grad=True)
-    C = torch.randn(B, H, N, dh, requires_grad=True)
-    mu = torch.ones(H, requires_grad=True)
-    gamma = torch.full((H,), 0.05, requires_grad=True)
-    mask = torch.tensor(
-        [[1, 1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 0, 0, 0]],
-        dtype=torch.bool,
-    )
-
-    lsso(
-        U,
-        C,
-        mu,
-        gamma,
-        valid_mask=mask,
-        padding_ratio_hint=0.25,
-    ).square().mean().backward()
-
-    assert hints == [0.25, 0.25]
-
-
 def test_masked_functional_matches_individually_cropped_sequences() -> None:
     """Padding must not change valid outputs or compact solve statistics."""
 
@@ -355,6 +323,30 @@ def test_rrlsso_bucketed_rank_wide_head_complete_module_forward_backward(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("bias", [False, True])
+def test_rrlsso_output_projection_preserves_padding_without_redundant_mask(
+    bias: bool,
+) -> None:
+    torch.manual_seed(17101)
+    layer = RRLSSO(
+        dim=64, num_heads=2, rank=16, bias=bias, length_normalize=True,
+    ).cuda().to(torch.bfloat16)
+    x = torch.randn(2, 17, 64, device="cuda", dtype=torch.bfloat16)
+    mask = torch.tensor(
+        [[True] * 17, [True] * 5 + [False] * 12], device="cuda"
+    )
+    x = torch.where(
+        mask[:, :, None], x, torch.full_like(x, float("nan"))
+    ).requires_grad_()
+    output = layer(x, valid_mask=mask, padding_ratio_hint=0.7)
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output[1, 5:]) == 0
+    output.float().square().mean().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad[1, 5:]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_long_masked_backward_fallback_is_safe_inside_bfloat16_autocast() -> None:
     """The N>512 fallback must not inherit autocast for FP32 baddbmm."""
     torch.manual_seed(1711)
@@ -398,7 +390,6 @@ def test_long_backward_dispatch_matches_native_and_blocks_arbitrary_mask_leaks(
         return output.detach(), tuple(value.detach() for value in gradients)
 
     native_output, native_gradients = run(u0, c0)
-    monkeypatch.setattr(lsso_modules, "_FUSED_BACKWARD_MAX_SEQUENCE", 0)
     if dispatch == "split_n":
         monkeypatch.setattr(lsso_modules, "_SPLIT_BACKWARD_MIN_SEQUENCE", 1)
         monkeypatch.setattr(lsso_modules, "_SPLIT_BACKWARD_MAX_SYSTEMS", B * H)

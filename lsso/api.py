@@ -10,13 +10,14 @@ from .modules import (
     LSSO,
     length_normalize_basis,
     lsso,
+    lsso_gain_alpha,
     make_solve_state,
     read_solve_state,
+    trace_normalize_basis,
     update_solve_state,
 )
 from .modules_grouped import GroupedLSSO, GroupedRRLSSO
-from .modules_v2 import RRLSSO, RoPELSSO, apply_rank_rope, apply_rank_rotary
-from .rotary_2d import apply_2d_rank_rotary, apply_2d_rotary, make_2d_position_coords
+from .modules_v2 import RRLSSO, apply_rank_rotary
 from .types import SolveStateCache
 
 __all__ = [
@@ -25,17 +26,14 @@ __all__ = [
     "LSSO",
     "MixerAdapter",
     "RRLSSO",
-    "RoPELSSO",
     "RotaryMHA",
     "SolveStateCache",
-    "apply_2d_rank_rotary",
-    "apply_2d_rotary",
-    "apply_rank_rope",
     "apply_rank_rotary",
     "length_normalize_basis",
     "lsso",
-    "make_2d_position_coords",
+    "lsso_gain_alpha",
     "make_solve_state",
     "read_solve_state",
+    "trace_normalize_basis",
     "update_solve_state",
 ]

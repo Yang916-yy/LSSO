@@ -48,6 +48,17 @@ print(f"{major}{minor}")
 PY
     )
     torch_prefix="${torch_config[0]}"
+    torch_nvrtc="$(${python_bin} - <<'PY'
+from pathlib import Path
+import torch
+
+site_packages = Path(torch.__file__).resolve().parents[1]
+# CUDA 12 wheels use nvidia/cuda_nvrtc/lib; CUDA 13 consolidated toolkit
+# wheels use nvidia/cu13/lib. Restrict the recursive search to NVIDIA's tree.
+candidates = sorted((site_packages / "nvidia").rglob("libnvrtc.so.*"))
+print(candidates[-1] if candidates else "")
+PY
+)"
     if [[ -z "${lto_architectures}" ]]; then
         lto_architectures="${torch_config[1]}"
     fi
@@ -57,12 +68,23 @@ PY
         -G Ninja
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_CUDA_COMPILER="${cuda_root}/bin/nvcc"
+        -DCUDA_TOOLKIT_ROOT_DIR="${cuda_root}"
         -DCMAKE_CUDA_ARCHITECTURES="${architectures}"
         -DLSSO_MATHDX_LTO_ARCHITECTURES="${lto_architectures}"
         -DCMAKE_PREFIX_PATH="${torch_prefix};${mathdx_root}/lib/cmake"
         -DLSSO_TORCH_INCLUDE_DIR="${torch_include_cache}"
         -DCUDAToolkit_ROOT="${cuda_root}"
     )
+    if [[ -n "${torch_nvrtc}" ]]; then
+        cmake_args+=("-DCUDA_nvrtc_LIBRARY=${torch_nvrtc}")
+    fi
+    if [[ "${LSSO_MATHDX_RELEASE:-0}" != "1" ]]; then
+        # Developing the fused rank-48/64 kernels otherwise instantiates every
+        # runtime architecture in one translation unit and can require tens of
+        # gigabytes of NVCC memory. Release builds intentionally retain the
+        # complete architecture dispatcher.
+        cmake_args+=("-DLSSO_MATHDX_NATIVE_ARCH=${torch_config[1]}0")
+    fi
     if [[ -n "${torch_architectures}" ]]; then
         cmake_args+=("-DTORCH_CUDA_ARCH_LIST=${torch_architectures}")
     fi
@@ -72,4 +94,11 @@ cmake --build "${build_dir}" --parallel
 
 mkdir -p "${artifact_dir}"
 cp "${build_dir}/lib/lsso_mathdx.so" "${artifact_dir}/lsso_mathdx.so"
+if [[ "${LSSO_MATHDX_RELEASE:-0}" == "1" ]]; then
+    if ! command -v patchelf >/dev/null 2>&1; then
+        echo "patchelf is required to remove build-host RUNPATHs from release artifacts" >&2
+        exit 1
+    fi
+    patchelf --remove-rpath "${artifact_dir}/lsso_mathdx.so"
+fi
 echo "Built ${artifact_dir}/lsso_mathdx.so"

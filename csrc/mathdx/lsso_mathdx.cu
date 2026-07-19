@@ -1,8 +1,8 @@
-#include <algorithm>
-#include <cstdlib>
+#include <cfloat>
 #include <cstdint>
 #include <limits>
 #include <tuple>
+#include <type_traits>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -11,10 +11,9 @@
 #include <torch/library.h>
 
 #include <cuda_runtime.h>
-#include <cuda_pipeline.h>
-#include <cuda/barrier>
-#include <cuda/ptx>
-#include <cudaTypedefs.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <mma.h>
 #include <cublasdx.hpp>
 #include <cusolverdx.hpp>
 
@@ -31,8 +30,6 @@
 
 namespace {
 
-using block_barrier = cuda::barrier<cuda::thread_scope_block>;
-namespace cuda_exp = cuda::device::experimental;
 #if CUDART_VERSION >= 13000
 constexpr int kThorMathDxArch = 1100;
 #else
@@ -41,55 +38,6 @@ constexpr int kThorMathDxArch = 1100;
 constexpr int kThorMathDxArch = 1010;
 #endif
 
-template <int TileRows, int TileColumns>
-__device__ __forceinline__ block_barrier::arrival_token issue_tma_tile(
-    void* destination,
-    const CUtensorMap* tensor_map,
-    int column,
-    int row,
-    int batch,
-    block_barrier& barrier) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    if (threadIdx.x == 0) {
-        cuda_exp::cp_async_bulk_tensor_3d_global_to_shared(
-            destination, tensor_map, column, row, batch, barrier);
-        return cuda::device::barrier_arrive_tx(
-            barrier, 1, TileRows * TileColumns * 2);
-    }
-    return barrier.arrive();
-#else
-    // Runtime architecture dispatch never calls a TMA specialization on
-    // pre-Hopper devices. This compile-time stub is still required because a
-    // release translation unit emits descriptors for several SM families.
-    return barrier.arrive();
-#endif
-}
-
-template <int KTile, int Rank, int RhsTile>
-__device__ __forceinline__ block_barrier::arrival_token issue_tma_cross_tiles(
-    void* u_destination,
-    void* c_destination,
-    const CUtensorMap* u_map,
-    const CUtensorMap* c_map,
-    int sequence_start,
-    int rhs_start,
-    int batch,
-    block_barrier& barrier) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    if (threadIdx.x == 0) {
-        cuda_exp::cp_async_bulk_tensor_3d_global_to_shared(
-            u_destination, u_map, 0, sequence_start, batch, barrier);
-        cuda_exp::cp_async_bulk_tensor_3d_global_to_shared(
-            c_destination, c_map, rhs_start, sequence_start, batch, barrier);
-        return cuda::device::barrier_arrive_tx(
-            barrier, 1, KTile * (Rank + RhsTile) * 2);
-    }
-    return barrier.arrive();
-#else
-    return barrier.arrive();
-#endif
-}
-
 template <typename scalar_t, bool Inverse>
 __global__ void rank_rotary_kernel(
     const scalar_t* __restrict__ input,
@@ -97,15 +45,35 @@ __global__ void rank_rotary_kernel(
     const scalar_t* __restrict__ sin,
     scalar_t* __restrict__ output,
     int64_t pair_count,
-    int64_t factors_per_head) {
+    int64_t batches,
+    int64_t heads,
+    int64_t sequence,
+    int64_t half_rank,
+    int64_t factor_batches,
+    int64_t stride_b,
+    int64_t stride_h,
+    int64_t stride_n,
+    int64_t stride_r) {
     const int64_t pair =
         static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (pair >= pair_count) {
         return;
     }
-    const int64_t factor = pair % factors_per_head;
-    const float even = static_cast<float>(input[2 * pair]);
-    const float odd = static_cast<float>(input[2 * pair + 1]);
+    int64_t index = pair;
+    const int64_t rank_pair = index % half_rank;
+    index /= half_rank;
+    const int64_t token = index % sequence;
+    index /= sequence;
+    const int64_t head = index % heads;
+    const int64_t batch = index / heads;
+    const int64_t input_base =
+        batch * stride_b + head * stride_h + token * stride_n +
+        2 * rank_pair * stride_r;
+    const int64_t factor =
+        (factor_batches == 1 ? 0 : batch * sequence * half_rank) +
+        token * half_rank + rank_pair;
+    const float even = static_cast<float>(input[input_base]);
+    const float odd = static_cast<float>(input[input_base + stride_r]);
     const float c = static_cast<float>(cos[factor]);
     const float s = static_cast<float>(sin[factor]);
     if constexpr (Inverse) {
@@ -114,152 +82,6 @@ __global__ void rank_rotary_kernel(
     } else {
         output[2 * pair] = static_cast<scalar_t>(even * c - odd * s);
         output[2 * pair + 1] = static_cast<scalar_t>(even * s + odd * c);
-    }
-}
-
-__device__ __forceinline__ float warp_sum(float value) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffff, value, offset);
-    }
-    return value;
-}
-
-template <typename scalar_t>
-__device__ __forceinline__ void issue_async_contiguous_tile(
-    scalar_t* dst, const scalar_t* src, int elements) {
-    constexpr int copy_bytes = 16;
-    const int bytes = elements * static_cast<int>(sizeof(scalar_t));
-    for (int offset = threadIdx.x * copy_bytes; offset < bytes;
-         offset += blockDim.x * copy_bytes) {
-        __pipeline_memcpy_async(
-            reinterpret_cast<char*>(dst) + offset,
-            reinterpret_cast<const char*>(src) + offset,
-            copy_bytes);
-    }
-}
-
-template <typename scalar_t, int Rows, int Columns>
-__device__ __forceinline__ void issue_async_rhs_tile(
-    scalar_t* dst,
-    const scalar_t* src,
-    int64_t sequence_start,
-    int64_t rhs_start,
-    int64_t sequence,
-    int64_t rhs_width) {
-    constexpr int copy_bytes = 16;
-    constexpr int values_per_copy = copy_bytes / sizeof(scalar_t);
-    constexpr int copies_per_row = Columns / values_per_copy;
-    for (int copy = threadIdx.x; copy < Rows * copies_per_row;
-         copy += blockDim.x) {
-        const int row = copy / copies_per_row;
-        const int column = (copy - row * copies_per_row) * values_per_copy;
-        const int64_t token = sequence_start + row;
-        if (token < sequence) {
-            __pipeline_memcpy_async(
-                dst + row * Columns + column,
-                src + token * rhs_width + rhs_start + column,
-                copy_bytes);
-        }
-    }
-}
-
-template <typename scalar_t, bool Rotary>
-__global__ void prepare_basis_kernel(
-    const scalar_t* __restrict__ input,
-    const scalar_t* __restrict__ cos,
-    const scalar_t* __restrict__ sin,
-    scalar_t* __restrict__ output,
-    float* __restrict__ inv_rms,
-    int64_t tokens,
-    int64_t sequence,
-    int rank,
-    float eps,
-    float length_scale) {
-    const int64_t token = static_cast<int64_t>(blockIdx.x);
-    const int lane = threadIdx.x;
-    if (token >= tokens) return;
-    const scalar_t* x = input + token * rank;
-    scalar_t* y = output + token * rank;
-    float square_sum = 0.0f;
-    for (int j = lane; j < rank; j += 32) {
-        const float value = static_cast<float>(x[j]);
-        square_sum += value * value;
-    }
-    square_sum = warp_sum(square_sum);
-    const float inv = rsqrtf(__shfl_sync(0xffffffff, square_sum, 0) / rank + eps);
-    if (lane == 0) inv_rms[token] = inv;
-    const float norm_scale = inv * length_scale;
-    if constexpr (Rotary) {
-        const int half = rank / 2;
-        const int64_t factor_base = (token % sequence) * half;
-        for (int pair = lane; pair < half; pair += 32) {
-            const float even = static_cast<float>(x[2 * pair]) * norm_scale;
-            const float odd = static_cast<float>(x[2 * pair + 1]) * norm_scale;
-            const float c = static_cast<float>(cos[factor_base + pair]);
-            const float s = static_cast<float>(sin[factor_base + pair]);
-            y[2 * pair] = static_cast<scalar_t>(even * c - odd * s);
-            y[2 * pair + 1] = static_cast<scalar_t>(even * s + odd * c);
-        }
-    } else {
-        for (int j = lane; j < rank; j += 32) {
-            y[j] = static_cast<scalar_t>(static_cast<float>(x[j]) * norm_scale);
-        }
-    }
-}
-
-template <typename scalar_t, bool Rotary>
-__global__ void prepare_basis_backward_kernel(
-    const scalar_t* __restrict__ grad_output,
-    const scalar_t* __restrict__ input,
-    const float* __restrict__ inv_rms,
-    const scalar_t* __restrict__ cos,
-    const scalar_t* __restrict__ sin,
-    scalar_t* __restrict__ grad_input,
-    int64_t tokens,
-    int64_t sequence,
-    int rank,
-    float length_scale) {
-    const int64_t token = static_cast<int64_t>(blockIdx.x);
-    const int lane = threadIdx.x;
-    if (token >= tokens) return;
-    const scalar_t* grad = grad_output + token * rank;
-    const scalar_t* x = input + token * rank;
-    scalar_t* grad_x = grad_input + token * rank;
-    const int half = rank / 2;
-    const int64_t factor_base = (token % sequence) * half;
-    float dot = 0.0f;
-    for (int j = lane; j < rank; j += 32) {
-        float g;
-        if constexpr (Rotary) {
-            const int pair = j / 2;
-            const float ge = static_cast<float>(grad[2 * pair]);
-            const float go = static_cast<float>(grad[2 * pair + 1]);
-            const float c = static_cast<float>(cos[factor_base + pair]);
-            const float s = static_cast<float>(sin[factor_base + pair]);
-            g = (j % 2 == 0) ? ge * c + go * s : -ge * s + go * c;
-        } else {
-            g = static_cast<float>(grad[j]);
-        }
-        dot += g * static_cast<float>(x[j]);
-    }
-    dot = __shfl_sync(0xffffffff, warp_sum(dot), 0);
-    const float inv = inv_rms[token];
-    const float correction_scale = inv * inv * dot / rank;
-    const float common = length_scale * inv;
-    for (int j = lane; j < rank; j += 32) {
-        float g;
-        if constexpr (Rotary) {
-            const int pair = j / 2;
-            const float ge = static_cast<float>(grad[2 * pair]);
-            const float go = static_cast<float>(grad[2 * pair + 1]);
-            const float c = static_cast<float>(cos[factor_base + pair]);
-            const float s = static_cast<float>(sin[factor_base + pair]);
-            g = (j % 2 == 0) ? ge * c + go * s : -ge * s + go * c;
-        } else {
-            g = static_cast<float>(grad[j]);
-        }
-        grad_x[j] = static_cast<scalar_t>(
-            common * (g - static_cast<float>(x[j]) * correction_scale));
     }
 }
 
@@ -280,11 +102,28 @@ struct SolverTraits {
     using Potrs = decltype(Base() + cusolverdx::Function<cusolverdx::potrs>());
 };
 
-template <int Rank, int Columns, int KTile, int Arch>
+template <typename scalar_t>
+struct GemmInputPrecision {
+    using Type = float;
+};
+
+template <>
+struct GemmInputPrecision<c10::Half> {
+    using Type = half;
+};
+
+template <>
+struct GemmInputPrecision<c10::BFloat16> {
+    using Type = __nv_bfloat16;
+};
+
+template <typename scalar_t, int Rank, int Columns, int KTile, int Arch>
 struct GemmTraits {
+    using Input = typename GemmInputPrecision<scalar_t>::Type;
     using Type = decltype(
         cublasdx::Size<Rank, Columns, KTile>() +
-        cublasdx::Precision<float>() +
+        cublasdx::Precision<Input, Input, float>() +
+        cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
         cublasdx::Arrangement<
@@ -297,25 +136,59 @@ struct GemmTraits {
         cublasdx::SM<Arch>());
 };
 
-template <typename scalar_t, int Rank, int RhsTile, int KTile, int Arch,
-          bool FuseReadout>
-__global__ void masked_stats_solve_spd_kernel(
+template <typename scalar_t>
+__device__ __forceinline__ float load_relation_value(
+    const scalar_t* __restrict__ u,
+    int64_t sample,
+    int64_t head,
+    int64_t token,
+    int rank,
+    int64_t stride_b,
+    int64_t stride_h,
+    int64_t stride_n,
+    int64_t stride_r) {
+    const int64_t base =
+        sample * stride_b + head * stride_h + token * stride_n;
+    return static_cast<float>(u[base + rank * stride_r]);
+}
+
+template <typename scalar_t, int Rank, int RhsTile, int KTile, int Arch>
+__global__ void masked_trace_solve_readout_kernel(
     const scalar_t* __restrict__ u,
     const scalar_t* __restrict__ c,
     const bool* __restrict__ valid_mask,
     const float* __restrict__ length_scale,
     const float* __restrict__ alpha,
-    const float* __restrict__ inv_mu,
-    float* __restrict__ solution,
+    const float* __restrict__ gain,
     scalar_t* __restrict__ output,
     int* __restrict__ info,
+    bool trace_normalize,
+    float normalization_eps,
+    float length_reference,
+    bool length_normalize,
+    float* __restrict__ effective_alpha_output,
+    float* __restrict__ denominator_output,
+    float* __restrict__ scale_squared_output,
+    int64_t u_stride_b,
+    int64_t u_stride_h,
+    int64_t u_stride_n,
+    int64_t u_stride_r,
+    int64_t c_stride_b,
+    int64_t c_stride_h,
+    int64_t c_stride_n,
+    int64_t c_stride_w,
+    int64_t output_stride_b,
+    int64_t output_stride_h,
+    int64_t output_stride_n,
+    int64_t output_stride_w,
     int64_t batches,
     int64_t heads,
     int64_t sequence,
     int64_t rhs_width) {
-    using Gram = typename GemmTraits<Rank, Rank, KTile, Arch>::Type;
-    using Cross = typename GemmTraits<Rank, RhsTile, KTile, Arch>::Type;
-    using Readout = typename GemmTraits<KTile, RhsTile, Rank, Arch>::Type;
+    using Input = typename GemmInputPrecision<scalar_t>::Type;
+    using Gram = typename GemmTraits<scalar_t, Rank, Rank, KTile, Arch>::Type;
+    using Cross = typename GemmTraits<scalar_t, Rank, RhsTile, KTile, Arch>::Type;
+    using Readout = typename GemmTraits<scalar_t, KTile, RhsTile, Rank, Arch>::Type;
     using Solver = SolverTraits<Rank, RhsTile, Arch>;
     using Potrf = typename Solver::Potrf;
     using Potrs = typename Solver::Potrs;
@@ -334,12 +207,17 @@ __global__ void masked_stats_solve_spd_kernel(
     constexpr int lda = Potrf::lda;
     constexpr int ldb = Potrs::ldb;
     constexpr int u_tile_elements = cublasdx::cosize(Gram::get_layout_smem_a());
-    constexpr int c_tile_elements = cublasdx::cosize(Cross::get_layout_smem_b());
+    constexpr int cross_b_elements = cublasdx::cosize(Cross::get_layout_smem_b());
+    constexpr int readout_b_elements = cublasdx::cosize(Readout::get_layout_smem_b());
+    constexpr int c_tile_elements =
+        cross_b_elements > readout_b_elements ? cross_b_elements : readout_b_elements;
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    float* u_tile = reinterpret_cast<float*>(smem_raw);
-    float* c_tile = u_tile + u_tile_elements;
-    float* a = c_tile + c_tile_elements;
+    Input* u_tile = reinterpret_cast<Input*>(smem_raw);
+    Input* c_tile = u_tile + u_tile_elements;
+    uintptr_t float_address = reinterpret_cast<uintptr_t>(c_tile + c_tile_elements);
+    float_address = (float_address + 15u) & ~uintptr_t(15u);
+    float* a = reinterpret_cast<float*>(float_address);
     float* b = a + Rank * lda;
     float* gemm_output = b + Rank * ldb;
 
@@ -347,34 +225,41 @@ __global__ void masked_stats_solve_spd_kernel(
     auto gram_b = cublasdx::make_tensor(u_tile, Gram::get_layout_smem_b());
     auto cross_a = cublasdx::make_tensor(u_tile, Cross::get_layout_smem_a());
     auto cross_b = cublasdx::make_tensor(c_tile, Cross::get_layout_smem_b());
-    auto gram_output_tensor = cublasdx::make_tensor(gemm_output, Gram::get_layout_gmem_c());
-    auto cross_output_tensor = cublasdx::make_tensor(gemm_output, Cross::get_layout_gmem_c());
+    auto gram_output_tensor = cublasdx::make_tensor(gemm_output, Gram::get_layout_smem_c());
+    auto cross_output_tensor = cublasdx::make_tensor(gemm_output, Cross::get_layout_smem_c());
     auto readout_a = cublasdx::make_tensor(u_tile, Readout::get_layout_smem_a());
     auto readout_b = cublasdx::make_tensor(c_tile, Readout::get_layout_smem_b());
     auto readout_output_tensor = cublasdx::make_tensor(
-        gemm_output, Readout::get_layout_gmem_c());
+        gemm_output, Readout::get_layout_smem_c());
 
     const int64_t sample = batch / heads;
-    const scalar_t* u_batch = u + batch * sequence * Rank;
-    const scalar_t* c_batch = c + batch * sequence * rhs_width;
-    const bool* mask_batch = valid_mask + sample * sequence;
-    const float scale = length_scale[sample];
-    float* solution_batch = FuseReadout ? nullptr : solution + batch * Rank * rhs_width;
-    scalar_t* output_batch = FuseReadout ? output + batch * sequence * rhs_width : nullptr;
+    const int64_t head = batch - sample * heads;
+    const bool* mask_batch = valid_mask == nullptr
+        ? nullptr : valid_mask + sample * sequence;
+    const float scale = trace_normalize || length_scale == nullptr
+        ? 1.0f : length_scale[sample];
     static_assert(KTile == 32, "masked tile ballot assumes one warp per token tile");
     __shared__ unsigned int tile_valid_bits;
+    __shared__ int valid_count;
+    __shared__ float effective_alpha_shared;
+    if (threadIdx.x == 0) valid_count = 0;
+    __syncthreads();
 
-    auto gram_accumulator = Gram().suggest_accumulator();
-    gram_accumulator.clear();
+    for (int linear = threadIdx.x; linear < Rank * Rank; linear += blockDim.x) {
+        gemm_output[linear] = 0.0f;
+    }
+    __syncthreads();
     for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
         if (threadIdx.x < KTile) {
             const int64_t token = sequence_start + threadIdx.x;
-            const bool valid = token < sequence && mask_batch[token];
+            const bool valid = token < sequence &&
+                (mask_batch == nullptr || mask_batch[token]);
             const unsigned int bits = __ballot_sync(0xffffffffu, valid);
             if (threadIdx.x == 0) tile_valid_bits = bits;
         }
         __syncthreads();
         const unsigned int valid_bits = tile_valid_bits;
+        if (threadIdx.x == 0) valid_count += __popc(valid_bits);
         if (valid_bits == 0) continue;
         const bool full_tile = valid_bits == 0xffffffffu;
         for (int linear = threadIdx.x; linear < Rank * KTile; linear += blockDim.x) {
@@ -383,17 +268,42 @@ __global__ void masked_stats_solve_spd_kernel(
             const int64_t token = sequence_start + k;
             const bool valid = full_tile || ((valid_bits >> k) & 1u);
             gram_a(row, k) = valid
-                ? static_cast<float>(u_batch[token * Rank + row]) * scale
-                : 0.0f;
+                ? static_cast<Input>(load_relation_value(
+                    u, sample, head, token, row,
+                    u_stride_b, u_stride_h, u_stride_n, u_stride_r) * scale)
+                : Input(0.0f);
         }
         __syncthreads();
-        Gram().execute(gram_a, gram_b, gram_accumulator);
+        Gram().execute(1.0f, gram_a, gram_b, 1.0f, gram_output_tensor);
         __syncthreads();
     }
-    gram_accumulator.partition_and_store(gram_output_tensor);
-    __syncthreads();
 
-    const float alpha_batch = alpha[batch];
+    if (threadIdx.x == 0) {
+        float scale_squared = 1.0f;
+        float denominator = 1.0f;
+        if (trace_normalize) {
+            float energy = 0.0f;
+            for (int diagonal = 0; diagonal < Rank; ++diagonal) {
+                energy += gemm_output[diagonal * Rank + diagonal];
+            }
+            const int active_tokens = valid_count > 0 ? valid_count : 1;
+            const float element_count =
+                static_cast<float>(active_tokens * Rank);
+            denominator = energy + normalization_eps * element_count;
+            const float target = length_normalize
+                ? static_cast<float>(Rank) * length_reference
+                : element_count;
+            scale_squared = target / fmaxf(denominator, FLT_MIN);
+        }
+        effective_alpha_shared = alpha[batch] * scale_squared;
+        if (effective_alpha_output != nullptr) {
+            effective_alpha_output[batch] = effective_alpha_shared;
+            denominator_output[batch] = denominator;
+            scale_squared_output[batch] = scale_squared;
+        }
+    }
+    __syncthreads();
+    const float alpha_batch = effective_alpha_shared;
     for (int linear = threadIdx.x; linear < Rank * Rank; linear += blockDim.x) {
         const int row = linear / Rank;
         const int col = linear - row * Rank;
@@ -404,12 +314,15 @@ __global__ void masked_stats_solve_spd_kernel(
     __syncthreads();
 
     for (int64_t rhs_start = 0; rhs_start < rhs_width; rhs_start += RhsTile) {
-        auto cross_accumulator = Cross().suggest_accumulator();
-        cross_accumulator.clear();
+        for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
+            gemm_output[linear] = 0.0f;
+        }
+        __syncthreads();
         for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
             if (threadIdx.x < KTile) {
                 const int64_t token = sequence_start + threadIdx.x;
-                const bool valid = token < sequence && mask_batch[token];
+                const bool valid = token < sequence &&
+                    (mask_batch == nullptr || mask_batch[token]);
                 const unsigned int bits = __ballot_sync(0xffffffffu, valid);
                 if (threadIdx.x == 0) tile_valid_bits = bits;
             }
@@ -423,8 +336,10 @@ __global__ void masked_stats_solve_spd_kernel(
                 const int64_t token = sequence_start + k;
                 const bool valid = full_tile || ((valid_bits >> k) & 1u);
                 cross_a(row, k) = valid
-                    ? static_cast<float>(u_batch[token * Rank + row]) * scale
-                    : 0.0f;
+                    ? static_cast<Input>(load_relation_value(
+                        u, sample, head, token, row,
+                        u_stride_b, u_stride_h, u_stride_n, u_stride_r) * scale)
+                    : Input(0.0f);
             }
             for (int linear = threadIdx.x; linear < KTile * RhsTile; linear += blockDim.x) {
                 const int k = linear / RhsTile;
@@ -433,15 +348,15 @@ __global__ void masked_stats_solve_spd_kernel(
                 const int64_t global_col = rhs_start + col;
                 const bool valid = full_tile || ((valid_bits >> k) & 1u);
                 cross_b(k, col) = valid && global_col < rhs_width
-                    ? static_cast<float>(c_batch[token * rhs_width + global_col])
-                    : 0.0f;
+                    ? static_cast<Input>(c[
+                        sample * c_stride_b + head * c_stride_h +
+                        token * c_stride_n + global_col * c_stride_w])
+                    : Input(0.0f);
             }
             __syncthreads();
-            Cross().execute(cross_a, cross_b, cross_accumulator);
+            Cross().execute(1.0f, cross_a, cross_b, 1.0f, cross_output_tensor);
             __syncthreads();
         }
-        cross_accumulator.partition_and_store(cross_output_tensor);
-        __syncthreads();
         for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
             const int row = linear / RhsTile;
             const int col = linear - row * RhsTile;
@@ -450,40 +365,35 @@ __global__ void masked_stats_solve_spd_kernel(
         __syncthreads();
         Potrs().execute(a, lda, b, ldb);
         __syncthreads();
-        if constexpr (!FuseReadout) {
-            for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
-                const int row = linear / RhsTile;
-                const int col = linear - row * RhsTile;
-                const int64_t global_col = rhs_start + col;
-                if (global_col < rhs_width) {
-                    solution_batch[row * rhs_width + global_col] = b[row * ldb + col];
-                }
-            }
-            __syncthreads();
-        } else {
-            for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
-                const int row = linear / RhsTile;
-                const int col = linear - row * RhsTile;
-                readout_b(row, col) = b[row * ldb + col];
-            }
-            __syncthreads();
-            for (int64_t token_start = 0; token_start < sequence; token_start += KTile) {
+        for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
+            const int row = linear / RhsTile;
+            const int col = linear - row * RhsTile;
+            // Match the fallback contract exactly: the FP32 compact solve is
+            // rounded once to the activation dtype before Tensor-Core readout.
+            readout_b(row, col) = static_cast<Input>(b[row * ldb + col]);
+        }
+        __syncthreads();
+        for (int64_t token_start = 0; token_start < sequence; token_start += KTile) {
                 for (int linear = threadIdx.x; linear < KTile * Rank; linear += blockDim.x) {
                     const int row = linear / Rank;
                     const int col = linear - row * Rank;
                     const int64_t token = token_start + row;
-                    const bool valid = token < sequence && mask_batch[token];
+                    const bool valid = token < sequence &&
+                        (mask_batch == nullptr || mask_batch[token]);
                     // Mask is checked before the global load: padding values
                     // cannot enter either statistics or the readout.
                     readout_a(row, col) = valid
-                        ? static_cast<float>(u_batch[token * Rank + col]) * scale
-                        : 0.0f;
+                        ? static_cast<Input>(load_relation_value(
+                            u, sample, head, token, col, u_stride_b, u_stride_h,
+                            u_stride_n, u_stride_r) * scale)
+                        : Input(0.0f);
                 }
                 __syncthreads();
-                auto readout_accumulator = Readout().suggest_accumulator();
-                readout_accumulator.clear();
-                Readout().execute(readout_a, readout_b, readout_accumulator);
-                readout_accumulator.partition_and_store(readout_output_tensor);
+                for (int linear = threadIdx.x; linear < KTile * RhsTile; linear += blockDim.x) {
+                    gemm_output[linear] = 0.0f;
+                }
+                __syncthreads();
+                Readout().execute(1.0f, readout_a, readout_b, 0.0f, readout_output_tensor);
                 __syncthreads();
                 for (int linear = threadIdx.x; linear < KTile * RhsTile; linear += blockDim.x) {
                     const int row = linear / RhsTile;
@@ -491,571 +401,668 @@ __global__ void masked_stats_solve_spd_kernel(
                     const int64_t token = token_start + row;
                     const int64_t global_col = rhs_start + col;
                     if (token < sequence && global_col < rhs_width) {
-                        if (mask_batch[token]) {
-                            const float local = static_cast<float>(
-                                c_batch[token * rhs_width + global_col]);
-                            output_batch[token * rhs_width + global_col] = static_cast<scalar_t>(
+                        if (mask_batch == nullptr || mask_batch[token]) {
+                            const float local = static_cast<float>(c[
+                                sample * c_stride_b + head * c_stride_h +
+                                token * c_stride_n + global_col * c_stride_w]);
+                            const int64_t output_index =
+                                sample * output_stride_b + head * output_stride_h +
+                                token * output_stride_n + global_col * output_stride_w;
+                            output[output_index] = static_cast<scalar_t>(
                                 (local - alpha_batch * gemm_output[linear]) *
-                                inv_mu[batch]);
+                                gain[batch]);
                         } else {
-                            output_batch[token * rhs_width + global_col] = scalar_t(0);
+                            const int64_t output_index =
+                                sample * output_stride_b + head * output_stride_h +
+                                token * output_stride_n + global_col * output_stride_w;
+                            output[output_index] = scalar_t(0);
                         }
                     }
                 }
                 __syncthreads();
-            }
         }
     }
 }
 
-template <typename scalar_t, int Rank, int RhsTile, int KTile, int Arch,
-          bool FuseReadout, bool UseTma>
-__global__ void stats_solve_spd_kernel(
-    const scalar_t* __restrict__ u,
-    const scalar_t* __restrict__ c,
-    const float* __restrict__ alpha,
-    const float* __restrict__ inv_mu,
-    float* __restrict__ solution,
-    scalar_t* __restrict__ output,
-    const __grid_constant__ CUtensorMap u_tensor_map,
-    const __grid_constant__ CUtensorMap c_tensor_map,
-    int* __restrict__ info,
-    int64_t batches,
-    int64_t sequence,
-    int64_t rhs_width) {
-    using Gram = typename GemmTraits<Rank, Rank, KTile, Arch>::Type;
-    using Cross = typename GemmTraits<Rank, RhsTile, KTile, Arch>::Type;
-    using Readout = typename GemmTraits<KTile, RhsTile, Rank, Arch>::Type;
-    using Solver = SolverTraits<Rank, RhsTile, Arch>;
-    using Potrf = typename Solver::Potrf;
-    using Potrs = typename Solver::Potrs;
-
-    CUBLASDX_SKIP_IF_NOT_APPLICABLE_SM(Gram);
-    CUSOLVERDX_SKIP_IF_NOT_APPLICABLE_SM(Potrf);
-
-    const int64_t batch = static_cast<int64_t>(blockIdx.x);
-    if (batch >= batches) {
-        return;
-    }
-
-    constexpr int lda = Potrf::lda;
-    constexpr int ldb = Potrs::ldb;
-    constexpr int u_tile_elements =
-        cublasdx::cosize(Gram::get_layout_smem_a());
-    constexpr int c_tile_elements =
-        cublasdx::cosize(Cross::get_layout_smem_b());
-    // Hopper (SM90) introduced TMA. Ampere and Ada instead use the cp.async
-    // pipeline below, which is hardware accelerated from SM80 onward.
-    constexpr bool use_tma = UseTma && Arch >= 900 && sizeof(scalar_t) == 2;
-    constexpr bool use_async_staging =
-        !use_tma && Arch >= 800 && sizeof(scalar_t) == 2;
-    constexpr int output_elements =
-        (Rank > KTile ? Rank : KTile) * RhsTile;
-
-    extern __shared__ __align__(128) unsigned char smem_raw[];
-    #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ block_barrier tma_barriers[2];
-    float* u_tile = reinterpret_cast<float*>(smem_raw);
-    float* c_tile = u_tile + u_tile_elements;
-    float* a = c_tile + c_tile_elements;
-    float* b = a + Rank * lda;
-    float* gemm_output = b + Rank * ldb;
-    uintptr_t staging_address = reinterpret_cast<uintptr_t>(gemm_output + output_elements);
-    staging_address = (staging_address + 127u) & ~uintptr_t(127u);
-    scalar_t* raw_u = reinterpret_cast<scalar_t*>(staging_address);
-    scalar_t* raw_c = raw_u + ((use_async_staging || use_tma) ? 2 * KTile * Rank : 0);
-
-    auto gram_a = cublasdx::make_tensor(u_tile, Gram::get_layout_smem_a());
-    auto gram_b = cublasdx::make_tensor(u_tile, Gram::get_layout_smem_b());
-    auto cross_a = cublasdx::make_tensor(u_tile, Cross::get_layout_smem_a());
-    auto cross_b = cublasdx::make_tensor(c_tile, Cross::get_layout_smem_b());
-    auto gram_output_tensor = cublasdx::make_tensor(
-        gemm_output,
-        Gram::get_layout_gmem_c());
-    auto cross_output_tensor = cublasdx::make_tensor(
-        gemm_output,
-        Cross::get_layout_gmem_c());
-    auto readout_a = cublasdx::make_tensor(u_tile, Readout::get_layout_smem_a());
-    auto readout_b = cublasdx::make_tensor(c_tile, Readout::get_layout_smem_b());
-    auto readout_output_tensor = cublasdx::make_tensor(
-        gemm_output, Readout::get_layout_gmem_c());
-
-    const scalar_t* u_batch = u + batch * sequence * Rank;
-    const scalar_t* c_batch = c + batch * sequence * rhs_width;
-    float* solution_batch = FuseReadout ? nullptr : solution + batch * Rank * rhs_width;
-    scalar_t* output_batch = FuseReadout ? output + batch * sequence * rhs_width : nullptr;
-
-    auto gram_accumulator = Gram().suggest_accumulator();
-    gram_accumulator.clear();
-    if constexpr (use_tma) {
-        if (threadIdx.x == 0) {
-            init(&tma_barriers[0], blockDim.x);
-            init(&tma_barriers[1], blockDim.x);
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        }
-        __syncthreads();
-        auto first_token = issue_tma_tile<KTile, Rank>(
-            raw_u, &u_tensor_map, 0, 0, batch, tma_barriers[0]);
-        tma_barriers[0].wait(cuda::std::move(first_token));
-    }
-    if constexpr (use_async_staging) {
-        const int first_tokens = static_cast<int>(sequence < KTile ? sequence : KTile);
-        issue_async_contiguous_tile(
-            raw_u, u_batch, first_tokens * Rank);
-        __pipeline_commit();
-    }
-    int gram_tile_index = 0;
-    for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
-        block_barrier::arrival_token next_tma_token{};
-        const int64_t next_start = sequence_start + KTile;
-        const bool has_next_tile = next_start < sequence;
-        if constexpr (use_tma) {
-            if (has_next_tile) {
-                const int next_buffer = (gram_tile_index + 1) & 1;
-                next_tma_token = issue_tma_tile<KTile, Rank>(
-                    raw_u + next_buffer * KTile * Rank,
-                    &u_tensor_map, 0, static_cast<int>(next_start), batch,
-                    tma_barriers[next_buffer]);
-            }
-        }
-        if constexpr (use_async_staging) {
-            __pipeline_wait_prior(0);
-            __syncthreads();
-            const int64_t next_start = sequence_start + KTile;
-            if (next_start < sequence) {
-                const int next_tokens = static_cast<int>(
-                    sequence - next_start < KTile ? sequence - next_start : KTile);
-                issue_async_contiguous_tile(
-                    raw_u + ((gram_tile_index + 1) & 1) * KTile * Rank,
-                    u_batch + next_start * Rank,
-                    next_tokens * Rank);
-                __pipeline_commit();
-            }
-        }
-        for (int linear = threadIdx.x; linear < Rank * KTile; linear += blockDim.x) {
-            const int row = linear / KTile;
-            const int k = linear - row * KTile;
-            const int64_t token = sequence_start + k;
-            if constexpr (use_async_staging || use_tma) {
-                const scalar_t* staged_u =
-                    raw_u + (gram_tile_index & 1) * KTile * Rank;
-                gram_a(row, k) = token < sequence
-                    ? static_cast<float>(staged_u[k * Rank + row])
-                    : 0.0f;
-            } else {
-                gram_a(row, k) = token < sequence
-                    ? static_cast<float>(u_batch[token * Rank + row])
-                    : 0.0f;
-            }
-        }
-        __syncthreads();
-        Gram().execute(gram_a, gram_b, gram_accumulator);
-        __syncthreads();
-        if constexpr (use_tma) {
-            if (has_next_tile) {
-                tma_barriers[(gram_tile_index + 1) & 1].wait(
-                    cuda::std::move(next_tma_token));
-            }
-        }
-        ++gram_tile_index;
-    }
-    gram_accumulator.partition_and_store(gram_output_tensor);
-    __syncthreads();
-
-    const float alpha_batch = alpha[batch];
-    for (int linear = threadIdx.x; linear < Rank * Rank; linear += blockDim.x) {
-        const int row = linear / Rank;
-        const int col = linear - row * Rank;
-        a[row * lda + col] = alpha_batch * gemm_output[linear] + (row == col ? 1.0f : 0.0f);
-    }
-    __syncthreads();
-    Potrf().execute(a, lda, info + batch);
-    __syncthreads();
-
-    for (int64_t rhs_start = 0; rhs_start < rhs_width; rhs_start += RhsTile) {
-        auto cross_accumulator = Cross().suggest_accumulator();
-        cross_accumulator.clear();
-        const bool async_rhs = use_async_staging &&
-            rhs_start + RhsTile <= rhs_width;
-        if constexpr (use_tma) {
-            if (threadIdx.x == 0) {
-                init(&tma_barriers[0], blockDim.x);
-                init(&tma_barriers[1], blockDim.x);
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            }
-            __syncthreads();
-            auto first_token = issue_tma_cross_tiles<KTile, Rank, RhsTile>(
-                raw_u, raw_c, &u_tensor_map, &c_tensor_map,
-                0, static_cast<int>(rhs_start), batch, tma_barriers[0]);
-            tma_barriers[0].wait(cuda::std::move(first_token));
-        }
-        if (async_rhs) {
-            const int first_tokens = static_cast<int>(sequence < KTile ? sequence : KTile);
-            issue_async_contiguous_tile(raw_u, u_batch, first_tokens * Rank);
-            issue_async_rhs_tile<scalar_t, KTile, RhsTile>(
-                raw_c, c_batch, 0, rhs_start, sequence, rhs_width);
-            __pipeline_commit();
-        }
-        int cross_tile_index = 0;
-        for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
-            block_barrier::arrival_token next_tma_token{};
-            const int64_t tma_next_start = sequence_start + KTile;
-            const bool has_next_tile = tma_next_start < sequence;
-            if constexpr (use_tma) {
-                if (has_next_tile) {
-                    const int next_buffer = (cross_tile_index + 1) & 1;
-                    next_tma_token = issue_tma_cross_tiles<KTile, Rank, RhsTile>(
-                        raw_u + next_buffer * KTile * Rank,
-                        raw_c + next_buffer * KTile * RhsTile,
-                        &u_tensor_map, &c_tensor_map,
-                        static_cast<int>(tma_next_start), static_cast<int>(rhs_start),
-                        batch, tma_barriers[next_buffer]);
-                }
-            }
-            if (async_rhs) {
-                __pipeline_wait_prior(0);
-                __syncthreads();
-                const int64_t next_start = sequence_start + KTile;
-                if (next_start < sequence) {
-                    const int next_tokens = static_cast<int>(
-                        sequence - next_start < KTile ? sequence - next_start : KTile);
-                    const int next_buffer = (cross_tile_index + 1) & 1;
-                    issue_async_contiguous_tile(
-                        raw_u + next_buffer * KTile * Rank,
-                        u_batch + next_start * Rank,
-                        next_tokens * Rank);
-                    issue_async_rhs_tile<scalar_t, KTile, RhsTile>(
-                        raw_c + next_buffer * KTile * RhsTile,
-                        c_batch, next_start, rhs_start, sequence, rhs_width);
-                    __pipeline_commit();
-                }
-            }
-            for (int linear = threadIdx.x; linear < Rank * KTile; linear += blockDim.x) {
-                const int row = linear / KTile;
-                const int k = linear - row * KTile;
-                const int64_t token = sequence_start + k;
-                if (async_rhs || use_tma) {
-                    const scalar_t* staged_u =
-                        raw_u + (cross_tile_index & 1) * KTile * Rank;
-                    cross_a(row, k) = token < sequence
-                        ? static_cast<float>(staged_u[k * Rank + row])
-                        : 0.0f;
-                } else {
-                    cross_a(row, k) = token < sequence
-                        ? static_cast<float>(u_batch[token * Rank + row])
-                        : 0.0f;
-                }
-            }
-            for (int linear = threadIdx.x; linear < KTile * RhsTile; linear += blockDim.x) {
-                const int k = linear / RhsTile;
-                const int col = linear - k * RhsTile;
-                const int64_t token = sequence_start + k;
-                const int64_t global_col = rhs_start + col;
-                if (async_rhs || use_tma) {
-                    const scalar_t* staged_c =
-                        raw_c + (cross_tile_index & 1) * KTile * RhsTile;
-                    cross_b(k, col) = token < sequence
-                        ? static_cast<float>(staged_c[k * RhsTile + col])
-                        : 0.0f;
-                } else {
-                    cross_b(k, col) = token < sequence && global_col < rhs_width
-                        ? static_cast<float>(c_batch[token * rhs_width + global_col])
-                        : 0.0f;
-                }
-            }
-            __syncthreads();
-            Cross().execute(cross_a, cross_b, cross_accumulator);
-            __syncthreads();
-            if constexpr (use_tma) {
-                if (has_next_tile) {
-                    tma_barriers[(cross_tile_index + 1) & 1].wait(
-                        cuda::std::move(next_tma_token));
-                }
-            }
-            ++cross_tile_index;
-        }
-        cross_accumulator.partition_and_store(cross_output_tensor);
-        __syncthreads();
-        for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
-            const int row = linear / RhsTile;
-            const int col = linear - row * RhsTile;
-            b[row * ldb + col] = gemm_output[linear];
-        }
-        __syncthreads();
-        Potrs().execute(a, lda, b, ldb);
-        __syncthreads();
-
-        if constexpr (!FuseReadout) {
-            for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
-                const int row = linear / RhsTile;
-                const int col = linear - row * RhsTile;
-                const int64_t global_col = rhs_start + col;
-                if (global_col < rhs_width) {
-                    solution_batch[row * rhs_width + global_col] = b[row * ldb + col];
-                }
-            }
-            __syncthreads();
-        } else {
-            // The statistics buffers are dead after POTRS, so reuse them for
-            // U@K and apply the Woodbury epilogue before the sole global write.
-            for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
-                const int row = linear / RhsTile;
-                const int col = linear - row * RhsTile;
-                readout_b(row, col) = b[row * ldb + col];
-            }
-            __syncthreads();
-            if constexpr (use_tma) {
-                if (threadIdx.x == 0) {
-                    init(&tma_barriers[0], blockDim.x);
-                    init(&tma_barriers[1], blockDim.x);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                }
-                __syncthreads();
-                auto first_token = issue_tma_tile<KTile, Rank>(
-                    raw_u, &u_tensor_map, 0, 0, batch, tma_barriers[0]);
-                tma_barriers[0].wait(cuda::std::move(first_token));
-            }
-            int readout_tile_index = 0;
-            for (int64_t token_start = 0; token_start < sequence; token_start += KTile) {
-                block_barrier::arrival_token next_tma_token{};
-                const int64_t next_start = token_start + KTile;
-                const bool has_next_tile = next_start < sequence;
-                if constexpr (use_tma) {
-                    if (has_next_tile) {
-                        const int next_buffer = (readout_tile_index + 1) & 1;
-                        next_tma_token = issue_tma_tile<KTile, Rank>(
-                            raw_u + next_buffer * KTile * Rank,
-                            &u_tensor_map, 0, static_cast<int>(next_start), batch,
-                            tma_barriers[next_buffer]);
-                    }
-                }
-                for (int linear = threadIdx.x; linear < KTile * Rank; linear += blockDim.x) {
-                    const int row = linear / Rank;
-                    const int col = linear - row * Rank;
-                    const int64_t token = token_start + row;
-                    if constexpr (use_tma) {
-                        const scalar_t* staged_u =
-                            raw_u + (readout_tile_index & 1) * KTile * Rank;
-                        readout_a(row, col) = token < sequence
-                            ? static_cast<float>(staged_u[row * Rank + col])
-                            : 0.0f;
-                    } else {
-                        readout_a(row, col) = token < sequence
-                            ? static_cast<float>(u_batch[token * Rank + col])
-                            : 0.0f;
-                    }
-                }
-                __syncthreads();
-                auto readout_accumulator = Readout().suggest_accumulator();
-                readout_accumulator.clear();
-                Readout().execute(readout_a, readout_b, readout_accumulator);
-                readout_accumulator.partition_and_store(readout_output_tensor);
-                __syncthreads();
-                for (int linear = threadIdx.x; linear < KTile * RhsTile; linear += blockDim.x) {
-                    const int row = linear / RhsTile;
-                    const int col = linear - row * RhsTile;
-                    const int64_t token = token_start + row;
-                    const int64_t global_col = rhs_start + col;
-                    if (token < sequence && global_col < rhs_width) {
-                        const float local = static_cast<float>(
-                            c_batch[token * rhs_width + global_col]);
-                        output_batch[token * rhs_width + global_col] = static_cast<scalar_t>(
-                            (local - alpha_batch * gemm_output[linear]) * inv_mu[batch]);
-                    }
-                }
-                __syncthreads();
-                if constexpr (use_tma) {
-                    if (has_next_tile) {
-                        tma_barriers[(readout_tile_index + 1) & 1].wait(
-                            cuda::std::move(next_tma_token));
-                    }
-                }
-                ++readout_tile_index;
-            }
-        }
-    }
-}
-
-template <typename scalar_t, int Rank, int Arch, bool FuseReadout>
-void launch_masked_stats_solve_typed(
+template <typename scalar_t, int Rank, int Arch>
+void launch_masked_trace_solve_typed(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
     const at::Tensor& length_scale,
     const at::Tensor& alpha,
-    const at::Tensor& inv_mu,
-    at::Tensor& solution,
+    const at::Tensor& gain,
     at::Tensor& output,
     at::Tensor& info,
+    bool trace_normalize,
+    float normalization_eps,
+    float length_reference,
+    bool length_normalize,
+    at::Tensor& effective_alpha_output,
+    at::Tensor& denominator_output,
+    at::Tensor& scale_squared_output,
     cudaStream_t stream) {
     constexpr int rhs_tile = 32;
     constexpr int k_tile = 32;
-    using Gram = typename GemmTraits<Rank, Rank, k_tile, Arch>::Type;
-    using Cross = typename GemmTraits<Rank, rhs_tile, k_tile, Arch>::Type;
-    using Readout = typename GemmTraits<k_tile, rhs_tile, Rank, Arch>::Type;
+    using Input = typename GemmInputPrecision<scalar_t>::Type;
+    using Gram = typename GemmTraits<scalar_t, Rank, Rank, k_tile, Arch>::Type;
+    using Cross = typename GemmTraits<scalar_t, Rank, rhs_tile, k_tile, Arch>::Type;
+    using Readout = typename GemmTraits<scalar_t, k_tile, rhs_tile, Rank, Arch>::Type;
     using Solver = SolverTraits<Rank, rhs_tile, Arch>;
     using Potrf = typename Solver::Potrf;
     using Potrs = typename Solver::Potrs;
-    constexpr size_t smem_bytes = sizeof(float) * (
-        cublasdx::cosize(Gram::get_layout_smem_a()) +
-        cublasdx::cosize(Cross::get_layout_smem_b()) +
+    constexpr int c_tile_elements =
+        cublasdx::cosize(Cross::get_layout_smem_b()) >
+                cublasdx::cosize(Readout::get_layout_smem_b())
+            ? cublasdx::cosize(Cross::get_layout_smem_b())
+            : cublasdx::cosize(Readout::get_layout_smem_b());
+    constexpr size_t smem_bytes = sizeof(Input) * (
+        cublasdx::cosize(Gram::get_layout_smem_a()) + c_tile_elements) +
+        15 + sizeof(float) * (
         Rank * Potrf::lda + Rank * Potrs::ldb +
-        (Rank > k_tile ? Rank : k_tile) * rhs_tile);
+        (Rank * Rank > k_tile * rhs_tile
+            ? Rank * Rank : k_tile * rhs_tile));
     static_assert(cublasdx::cosize(Gram::get_layout_smem_a()) >=
                   cublasdx::cosize(Readout::get_layout_smem_a()));
-    static_assert(cublasdx::cosize(Cross::get_layout_smem_b()) >=
-                  cublasdx::cosize(Readout::get_layout_smem_b()));
 
-    auto kernel = masked_stats_solve_spd_kernel<
-        scalar_t, Rank, rhs_tile, k_tile, Arch, FuseReadout>;
+    auto kernel = masked_trace_solve_readout_kernel<
+        scalar_t, Rank, rhs_tile, k_tile, Arch>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)));
     const int64_t systems = u.size(0) * u.size(1);
     TORCH_CHECK(
         systems <= static_cast<int64_t>(std::numeric_limits<unsigned int>::max()),
         "B * H exceeds the CUDA launch-grid limit");
     kernel<<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
         u.const_data_ptr<scalar_t>(), c.const_data_ptr<scalar_t>(),
-        valid_mask.const_data_ptr<bool>(), length_scale.const_data_ptr<float>(),
-        alpha.const_data_ptr<float>(),
-        FuseReadout ? inv_mu.const_data_ptr<float>() : nullptr,
-        FuseReadout ? nullptr : solution.mutable_data_ptr<float>(),
-        FuseReadout ? output.mutable_data_ptr<scalar_t>() : nullptr,
-        info.mutable_data_ptr<int>(), systems, u.size(1), u.size(2), c.size(3));
+        valid_mask.numel() == 0 ? nullptr : valid_mask.const_data_ptr<bool>(),
+        length_scale.numel() == 0 ? nullptr : length_scale.const_data_ptr<float>(),
+        alpha.const_data_ptr<float>(), gain.const_data_ptr<float>(),
+        output.mutable_data_ptr<scalar_t>(), info.mutable_data_ptr<int>(),
+        trace_normalize, normalization_eps, length_reference, length_normalize,
+        effective_alpha_output.numel() == 0
+            ? nullptr : effective_alpha_output.mutable_data_ptr<float>(),
+        denominator_output.numel() == 0
+            ? nullptr : denominator_output.mutable_data_ptr<float>(),
+        scale_squared_output.numel() == 0
+            ? nullptr : scale_squared_output.mutable_data_ptr<float>(),
+        u.stride(0), u.stride(1), u.stride(2), u.stride(3),
+        c.stride(0), c.stride(1), c.stride(2), c.stride(3),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        systems, u.size(1), u.size(2), c.size(3));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int Arch, bool FuseReadout>
-void dispatch_masked_stats_solve_rank(
+template <int Arch>
+void dispatch_masked_trace_solve_rank(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
     const at::Tensor& length_scale,
     const at::Tensor& alpha,
-    const at::Tensor& inv_mu,
-    at::Tensor& solution,
+    const at::Tensor& gain,
     at::Tensor& output,
     at::Tensor& info,
+    bool trace_normalize,
+    float normalization_eps,
+    float length_reference,
+    bool length_normalize,
+    at::Tensor& effective_alpha_output,
+    at::Tensor& denominator_output,
+    at::Tensor& scale_squared_output,
     cudaStream_t stream) {
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16, u.scalar_type(),
-        "masked_stats_solve_spd_cuda", [&] {
-            if (u.size(3) == 16) {
-                launch_masked_stats_solve_typed<scalar_t, 16, Arch, FuseReadout>(
-                    u, c, valid_mask, length_scale, alpha, inv_mu,
-                    solution, output, info, stream);
-            } else if (u.size(3) == 32) {
-                launch_masked_stats_solve_typed<scalar_t, 32, Arch, FuseReadout>(
-                    u, c, valid_mask, length_scale, alpha, inv_mu,
-                    solution, output, info, stream);
-            } else {
-                TORCH_CHECK(false, "MathDx backend supports rank 16 or 32, got ", u.size(3));
+    AT_DISPATCH_SWITCH(
+        u.scalar_type(), "masked_trace_solve_cuda",
+        AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
+            auto launch = [&](auto rank_tag) {
+                constexpr int rank = decltype(rank_tag)::value;
+                launch_masked_trace_solve_typed<scalar_t, rank, Arch>(
+                    u, c, valid_mask, length_scale, alpha, gain, output, info,
+                    trace_normalize, normalization_eps, length_reference,
+                    length_normalize, effective_alpha_output,
+                    denominator_output, scale_squared_output, stream);
+            };
+            if (u.size(3) == 16) launch(std::integral_constant<int, 16>{});
+            else if (u.size(3) == 32) launch(std::integral_constant<int, 32>{});
+            else if (u.size(3) == 48) launch(std::integral_constant<int, 48>{});
+            else if (u.size(3) == 64) launch(std::integral_constant<int, 64>{});
+            else TORCH_CHECK(false, "MathDx fused backend supports rank 16/32/48/64, got ", u.size(3));
+        })
+        AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
+            auto launch = [&](auto rank_tag) {
+                constexpr int rank = decltype(rank_tag)::value;
+                launch_masked_trace_solve_typed<scalar_t, rank, Arch>(
+                    u, c, valid_mask, length_scale, alpha, gain, output, info,
+                    trace_normalize, normalization_eps, length_reference,
+                    length_normalize, effective_alpha_output,
+                    denominator_output, scale_squared_output, stream);
+            };
+            if (u.size(3) == 16) launch(std::integral_constant<int, 16>{});
+            else if (u.size(3) == 32) launch(std::integral_constant<int, 32>{});
+            else if (u.size(3) == 48) launch(std::integral_constant<int, 48>{});
+            else if (u.size(3) == 64) launch(std::integral_constant<int, 64>{});
+            else TORCH_CHECK(false, "MathDx fused backend supports rank 16/32/48/64, got ", u.size(3));
+        }));
+}
+template <typename mma_t>
+__global__ void dual_backward_statistics_tensorcore_kernel(
+    const mma_t* __restrict__ u,
+    const mma_t* __restrict__ y,
+    const mma_t* __restrict__ p,
+    float* __restrict__ ytu,
+    float* __restrict__ ptu,
+    float* __restrict__ grad_mu,
+    const bool* __restrict__ valid_mask,
+    int64_t systems,
+    int64_t sequence,
+    int64_t width,
+    int64_t rank_dim,
+    int64_t heads,
+    int64_t u_stride_b,
+    int64_t u_stride_h,
+    int64_t u_stride_n,
+    int64_t u_stride_r,
+    int64_t y_stride_b,
+    int64_t y_stride_h,
+    int64_t y_stride_n,
+    int64_t y_stride_w,
+    int64_t p_stride_b,
+    int64_t p_stride_h,
+    int64_t p_stride_n,
+    int64_t p_stride_w) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    namespace wmma = nvcuda::wmma;
+    constexpr int tile = 16;
+    const int64_t system = static_cast<int64_t>(blockIdx.x);
+    const int64_t sample = system / heads;
+    const int64_t head = system - sample * heads;
+    const bool* mask_batch = valid_mask == nullptr
+        ? nullptr : valid_mask + sample * sequence;
+    const int width_start = static_cast<int>(blockIdx.y) * tile;
+    const int rank_start = static_cast<int>(blockIdx.z) * tile;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (system >= systems || warp >= 2) return;
+
+    extern __shared__ __align__(32) unsigned char smem_raw[];
+    mma_t* y_tile = reinterpret_cast<mma_t*>(smem_raw);
+    mma_t* p_tile = y_tile + tile * tile;
+    mma_t* u_tile = p_tile + tile * tile;
+    float* output_tiles = reinterpret_cast<float*>(u_tile + tile * tile);
+    float* reduction = output_tiles + 2 * tile * tile;
+
+    wmma::fragment<wmma::accumulator, tile, tile, tile, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+    float mu_partial = 0.0f;
+    for (int64_t token_start = 0; token_start < sequence; token_start += tile) {
+        for (int linear = threadIdx.x; linear < tile * tile;
+             linear += blockDim.x) {
+            const int row = linear / tile;
+            const int column = linear - row * tile;
+            const int64_t token = token_start + column;
+            const int channel = width_start + row;
+            const bool source_active = token < sequence && channel < width &&
+                (mask_batch == nullptr || mask_batch[token]);
+            const mma_t y_value = source_active
+                ? y[sample * y_stride_b + head * y_stride_h +
+                    token * y_stride_n + channel * y_stride_w]
+                : mma_t(0.0f);
+            const mma_t p_value = source_active
+                ? p[sample * p_stride_b + head * p_stride_h +
+                    token * p_stride_n + channel * p_stride_w]
+                : mma_t(0.0f);
+            y_tile[linear] = y_value;
+            p_tile[linear] = p_value;
+            if (rank_start == 0 && source_active) {
+                mu_partial -= static_cast<float>(y_value) *
+                    static_cast<float>(p_value);
             }
-        });
+            const int64_t u_token = token_start + row;
+            const int rank = rank_start + column;
+            u_tile[linear] = u_token < sequence && rank < rank_dim &&
+                    (mask_batch == nullptr || mask_batch[u_token])
+                ? u[sample * u_stride_b + head * u_stride_h +
+                    u_token * u_stride_n + rank * u_stride_r]
+                : mma_t(0.0f);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, tile, tile, tile, mma_t, wmma::row_major>
+            source_fragment;
+        wmma::fragment<wmma::matrix_b, tile, tile, tile, mma_t, wmma::row_major>
+            u_fragment;
+        wmma::load_matrix_sync(
+            source_fragment, warp == 0 ? y_tile : p_tile, tile);
+        wmma::load_matrix_sync(u_fragment, u_tile, tile);
+        wmma::mma_sync(accumulator, source_fragment, u_fragment, accumulator);
+        __syncthreads();
+    }
+
+    float* warp_output = output_tiles + warp * tile * tile;
+    wmma::store_matrix_sync(
+        warp_output, accumulator, tile, wmma::mem_row_major);
+    __syncwarp();
+    float* destination = warp == 0 ? ytu : ptu;
+    const int64_t output_base = system * width * rank_dim;
+    for (int linear = lane; linear < tile * tile; linear += 32) {
+        const int row = linear / tile;
+        const int column = linear - row * tile;
+        const int channel = width_start + row;
+        const int rank = rank_start + column;
+        if (channel < width && rank < rank_dim) {
+            destination[output_base + channel * rank_dim + rank] =
+                warp_output[linear];
+        }
+    }
+
+    if (rank_start == 0) {
+        reduction[threadIdx.x] = mu_partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) atomicAdd(grad_mu + system, reduction[0]);
+    }
+#endif
 }
 
-template <typename scalar_t, int Rank, bool Masked>
-__global__ void lsso_backward_fused_kernel(
-    const scalar_t* __restrict__ u,
-    const scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ p,
-    const float* __restrict__ gamma,
-    const bool* __restrict__ valid_mask,
-    const float* __restrict__ length_scale,
-    scalar_t* __restrict__ grad_u,
-    float* __restrict__ grad_mu,
-    float* __restrict__ grad_gamma,
-    int64_t systems,
+template <typename mma_t>
+void launch_dual_backward_statistics_tensorcore(
+    const at::Tensor& u,
+    const at::Tensor& y,
+    const at::Tensor& p,
+    at::Tensor& ytu,
+    at::Tensor& ptu,
+    at::Tensor& grad_mu,
+    const at::Tensor& valid_mask,
     int64_t heads,
+    cudaStream_t stream) {
+    constexpr int tile = 16;
+    const bool four_dimensional = u.dim() == 4;
+    const int64_t systems = four_dimensional ? u.size(0) * u.size(1) : u.size(0);
+    const int64_t sequence = four_dimensional ? u.size(2) : u.size(1);
+    const int64_t rank_dim = four_dimensional ? u.size(3) : u.size(2);
+    const int64_t width = four_dimensional ? y.size(3) : y.size(2);
+    const int64_t u_stride_b = four_dimensional ? u.stride(0) : heads * u.stride(0);
+    const int64_t u_stride_h = four_dimensional ? u.stride(1) : u.stride(0);
+    const int64_t u_stride_n = four_dimensional ? u.stride(2) : u.stride(1);
+    const int64_t u_stride_r = four_dimensional ? u.stride(3) : u.stride(2);
+    const int64_t y_stride_b = four_dimensional ? y.stride(0) : heads * y.stride(0);
+    const int64_t y_stride_h = four_dimensional ? y.stride(1) : y.stride(0);
+    const int64_t y_stride_n = four_dimensional ? y.stride(2) : y.stride(1);
+    const int64_t y_stride_w = four_dimensional ? y.stride(3) : y.stride(2);
+    const int64_t p_stride_b = four_dimensional ? p.stride(0) : heads * p.stride(0);
+    const int64_t p_stride_h = four_dimensional ? p.stride(1) : p.stride(0);
+    const int64_t p_stride_n = four_dimensional ? p.stride(2) : p.stride(1);
+    const int64_t p_stride_w = four_dimensional ? p.stride(3) : p.stride(2);
+    const dim3 grid(
+        static_cast<unsigned int>(systems),
+        static_cast<unsigned int>((width + tile - 1) / tile),
+        static_cast<unsigned int>((rank_dim + tile - 1) / tile));
+    constexpr int threads = 64;
+    constexpr size_t smem_bytes =
+        sizeof(mma_t) * 3 * tile * tile +
+        sizeof(float) * (2 * tile * tile + threads);
+    dual_backward_statistics_tensorcore_kernel<mma_t>
+        <<<grid, threads, smem_bytes, stream>>>(
+            reinterpret_cast<const mma_t*>(u.const_data_ptr()),
+            reinterpret_cast<const mma_t*>(y.const_data_ptr()),
+            reinterpret_cast<const mma_t*>(p.const_data_ptr()),
+            ytu.mutable_data_ptr<float>(),
+            ptu.mutable_data_ptr<float>(),
+            grad_mu.mutable_data_ptr<float>(),
+            valid_mask.numel() == 0 ? nullptr : valid_mask.const_data_ptr<bool>(),
+            systems, sequence, width, rank_dim, heads,
+            u_stride_b, u_stride_h, u_stride_n, u_stride_r,
+            y_stride_b, y_stride_h, y_stride_n, y_stride_w,
+            p_stride_b, p_stride_h, p_stride_n, p_stride_w);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+dual_backward_statistics_tensorcore_cuda(
+    const at::Tensor& u,
+    const at::Tensor& y,
+    const at::Tensor& p,
+    const at::Tensor& valid_mask,
+    int64_t heads) {
+    TORCH_CHECK(
+        u.is_cuda() && y.is_cuda() && p.is_cuda(),
+        "dual backward-statistics inputs must be CUDA tensors");
+    TORCH_CHECK(
+        u.scalar_type() == y.scalar_type() && y.scalar_type() == p.scalar_type() &&
+        (u.scalar_type() == at::kHalf || u.scalar_type() == at::kBFloat16),
+        "dual backward statistics requires matching FP16/BF16 inputs");
+    TORCH_CHECK(heads > 0, "heads must be positive");
+    const bool four_dimensional = u.dim() == 4;
+    TORCH_CHECK(
+        (u.dim() == 3 || four_dimensional) && y.dim() == u.dim() &&
+        p.dim() == u.dim() && y.sizes() == p.sizes(),
+        "expected 3-D system-major or 4-D [B,H,N,width] inputs");
+    TORCH_CHECK(
+        four_dimensional
+            ? (u.sizes().slice(0, 3) == y.sizes().slice(0, 3) &&
+               u.size(1) == heads)
+            : (u.size(0) == y.size(0) && u.size(1) == y.size(1) &&
+               heads > 0 && u.size(0) % heads == 0),
+        "U and Y/P logical dimensions differ");
+    const int64_t systems = four_dimensional ? u.size(0) * u.size(1) : u.size(0);
+    const int64_t sequence = four_dimensional ? u.size(2) : u.size(1);
+    const int64_t rank_dim = four_dimensional ? u.size(3) : u.size(2);
+    const int64_t width = four_dimensional ? y.size(3) : y.size(2);
+    const int64_t batches = systems / heads;
+    TORCH_CHECK(
+        rank_dim == 16 || rank_dim == 32 || rank_dim == 48 || rank_dim == 64,
+        "dual backward statistics requires rank 16/32/48/64");
+    TORCH_CHECK(heads > 0 && systems % heads == 0,
+                "heads must divide the system count");
+    TORCH_CHECK(
+        valid_mask.numel() == 0 ||
+            (valid_mask.is_cuda() && valid_mask.scalar_type() == at::kBool &&
+             valid_mask.is_contiguous() && valid_mask.dim() == 2 &&
+              valid_mask.size(0) == batches &&
+              valid_mask.size(1) == sequence),
+        "valid_mask must be empty or contiguous bool [B,N]");
+    const c10::cuda::CUDAGuard device_guard(u.device());
+    auto options = u.options().dtype(at::kFloat);
+    auto ytu = at::empty({systems, width, rank_dim}, options);
+    auto ptu = at::empty_like(ytu);
+    auto grad_mu = at::zeros({systems}, options);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(u.get_device()).stream();
+    if (u.scalar_type() == at::kBFloat16) {
+        launch_dual_backward_statistics_tensorcore<__nv_bfloat16>(
+            u, y, p, ytu, ptu, grad_mu, valid_mask, heads, stream);
+    } else {
+        launch_dual_backward_statistics_tensorcore<half>(
+            u, y, p, ytu, ptu, grad_mu, valid_mask, heads, stream);
+    }
+    return {ytu, ptu, grad_mu};
+}
+
+template <typename mma_t>
+__global__ void dual_grad_u_tensorcore_kernel(
+    const mma_t* __restrict__ p,
+    const mma_t* __restrict__ y,
+    const mma_t* __restrict__ ytu,
+    const mma_t* __restrict__ ptu,
+    const float* __restrict__ coefficient,
+    const mma_t* __restrict__ radial_u,
+    const float* __restrict__ radial_coefficient,
+    const bool* __restrict__ valid_mask,
+    mma_t* __restrict__ grad_u,
+    int64_t systems,
     int64_t sequence,
-    int64_t width) {
+    int64_t width,
+    int64_t rank_dim,
+    int64_t heads,
+    int64_t p_stride_b,
+    int64_t p_stride_h,
+    int64_t p_stride_n,
+    int64_t p_stride_w,
+    int64_t y_stride_b,
+    int64_t y_stride_h,
+    int64_t y_stride_n,
+    int64_t y_stride_w,
+    int64_t radial_stride_b,
+    int64_t radial_stride_h,
+    int64_t radial_stride_n,
+    int64_t radial_stride_r) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    namespace wmma = nvcuda::wmma;
+    constexpr int tile = 16;
+    const int rank_tiles = static_cast<int>((rank_dim + tile - 1) / tile);
     const int64_t system = static_cast<int64_t>(blockIdx.x);
-    if (system >= systems) return;
     const int64_t sample = system / heads;
-    const scalar_t* u_batch = u + system * sequence * Rank;
-    const scalar_t* y_batch = y + system * sequence * width;
-    const scalar_t* p_batch = p + system * sequence * width;
-    scalar_t* grad_batch = grad_u + system * sequence * Rank;
-    const bool* mask_batch = Masked ? valid_mask + sample * sequence : nullptr;
-    const float scale2 = Masked ? length_scale[sample] * length_scale[sample] : 1.0f;
-    const int compact_elements = static_cast<int>(width) * Rank;
+    const int64_t head = system - sample * heads;
+    const bool* mask_batch = valid_mask == nullptr
+        ? nullptr : valid_mask + sample * sequence;
+    const int64_t token_start = static_cast<int64_t>(blockIdx.y) * tile;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (system >= systems || warp >= rank_tiles) return;
 
-    extern __shared__ __align__(16) float shared[];
-    float* ytu = shared;
-    float* ptu = ytu + compact_elements;
-    float* reduction = ptu + compact_elements;
+    extern __shared__ __align__(32) unsigned char smem_raw[];
+    mma_t* p_tile = reinterpret_cast<mma_t*>(smem_raw);
+    mma_t* y_tile = p_tile + tile * tile;
+    float* output_tiles = reinterpret_cast<float*>(y_tile + tile * tile);
 
-    // Each lane owns one or more compact (channel, rank) entries and scans N.
-    // Padding is tested before U/Y/P are loaded.
-    for (int linear = threadIdx.x; linear < compact_elements; linear += blockDim.x) {
-        const int channel = linear / Rank;
-        const int rank = linear - channel * Rank;
-        float y_sum = 0.0f;
-        float p_sum = 0.0f;
-        for (int64_t token = 0; token < sequence; ++token) {
-            if constexpr (Masked) {
-                if (!mask_batch[token]) continue;
-            }
-            const float uv = static_cast<float>(u_batch[token * Rank + rank]);
-            y_sum += static_cast<float>(y_batch[token * width + channel]) * uv;
-            p_sum += static_cast<float>(p_batch[token * width + channel]) * uv;
+    wmma::fragment<wmma::accumulator, tile, tile, tile, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+    const int rank_start = warp * tile;
+    const int64_t compact_base = system * width * rank_dim;
+
+    for (int64_t k_start = 0; k_start < width; k_start += tile) {
+        for (int linear = threadIdx.x; linear < tile * tile;
+             linear += blockDim.x) {
+            const int row = linear / tile;
+            const int column = linear - row * tile;
+            const int64_t token = token_start + row;
+            const int64_t channel = k_start + column;
+            const bool active = token < sequence && channel < width &&
+                (mask_batch == nullptr || mask_batch[token]);
+            p_tile[linear] = active
+                ? p[sample * p_stride_b + head * p_stride_h +
+                    token * p_stride_n + channel * p_stride_w]
+                : mma_t(0.0f);
+            y_tile[linear] = active
+                ? y[sample * y_stride_b + head * y_stride_h +
+                    token * y_stride_n + channel * y_stride_w]
+                : mma_t(0.0f);
         }
-        ytu[linear] = y_sum;
-        ptu[linear] = p_sum;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    float mu_partial = 0.0f;
-    for (int64_t linear = threadIdx.x;
-         linear < sequence * width;
-         linear += blockDim.x) {
-        const int64_t token = linear / width;
-        if constexpr (Masked) {
-            if (!mask_batch[token]) continue;
-        }
-        mu_partial -= static_cast<float>(y_batch[linear]) *
-                      static_cast<float>(p_batch[linear]);
-    }
-    float gamma_partial = 0.0f;
-    for (int linear = threadIdx.x; linear < compact_elements; linear += blockDim.x) {
-        gamma_partial -= ytu[linear] * ptu[linear] * scale2;
-    }
-    reduction[threadIdx.x] = mu_partial;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        wmma::fragment<wmma::matrix_a, tile, tile, tile, mma_t, wmma::row_major> p_fragment;
+        wmma::fragment<wmma::matrix_a, tile, tile, tile, mma_t, wmma::row_major> y_fragment;
+        wmma::fragment<wmma::matrix_b, tile, tile, tile, mma_t, wmma::row_major> ytu_fragment;
+        wmma::fragment<wmma::matrix_b, tile, tile, tile, mma_t, wmma::row_major> ptu_fragment;
+        wmma::load_matrix_sync(p_fragment, p_tile, tile);
+        wmma::load_matrix_sync(y_fragment, y_tile, tile);
+        wmma::load_matrix_sync(
+            ytu_fragment,
+            ytu + compact_base + k_start * rank_dim + rank_start,
+            rank_dim);
+        wmma::load_matrix_sync(
+            ptu_fragment,
+            ptu + compact_base + k_start * rank_dim + rank_start,
+            rank_dim);
+        wmma::mma_sync(accumulator, p_fragment, ytu_fragment, accumulator);
+        wmma::mma_sync(accumulator, y_fragment, ptu_fragment, accumulator);
         __syncthreads();
     }
-    if (threadIdx.x == 0) grad_mu[system] = reduction[0];
-    reduction[threadIdx.x] = gamma_partial;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) grad_gamma[system] = reduction[0];
-    __syncthreads();
 
-    const float coefficient = -gamma[system] * scale2;
-    for (int64_t linear = threadIdx.x;
-         linear < sequence * Rank;
-         linear += blockDim.x) {
-        const int64_t token = linear / Rank;
-        const int rank = static_cast<int>(linear - token * Rank);
-        if constexpr (Masked) {
-            if (!mask_batch[token]) {
-                grad_batch[linear] = scalar_t(0);
+    const float scale = coefficient[system];
+    for (int index = 0; index < accumulator.num_elements; ++index) {
+        accumulator.x[index] *= scale;
+    }
+    float* warp_output = output_tiles + warp * tile * tile;
+    wmma::store_matrix_sync(
+        warp_output, accumulator, tile, wmma::mem_row_major);
+    __syncwarp();
+    const int64_t output_base = system * sequence * rank_dim;
+    for (int linear = lane; linear < tile * tile; linear += 32) {
+        const int row = linear / tile;
+        const int column = linear - row * tile;
+        const int64_t token = token_start + row;
+        if (token < sequence) {
+            const int64_t output_index =
+                output_base + token * rank_dim + rank_start + column;
+            if (mask_batch != nullptr && !mask_batch[token]) {
+                grad_u[output_index] = mma_t(0.0f);
                 continue;
             }
+            float value = warp_output[linear];
+            if (radial_u != nullptr) {
+                value += radial_coefficient[system] *
+                    static_cast<float>(radial_u[
+                        sample * radial_stride_b + head * radial_stride_h +
+                        token * radial_stride_n +
+                        (rank_start + column) * radial_stride_r]);
+            }
+            grad_u[output_index] = mma_t(value);
         }
-        float value = 0.0f;
-        for (int64_t channel = 0; channel < width; ++channel) {
-            const int compact = static_cast<int>(channel) * Rank + rank;
-            value += static_cast<float>(p_batch[token * width + channel]) * ytu[compact]
-                   + static_cast<float>(y_batch[token * width + channel]) * ptu[compact];
-        }
-        grad_batch[linear] = static_cast<scalar_t>(coefficient * value);
     }
+#endif
+}
+
+template <typename mma_t>
+void launch_dual_grad_u_tensorcore(
+    const at::Tensor& p,
+    const at::Tensor& y,
+    const at::Tensor& ytu,
+    const at::Tensor& ptu,
+    const at::Tensor& coefficient,
+    const at::Tensor& radial_u,
+    const at::Tensor& radial_coefficient,
+    const at::Tensor& valid_mask,
+    int64_t heads,
+    at::Tensor& grad_u,
+    cudaStream_t stream) {
+    constexpr int tile = 16;
+    const bool four_dimensional = p.dim() == 4;
+    const int64_t systems = four_dimensional ? p.size(0) * p.size(1) : p.size(0);
+    const int64_t sequence = four_dimensional ? p.size(2) : p.size(1);
+    const int64_t width = four_dimensional ? p.size(3) : p.size(2);
+    const int64_t p_stride_b = four_dimensional ? p.stride(0) : heads * p.stride(0);
+    const int64_t p_stride_h = four_dimensional ? p.stride(1) : p.stride(0);
+    const int64_t p_stride_n = four_dimensional ? p.stride(2) : p.stride(1);
+    const int64_t p_stride_w = four_dimensional ? p.stride(3) : p.stride(2);
+    const int64_t y_stride_b = four_dimensional ? y.stride(0) : heads * y.stride(0);
+    const int64_t y_stride_h = four_dimensional ? y.stride(1) : y.stride(0);
+    const int64_t y_stride_n = four_dimensional ? y.stride(2) : y.stride(1);
+    const int64_t y_stride_w = four_dimensional ? y.stride(3) : y.stride(2);
+    const bool radial_four_dimensional = radial_u.dim() == 4;
+    const int64_t radial_stride_b = radial_u.numel() == 0 ? 0 : (
+        radial_four_dimensional ? radial_u.stride(0) : heads * radial_u.stride(0));
+    const int64_t radial_stride_h = radial_u.numel() == 0 ? 0 : (
+        radial_four_dimensional ? radial_u.stride(1) : radial_u.stride(0));
+    const int64_t radial_stride_n = radial_u.numel() == 0 ? 0 : (
+        radial_four_dimensional ? radial_u.stride(2) : radial_u.stride(1));
+    const int64_t radial_stride_r = radial_u.numel() == 0 ? 0 : (
+        radial_four_dimensional ? radial_u.stride(3) : radial_u.stride(2));
+    const int rank_tiles = static_cast<int>((ytu.size(2) + tile - 1) / tile);
+    const dim3 grid(
+        static_cast<unsigned int>(systems),
+        static_cast<unsigned int>((sequence + tile - 1) / tile));
+    const int threads = 32 * rank_tiles;
+    const size_t smem_bytes =
+        sizeof(mma_t) * 2 * tile * tile +
+        sizeof(float) * rank_tiles * tile * tile;
+    dual_grad_u_tensorcore_kernel<mma_t>
+        <<<grid, threads, smem_bytes, stream>>>(
+            reinterpret_cast<const mma_t*>(p.const_data_ptr()),
+            reinterpret_cast<const mma_t*>(y.const_data_ptr()),
+            reinterpret_cast<const mma_t*>(ytu.const_data_ptr()),
+            reinterpret_cast<const mma_t*>(ptu.const_data_ptr()),
+            coefficient.const_data_ptr<float>(),
+            radial_u.numel() == 0
+                ? nullptr
+                : reinterpret_cast<const mma_t*>(radial_u.const_data_ptr()),
+            radial_coefficient.numel() == 0
+                ? nullptr
+                : radial_coefficient.const_data_ptr<float>(),
+            valid_mask.numel() == 0 ? nullptr : valid_mask.const_data_ptr<bool>(),
+            reinterpret_cast<mma_t*>(grad_u.mutable_data_ptr()),
+            systems, sequence, width, ytu.size(2), heads,
+            p_stride_b, p_stride_h, p_stride_n, p_stride_w,
+            y_stride_b, y_stride_h, y_stride_n, y_stride_w,
+            radial_stride_b, radial_stride_h, radial_stride_n, radial_stride_r);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+at::Tensor dual_grad_u_tensorcore_cuda(
+    const at::Tensor& p,
+    const at::Tensor& y,
+    const at::Tensor& ytu,
+    const at::Tensor& ptu,
+    const at::Tensor& coefficient,
+    const at::Tensor& radial_u,
+    const at::Tensor& radial_coefficient,
+    const at::Tensor& valid_mask,
+    int64_t heads) {
+    TORCH_CHECK(
+        p.is_cuda() && y.is_cuda() && ytu.is_cuda() && ptu.is_cuda() && coefficient.is_cuda(),
+        "dual grad-U tensors must be CUDA tensors");
+    TORCH_CHECK(
+        p.scalar_type() == y.scalar_type() && p.scalar_type() == ytu.scalar_type() &&
+        p.scalar_type() == ptu.scalar_type() &&
+        (p.scalar_type() == at::kHalf || p.scalar_type() == at::kBFloat16),
+        "dual grad-U requires matching FP16/BF16 inputs");
+    TORCH_CHECK(
+        coefficient.scalar_type() == at::kFloat && coefficient.dim() == 1,
+        "dual grad-U coefficient must be float32 [systems]");
+    TORCH_CHECK(heads > 0, "heads must be positive");
+    const bool four_dimensional = p.dim() == 4;
+    TORCH_CHECK(
+        (p.dim() == 3 || four_dimensional) && p.sizes() == y.sizes() &&
+        ytu.dim() == 3 && ytu.sizes() == ptu.sizes(),
+        "dual grad-U expects 3-D system-major or 4-D [B,H,N,width] P/Y");
+    TORCH_CHECK(
+        four_dimensional ? p.size(1) == heads : p.size(0) % heads == 0,
+        "heads must match or divide the system dimensions");
+    const int64_t systems = four_dimensional ? p.size(0) * p.size(1) : p.size(0);
+    const int64_t sequence = four_dimensional ? p.size(2) : p.size(1);
+    const int64_t width = four_dimensional ? p.size(3) : p.size(2);
+    const int64_t batches = systems / heads;
+    TORCH_CHECK(
+        systems == ytu.size(0) && width == ytu.size(1) &&
+        coefficient.size(0) == systems,
+        "dual grad-U dimensions differ");
+    const bool add_radial = radial_u.numel() != 0;
+    TORCH_CHECK(
+        add_radial == (radial_coefficient.numel() != 0),
+        "radial_u and radial_coefficient must both be empty or both be present");
+    if (add_radial) {
+        TORCH_CHECK(
+            radial_u.is_cuda() && radial_u.scalar_type() == p.scalar_type() &&
+            radial_u.dim() == p.dim() &&
+            (four_dimensional
+                ? (radial_u.size(0) == p.size(0) &&
+                   radial_u.size(1) == p.size(1) &&
+                   radial_u.size(2) == sequence && radial_u.size(3) == ytu.size(2))
+                : (radial_u.size(0) == systems &&
+                   radial_u.size(1) == sequence && radial_u.size(2) == ytu.size(2))),
+            "radial_u logical dimensions differ");
+        TORCH_CHECK(
+            radial_coefficient.is_cuda() &&
+            radial_coefficient.scalar_type() == at::kFloat &&
+            radial_coefficient.dim() == 1 &&
+            radial_coefficient.size(0) == systems &&
+            radial_coefficient.is_contiguous(),
+            "radial_coefficient must be contiguous float32 [systems]");
+    }
+    TORCH_CHECK(
+        width % 16 == 0 &&
+        (ytu.size(2) == 16 || ytu.size(2) == 32 ||
+         ytu.size(2) == 48 || ytu.size(2) == 64),
+        "dual grad-U requires width multiple of 16 and rank 16/32/48/64");
+    TORCH_CHECK(
+        valid_mask.numel() == 0 ||
+            (valid_mask.is_cuda() && valid_mask.scalar_type() == at::kBool &&
+             valid_mask.is_contiguous() && valid_mask.dim() == 2 &&
+              valid_mask.size(0) == batches &&
+              valid_mask.size(1) == sequence),
+        "valid_mask must be empty or contiguous bool [B,N]");
+    TORCH_CHECK(
+        ytu.is_contiguous() && ptu.is_contiguous() && coefficient.is_contiguous(),
+        "dual grad-U compact inputs and coefficients must be contiguous");
+    const c10::cuda::CUDAGuard device_guard(p.device());
+    auto grad_u = four_dimensional
+        ? at::empty({p.size(0), p.size(1), sequence, ytu.size(2)}, p.options())
+        : at::empty({systems, sequence, ytu.size(2)}, p.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(p.get_device()).stream();
+    if (p.scalar_type() == at::kBFloat16) {
+        launch_dual_grad_u_tensorcore<__nv_bfloat16>(
+            p, y, ytu, ptu, coefficient, radial_u, radial_coefficient,
+            valid_mask, heads, grad_u, stream);
+    } else {
+        launch_dual_grad_u_tensorcore<half>(
+            p, y, ytu, ptu, coefficient, radial_u, radial_coefficient,
+            valid_mask, heads, grad_u, stream);
+    }
+    return grad_u;
 }
 
 template <int Rank, int RhsTile, int Arch, int BatchesPerBlock>
@@ -1143,7 +1150,7 @@ __global__ void solve_spd_kernel(
     }
 }
 
-template <int Rank, int Arch, int BatchesPerBlock>
+template <int Rank, int Arch>
 void launch_solve_typed(
     const at::Tensor& gram,
     const at::Tensor& rhs,
@@ -1151,28 +1158,26 @@ void launch_solve_typed(
     at::Tensor& info,
     cudaStream_t stream) {
     constexpr int rhs_tile = 32;
-    using Traits = SolverTraits<Rank, rhs_tile, Arch, BatchesPerBlock>;
+    using Traits = SolverTraits<Rank, rhs_tile, Arch, 1>;
     using Potrf = typename Traits::Potrf;
     using Potrs = typename Traits::Potrs;
 
     constexpr size_t manual_smem =
-        sizeof(float) * BatchesPerBlock *
-        (Rank * Potrf::lda + Rank * Potrs::ldb);
+        sizeof(float) * (Rank * Potrf::lda + Rank * Potrs::ldb);
     constexpr size_t solver_smem =
         Potrf::shared_memory_size > Potrs::shared_memory_size
             ? Potrf::shared_memory_size
             : Potrs::shared_memory_size;
     constexpr size_t smem_bytes = manual_smem > solver_smem ? manual_smem : solver_smem;
 
-    auto kernel = solve_spd_kernel<Rank, rhs_tile, Arch, BatchesPerBlock>;
+    auto kernel = solve_spd_kernel<Rank, rhs_tile, Arch, 1>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(smem_bytes)));
 
     const auto batches = gram.size(0);
-    const int64_t blocks = batches / BatchesPerBlock;
-    kernel<<<static_cast<unsigned int>(blocks), 256 * BatchesPerBlock,
+    kernel<<<static_cast<unsigned int>(batches), 256,
              smem_bytes, stream>>>(
         gram.const_data_ptr<float>(),
         rhs.const_data_ptr<float>(),
@@ -1190,41 +1195,8 @@ void launch_solve(
     const at::Tensor& rhs,
     at::Tensor& solution,
     at::Tensor& info,
-    cudaStream_t stream,
-    int requested_batches_per_block = 0) {
-    const int64_t batches = gram.size(0);
-    if constexpr (Rank >= 48) {
-        // A 48/64-square factor plus one rank-by-32 RHS tile already provides enough
-        // work and shared-memory pressure for a CTA. Avoid instantiating or
-        // launching BPB=2/4 variants, especially on 100-KiB SM86/89/120.
-        TORCH_CHECK(
-            requested_batches_per_block == 0 || requested_batches_per_block == 1,
-            "rank-48/64 MathDx solve supports batches_per_block=1 only");
-        launch_solve_typed<Rank, Arch, 1>(
-            gram, rhs, solution, info, stream);
-    } else {
-        // BPB=2/4 is architecture and shape dependent. Auto remains the safe
-        // one-system-per-CTA policy; an offline benchmark can install an
-        // architecture-specific choice through LSSO_MATHDX_BATCHES_PER_BLOCK.
-        if (requested_batches_per_block == 0) {
-            if (const char* mode = std::getenv("LSSO_MATHDX_BATCHES_PER_BLOCK")) {
-                const int configured = std::atoi(mode);
-                if (configured == 1 || configured == 2 || configured == 4) {
-                    requested_batches_per_block = configured;
-                }
-            }
-        }
-        if (requested_batches_per_block == 4 && batches % 4 == 0) {
-            launch_solve_typed<Rank, Arch, 4>(
-                gram, rhs, solution, info, stream);
-        } else if (requested_batches_per_block == 2 && batches % 2 == 0) {
-            launch_solve_typed<Rank, Arch, 2>(
-                gram, rhs, solution, info, stream);
-        } else {
-            launch_solve_typed<Rank, Arch, 1>(
-                gram, rhs, solution, info, stream);
-        }
-    }
+    cudaStream_t stream) {
+    launch_solve_typed<Rank, Arch>(gram, rhs, solution, info, stream);
 }
 
 template <int Arch>
@@ -1233,270 +1205,24 @@ void dispatch_rank(
     const at::Tensor& rhs,
     at::Tensor& solution,
     at::Tensor& info,
-    cudaStream_t stream,
-    int requested_batches_per_block = 0) {
+    cudaStream_t stream) {
     if (gram.size(1) <= 16) {
-        launch_solve<16, Arch>(gram, rhs, solution, info, stream,
-                               requested_batches_per_block);
+        launch_solve<16, Arch>(gram, rhs, solution, info, stream);
     } else if (gram.size(1) <= 32) {
-        launch_solve<32, Arch>(gram, rhs, solution, info, stream,
-                               requested_batches_per_block);
+        launch_solve<32, Arch>(gram, rhs, solution, info, stream);
     } else if (gram.size(1) <= 48) {
-        launch_solve<48, Arch>(gram, rhs, solution, info, stream,
-                               requested_batches_per_block);
+        launch_solve<48, Arch>(gram, rhs, solution, info, stream);
     } else if (gram.size(1) <= 64) {
-        launch_solve<64, Arch>(gram, rhs, solution, info, stream,
-                               requested_batches_per_block);
+        launch_solve<64, Arch>(gram, rhs, solution, info, stream);
     } else {
         TORCH_CHECK(false, "MathDx backend supports bucketed ranks 1 through 64, got ",
                     gram.size(1));
     }
 }
 
-CUtensorMap encode_tma_3d_map(const at::Tensor& tensor, uint32_t tile_columns) {
-    static PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
-        cudaDriverEntryPointQueryResult status;
-        void* address = nullptr;
-        C10_CUDA_CHECK(cudaGetDriverEntryPointByVersion(
-            "cuTensorMapEncodeTiled", &address, 12000,
-            cudaEnableDefault, &status));
-        TORCH_CHECK(status == cudaDriverEntryPointSuccess && address != nullptr,
-                    "cuTensorMapEncodeTiled is unavailable in the CUDA driver");
-        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(address);
-    }();
-
-    CUtensorMap map{};
-    const uint64_t dimensions[3] = {
-        static_cast<uint64_t>(tensor.size(2)),
-        static_cast<uint64_t>(tensor.size(1)),
-        static_cast<uint64_t>(tensor.size(0))};
-    const uint64_t strides[2] = {
-        static_cast<uint64_t>(tensor.size(2) * tensor.element_size()),
-        static_cast<uint64_t>(tensor.size(1) * tensor.size(2) * tensor.element_size())};
-    const uint32_t box[3] = {tile_columns, 32u, 1u};
-    const uint32_t element_strides[3] = {1u, 1u, 1u};
-    const auto data_type = tensor.scalar_type() == at::kBFloat16
-        ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
-        : CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
-    const CUresult result = encode(
-        &map, data_type, 3,
-        const_cast<void*>(tensor.const_data_ptr()),
-        dimensions, strides, box, element_strides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_NONE,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(result == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed with code ", result);
-    return map;
-}
-
-template <typename scalar_t, int Rank, int Arch, bool FuseReadout, bool UseTma>
-void launch_stats_solve_typed(
-    const at::Tensor& u,
-    const at::Tensor& c,
-    const at::Tensor& alpha,
-    const at::Tensor& inv_mu,
-    at::Tensor& solution,
-    at::Tensor& output,
-    at::Tensor& info,
-    cudaStream_t stream) {
-    constexpr int rhs_tile = 32;
-    constexpr int k_tile = 32;
-    using Gram = typename GemmTraits<Rank, Rank, k_tile, Arch>::Type;
-    using Cross = typename GemmTraits<Rank, rhs_tile, k_tile, Arch>::Type;
-    using Readout = typename GemmTraits<k_tile, rhs_tile, Rank, Arch>::Type;
-    using Solver = SolverTraits<Rank, rhs_tile, Arch>;
-    using Potrf = typename Solver::Potrf;
-    using Potrs = typename Solver::Potrs;
-    static_assert(cublasdx::cosize(Gram::get_layout_smem_a()) >=
-                  cublasdx::cosize(Readout::get_layout_smem_a()));
-    static_assert(cublasdx::cosize(Cross::get_layout_smem_b()) >=
-                  cublasdx::cosize(Readout::get_layout_smem_b()));
-    constexpr size_t async_staging_bytes =
-        (Arch >= 800 && sizeof(scalar_t) == 2)
-        ? sizeof(scalar_t) * 2 * k_tile * (Rank + rhs_tile)
-        : 0;
-    constexpr size_t smem_bytes = sizeof(float) * (
-        cublasdx::cosize(Gram::get_layout_smem_a()) +
-        cublasdx::cosize(Cross::get_layout_smem_b()) +
-        Rank * Potrf::lda +
-        Rank * Potrs::ldb +
-        (Rank > k_tile ? Rank : k_tile) * rhs_tile) + async_staging_bytes + 127;
-
-    auto kernel = stats_solve_spd_kernel<
-        scalar_t, Rank, rhs_tile, k_tile, Arch, FuseReadout, UseTma>;
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(smem_bytes)));
-    CUtensorMap u_map{};
-    CUtensorMap c_map{};
-    if constexpr (UseTma) {
-        u_map = encode_tma_3d_map(u, Rank);
-        c_map = encode_tma_3d_map(c, rhs_tile);
-    }
-    kernel<<<static_cast<unsigned int>(u.size(0)), 256, smem_bytes, stream>>>(
-        u.const_data_ptr<scalar_t>(),
-        c.const_data_ptr<scalar_t>(),
-        alpha.const_data_ptr<float>(),
-        FuseReadout ? inv_mu.const_data_ptr<float>() : nullptr,
-        FuseReadout ? nullptr : solution.mutable_data_ptr<float>(),
-        FuseReadout ? output.mutable_data_ptr<scalar_t>() : nullptr,
-        u_map,
-        c_map,
-        info.mutable_data_ptr<int>(),
-        u.size(0),
-        u.size(1),
-        c.size(2));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-template <int Arch, bool FuseReadout>
-void dispatch_stats_solve_rank(
-    const at::Tensor& u,
-    const at::Tensor& c,
-    const at::Tensor& alpha,
-    const at::Tensor& inv_mu,
-    at::Tensor& solution,
-    at::Tensor& output,
-    at::Tensor& info,
-    cudaStream_t stream) {
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16, u.scalar_type(),
-        "stats_solve_spd_cuda", [&] {
-            // Hopper and datacenter Blackwell benefit from descriptor-driven
-            // TMA transfers. On the development SM120, the smaller cp.async
-            // staging path is 2--3% faster for RRLSSO tiles, so auto keeps it.
-            // The environment override supports architecture-specific A/B.
-            bool tma_enabled = Arch >= 900 && Arch < 1200;
-            if (const char* mode = std::getenv("LSSO_MATHDX_TMA")) {
-                if (mode[0] == '1' || mode[0] == 'y' || mode[0] == 'Y') {
-                    tma_enabled = true;
-                } else if (mode[0] == '0' || mode[0] == 'n' || mode[0] == 'N') {
-                    tma_enabled = false;
-                }
-            }
-            const bool use_tma = tma_enabled && Arch >= 900 &&
-                sizeof(scalar_t) == 2 &&
-                c.size(2) >= 32 && c.size(2) % 32 == 0;
-            if (u.size(2) == 16) {
-                if (use_tma) {
-                    launch_stats_solve_typed<scalar_t, 16, Arch, FuseReadout, true>(
-                        u, c, alpha, inv_mu, solution, output, info, stream);
-                } else {
-                    launch_stats_solve_typed<scalar_t, 16, Arch, FuseReadout, false>(
-                        u, c, alpha, inv_mu, solution, output, info, stream);
-                }
-            } else if (u.size(2) == 32) {
-                if (use_tma) {
-                    launch_stats_solve_typed<scalar_t, 32, Arch, FuseReadout, true>(
-                        u, c, alpha, inv_mu, solution, output, info, stream);
-                } else {
-                    launch_stats_solve_typed<scalar_t, 32, Arch, FuseReadout, false>(
-                        u, c, alpha, inv_mu, solution, output, info, stream);
-                }
-            } else {
-                TORCH_CHECK(false, "MathDx backend supports rank 16 or 32, got ", u.size(2));
-            }
-        });
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor> lsso_backward_fused_cuda(
-    const at::Tensor& u,
-    const at::Tensor& y,
-    const at::Tensor& p,
-    const at::Tensor& gamma,
-    const at::Tensor& valid_mask,
-    const at::Tensor& length_scale) {
-    TORCH_CHECK(u.is_cuda() && y.is_cuda() && p.is_cuda() && gamma.is_cuda(),
-                "u, y, p, and gamma must be CUDA tensors");
-    TORCH_CHECK(u.scalar_type() == y.scalar_type() && u.scalar_type() == p.scalar_type(),
-                "u, y, and p must have the same dtype");
-    TORCH_CHECK(u.dim() == 4 && y.dim() == 4 && p.dim() == 4,
-                "u, y, and p must be rank-4 tensors");
-    TORCH_CHECK(u.sizes().slice(0, 3) == y.sizes().slice(0, 3) && y.sizes() == p.sizes(),
-                "u/y/p leading dimensions differ");
-    TORCH_CHECK(u.size(3) == 16 || u.size(3) == 32,
-                "fused backward supports rank 16 or 32");
-    TORCH_CHECK(y.size(3) > 0 && y.size(3) <= 64,
-                "fused backward supports width in [1, 64]");
-    TORCH_CHECK(gamma.scalar_type() == at::kFloat && gamma.dim() == 1 &&
-                gamma.size(0) == u.size(0) * u.size(1),
-                "gamma must be float32 with shape [B * H]");
-    TORCH_CHECK(u.is_contiguous() && y.is_contiguous() && p.is_contiguous() &&
-                gamma.is_contiguous(), "fused backward inputs must be contiguous");
-    const bool masked = valid_mask.numel() != 0;
-    if (masked) {
-        TORCH_CHECK(valid_mask.is_cuda() && valid_mask.scalar_type() == at::kBool &&
-                    valid_mask.is_contiguous() && valid_mask.dim() == 2 &&
-                    valid_mask.size(0) == u.size(0) && valid_mask.size(1) == u.size(2),
-                    "valid_mask must be contiguous bool [B, N]");
-        TORCH_CHECK(length_scale.is_cuda() && length_scale.scalar_type() == at::kFloat &&
-                    length_scale.is_contiguous() && length_scale.dim() == 1 &&
-                    length_scale.size(0) == u.size(0),
-                    "length_scale must be contiguous float32 [B]");
-    }
-    const c10::cuda::CUDAGuard device_guard(u.device());
-    auto grad_u = at::empty_like(u);
-    const int64_t systems = u.size(0) * u.size(1);
-    auto grad_mu = at::empty({systems}, u.options().dtype(at::kFloat));
-    auto grad_gamma = at::empty({systems}, u.options().dtype(at::kFloat));
-    const size_t smem_bytes = sizeof(float) *
-        (2 * u.size(3) * y.size(3) + 256);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(u.get_device()).stream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16, u.scalar_type(),
-        "lsso_backward_fused_cuda", [&] {
-            auto launch16_masked = [&] {
-                lsso_backward_fused_kernel<scalar_t, 16, true>
-                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
-                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
-                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
-                        valid_mask.const_data_ptr<bool>(), length_scale.const_data_ptr<float>(),
-                        grad_u.mutable_data_ptr<scalar_t>(), grad_mu.mutable_data_ptr<float>(),
-                        grad_gamma.mutable_data_ptr<float>(), systems, u.size(1), u.size(2), y.size(3));
-            };
-            auto launch16 = [&] {
-                lsso_backward_fused_kernel<scalar_t, 16, false>
-                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
-                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
-                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
-                        nullptr, nullptr, grad_u.mutable_data_ptr<scalar_t>(),
-                        grad_mu.mutable_data_ptr<float>(), grad_gamma.mutable_data_ptr<float>(),
-                        systems, u.size(1), u.size(2), y.size(3));
-            };
-            auto launch32_masked = [&] {
-                lsso_backward_fused_kernel<scalar_t, 32, true>
-                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
-                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
-                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
-                        valid_mask.const_data_ptr<bool>(), length_scale.const_data_ptr<float>(),
-                        grad_u.mutable_data_ptr<scalar_t>(), grad_mu.mutable_data_ptr<float>(),
-                        grad_gamma.mutable_data_ptr<float>(), systems, u.size(1), u.size(2), y.size(3));
-            };
-            auto launch32 = [&] {
-                lsso_backward_fused_kernel<scalar_t, 32, false>
-                    <<<static_cast<unsigned int>(systems), 256, smem_bytes, stream>>>(
-                        u.const_data_ptr<scalar_t>(), y.const_data_ptr<scalar_t>(),
-                        p.const_data_ptr<scalar_t>(), gamma.const_data_ptr<float>(),
-                        nullptr, nullptr, grad_u.mutable_data_ptr<scalar_t>(),
-                        grad_mu.mutable_data_ptr<float>(), grad_gamma.mutable_data_ptr<float>(),
-                        systems, u.size(1), u.size(2), y.size(3));
-            };
-            if (u.size(3) == 16) {
-                if (masked) launch16_masked(); else launch16();
-            } else {
-                if (masked) launch32_masked(); else launch32();
-            }
-        });
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {grad_u, grad_mu, grad_gamma};
-}
-
 std::tuple<at::Tensor, at::Tensor> solve_spd_impl(
     const at::Tensor& gram,
-    const at::Tensor& rhs,
-    int requested_batches_per_block) {
+    const at::Tensor& rhs) {
     TORCH_CHECK(gram.is_cuda() && rhs.is_cuda(), "gram and rhs must be CUDA tensors");
     TORCH_CHECK(gram.scalar_type() == at::kFloat, "gram must be float32");
     TORCH_CHECK(rhs.scalar_type() == at::kFloat, "rhs must be float32");
@@ -1510,11 +1236,6 @@ std::tuple<at::Tensor, at::Tensor> solve_spd_impl(
         gram.size(0) > 0 && gram.size(1) > 0 && rhs.size(2) > 0,
         "empty batches/ranks/RHS are unsupported");
     TORCH_CHECK(gram.get_device() == rhs.get_device(), "gram and rhs must be on the same GPU");
-    TORCH_CHECK(
-        requested_batches_per_block == 0 || requested_batches_per_block == 1 ||
-        requested_batches_per_block == 2 || requested_batches_per_block == 4,
-        "batches_per_block must be one of 0(auto), 1, 2, or 4");
-
     const c10::cuda::CUDAGuard device_guard(gram.device());
     auto solution = at::empty_like(rhs);
     auto info = at::zeros(
@@ -1526,239 +1247,188 @@ std::tuple<at::Tensor, at::Tensor> solve_spd_impl(
 
     // MathDx descriptors are architecture-specific. Minor revisions without a
     // dedicated descriptor use the closest compatible family descriptor.
+#ifdef LSSO_MATHDX_NATIVE_ARCH
+    dispatch_rank<LSSO_MATHDX_NATIVE_ARCH>(
+        gram, rhs, solution, info, stream);
+#else
     if (cc >= 121) {
-        dispatch_rank<1210>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<1210>(gram, rhs, solution, info, stream);
     } else if (cc >= 120) {
-        dispatch_rank<1200>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<1200>(gram, rhs, solution, info, stream);
     } else if (cc >= 110) {
-        dispatch_rank<kThorMathDxArch>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<kThorMathDxArch>(gram, rhs, solution, info, stream);
     } else if (cc >= 103) {
-        dispatch_rank<1030>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<1030>(gram, rhs, solution, info, stream);
     } else if (cc >= 100) {
-        dispatch_rank<1000>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<1000>(gram, rhs, solution, info, stream);
     } else if (cc >= 90) {
-        dispatch_rank<900>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<900>(gram, rhs, solution, info, stream);
     } else if (cc >= 89) {
-        dispatch_rank<890>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<890>(gram, rhs, solution, info, stream);
     } else if (cc >= 87) {
-        dispatch_rank<870>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<870>(gram, rhs, solution, info, stream);
     } else if (cc >= 86) {
-        dispatch_rank<860>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<860>(gram, rhs, solution, info, stream);
     } else if (cc >= 80) {
-        dispatch_rank<800>(gram, rhs, solution, info, stream, requested_batches_per_block);
+        dispatch_rank<800>(gram, rhs, solution, info, stream);
     } else {
         TORCH_CHECK(false, "MathDx backend requires an Ampere-or-newer GPU, got compute capability ",
                     props->major, ".", props->minor);
     }
+#endif
     return {solution, info};
 }
 
 std::tuple<at::Tensor, at::Tensor> solve_spd_cuda(
     const at::Tensor& gram, const at::Tensor& rhs) {
-    return solve_spd_impl(gram, rhs, 0);
+    return solve_spd_impl(gram, rhs);
 }
 
-std::tuple<at::Tensor, at::Tensor> solve_spd_bpb_cuda(
-    const at::Tensor& gram, const at::Tensor& rhs,
-    int64_t batches_per_block) {
-    return solve_spd_impl(gram, rhs, static_cast<int>(batches_per_block));
-}
-
-template <bool FuseReadout>
-std::tuple<at::Tensor, at::Tensor> stats_solve_spd_impl(
-    const at::Tensor& u,
-    const at::Tensor& c,
-    const at::Tensor& alpha,
-    const at::Tensor& inv_mu) {
-    TORCH_CHECK(u.is_cuda() && c.is_cuda() && alpha.is_cuda(), "u, c, and alpha must be CUDA tensors");
-    TORCH_CHECK(
-        u.scalar_type() == c.scalar_type() &&
-        (u.scalar_type() == at::kFloat || u.scalar_type() == at::kHalf ||
-         u.scalar_type() == at::kBFloat16),
-        "u and c must have the same float32, float16, or bfloat16 dtype");
-    TORCH_CHECK(alpha.scalar_type() == at::kFloat, "alpha must be float32");
-    TORCH_CHECK(u.is_contiguous() && c.is_contiguous() && alpha.is_contiguous(),
-                "u, c, and alpha must be contiguous");
-    TORCH_CHECK(u.dim() == 3, "u must have shape [batch, sequence, rank]");
-    TORCH_CHECK(c.dim() == 3, "c must have shape [batch, sequence, rhs_width]");
-    TORCH_CHECK(alpha.dim() == 1, "alpha must have shape [batch]");
-    TORCH_CHECK(u.size(0) == c.size(0) && u.size(0) == alpha.size(0), "batch dimensions differ");
-    TORCH_CHECK(u.size(1) == c.size(1), "sequence dimensions differ");
-    TORCH_CHECK(u.size(0) > 0 && u.size(1) > 0 && c.size(2) > 0, "empty dimensions are unsupported");
-    TORCH_CHECK(u.get_device() == c.get_device() && u.get_device() == alpha.get_device(),
-                "u, c, and alpha must be on the same GPU");
-    if constexpr (FuseReadout) {
-        TORCH_CHECK(inv_mu.is_cuda() && inv_mu.scalar_type() == at::kFloat &&
-                    inv_mu.is_contiguous() && inv_mu.dim() == 1 &&
-                    inv_mu.size(0) == u.size(0),
-                    "inv_mu must be contiguous float32 with shape [batch]");
-        TORCH_CHECK(inv_mu.get_device() == u.get_device(), "inv_mu must be on the same GPU");
-    }
-
-    const c10::cuda::CUDAGuard device_guard(u.device());
-    auto solution = FuseReadout
-        ? at::empty({0}, u.options().dtype(at::kFloat))
-        : at::empty({u.size(0), u.size(2), c.size(2)}, u.options().dtype(at::kFloat));
-    auto output = FuseReadout ? at::empty_like(c) : at::empty({0}, u.options());
-    auto info = at::zeros({u.size(0)}, u.options().dtype(at::kInt));
-    const auto* props = at::cuda::getCurrentDeviceProperties();
-    const int cc = props->major * 10 + props->minor;
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(u.get_device()).stream();
-
-#define DISPATCH_STATS(ARCH) \
-    dispatch_stats_solve_rank<ARCH, FuseReadout>( \
-        u, c, alpha, inv_mu, solution, output, info, stream)
-    if (cc >= 121) {
-        DISPATCH_STATS(1210);
-    } else if (cc >= 120) {
-        DISPATCH_STATS(1200);
-    } else if (cc >= 110) {
-        DISPATCH_STATS(kThorMathDxArch);
-    } else if (cc >= 103) {
-        DISPATCH_STATS(1030);
-    } else if (cc >= 100) {
-        DISPATCH_STATS(1000);
-    } else if (cc >= 90) {
-        DISPATCH_STATS(900);
-    } else if (cc >= 89) {
-        DISPATCH_STATS(890);
-    } else if (cc >= 87) {
-        DISPATCH_STATS(870);
-    } else if (cc >= 86) {
-        DISPATCH_STATS(860);
-    } else if (cc >= 80) {
-        DISPATCH_STATS(800);
-    } else {
-        TORCH_CHECK(false, "MathDx backend requires an Ampere-or-newer GPU, got compute capability ",
-                    props->major, ".", props->minor);
-    }
-#undef DISPATCH_STATS
-    return {FuseReadout ? output : solution, info};
-}
-
-std::tuple<at::Tensor, at::Tensor> stats_solve_spd_cuda(
-    const at::Tensor& u, const at::Tensor& c, const at::Tensor& alpha) {
-    auto empty = at::empty({0}, alpha.options());
-    return stats_solve_spd_impl<false>(u, c, alpha, empty);
-}
-
-std::tuple<at::Tensor, at::Tensor> stats_solve_readout_cuda(
-    const at::Tensor& u, const at::Tensor& c, const at::Tensor& alpha,
-    const at::Tensor& inv_mu) {
-    return stats_solve_spd_impl<true>(u, c, alpha, inv_mu);
-}
-
-template <bool FuseReadout>
-std::tuple<at::Tensor, at::Tensor> masked_stats_solve_impl(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+masked_readout_impl(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
     const at::Tensor& length_scale,
     const at::Tensor& alpha,
-    const at::Tensor& inv_mu) {
+    const at::Tensor& gain,
+    bool trace_normalize,
+    double normalization_eps,
+    double length_reference,
+    bool length_normalize) {
+    const bool unmasked_direct =
+        valid_mask.numel() == 0 && length_scale.numel() == 0;
     TORCH_CHECK(
         u.is_cuda() && c.is_cuda() && valid_mask.is_cuda() &&
-        length_scale.is_cuda() && alpha.is_cuda(),
-        "all masked stats inputs must be CUDA tensors");
+        length_scale.is_cuda() && alpha.is_cuda() && gain.is_cuda(),
+        "all readout inputs must be CUDA tensors");
     TORCH_CHECK(
         u.scalar_type() == c.scalar_type() &&
-        (u.scalar_type() == at::kFloat || u.scalar_type() == at::kHalf ||
-         u.scalar_type() == at::kBFloat16 || u.scalar_type() == at::kDouble),
-        "u and c must have the same floating dtype");
+        (u.scalar_type() == at::kHalf || u.scalar_type() == at::kBFloat16),
+        "u and c must have the same float16 or bfloat16 dtype");
     TORCH_CHECK(valid_mask.scalar_type() == at::kBool, "valid_mask must be bool");
     TORCH_CHECK(length_scale.scalar_type() == at::kFloat, "length_scale must be float32");
     TORCH_CHECK(alpha.scalar_type() == at::kFloat, "alpha must be float32");
-    if constexpr (FuseReadout) {
-        TORCH_CHECK(inv_mu.is_cuda() && inv_mu.scalar_type() == at::kFloat &&
-                    inv_mu.is_contiguous() && inv_mu.dim() == 1 &&
-                    inv_mu.size(0) == u.size(0) * u.size(1),
-                    "inv_mu must be contiguous float32 with shape [B * H]");
-        TORCH_CHECK(inv_mu.get_device() == u.get_device(),
-                    "inv_mu must be on the same GPU");
-    }
     TORCH_CHECK(
-        u.is_contiguous() && c.is_contiguous() && valid_mask.is_contiguous() &&
+        gain.scalar_type() == at::kFloat && gain.is_contiguous() &&
+        gain.dim() == 1 && gain.size(0) == u.size(0) * u.size(1),
+        "gain must be contiguous float32 with shape [B * H]");
+    TORCH_CHECK(
+        u.is_contiguous() && valid_mask.is_contiguous() &&
         length_scale.is_contiguous() && alpha.is_contiguous(),
-        "all masked stats inputs must be contiguous");
+        "U, masks, scales, and coefficients must be contiguous");
     TORCH_CHECK(u.dim() == 4, "u must have shape [B, H, N, r]");
     TORCH_CHECK(c.dim() == 4, "c must have shape [B, H, N, rhs_width]");
-    TORCH_CHECK(valid_mask.dim() == 2, "valid_mask must have shape [B, N]");
-    TORCH_CHECK(length_scale.dim() == 1, "length_scale must have shape [B]");
-    TORCH_CHECK(alpha.dim() == 1, "alpha must have shape [B * H]");
-    TORCH_CHECK(u.sizes().slice(0, 3) == c.sizes().slice(0, 3), "u/c leading dimensions differ");
-    TORCH_CHECK(valid_mask.size(0) == u.size(0) && valid_mask.size(1) == u.size(2),
-                "valid_mask shape does not match u");
-    TORCH_CHECK(length_scale.size(0) == u.size(0), "length_scale batch differs");
-    TORCH_CHECK(alpha.size(0) == u.size(0) * u.size(1), "alpha must contain B * H values");
-    TORCH_CHECK(u.size(0) > 0 && u.size(1) > 0 && u.size(2) > 0 && c.size(3) > 0,
-                "empty dimensions are unsupported");
     TORCH_CHECK(
-        u.get_device() == c.get_device() && u.get_device() == valid_mask.get_device() &&
-        u.get_device() == length_scale.get_device() && u.get_device() == alpha.get_device(),
-        "all masked stats inputs must be on the same GPU");
+        unmasked_direct || valid_mask.dim() == 2,
+        "valid_mask must be empty or have shape [B, N]");
+    TORCH_CHECK(
+        unmasked_direct || length_scale.dim() == 1,
+        "length_scale must be empty or have shape [B]");
+    TORCH_CHECK(alpha.dim() == 1, "alpha must have shape [B * H]");
+    TORCH_CHECK(u.sizes().slice(0, 3) == c.sizes().slice(0, 3),
+                "u/c leading dimensions differ");
+    TORCH_CHECK(
+        unmasked_direct ||
+            (valid_mask.size(0) == u.size(0) && valid_mask.size(1) == u.size(2)),
+        "valid_mask shape does not match u");
+    TORCH_CHECK(
+        unmasked_direct || length_scale.size(0) == u.size(0),
+        "length_scale batch differs");
+    TORCH_CHECK(
+        alpha.size(0) == u.size(0) * u.size(1),
+        "alpha must contain B * H values");
+    TORCH_CHECK(
+        u.size(0) > 0 && u.size(1) > 0 && u.size(2) > 0 && c.size(3) > 0,
+        "empty dimensions are unsupported");
+    TORCH_CHECK(
+        u.get_device() == c.get_device() &&
+        u.get_device() == valid_mask.get_device() &&
+        u.get_device() == length_scale.get_device() &&
+        u.get_device() == alpha.get_device() &&
+        u.get_device() == gain.get_device(),
+        "all readout inputs must be on the same GPU");
 
     const c10::cuda::CUDAGuard device_guard(u.device());
     const int64_t systems = u.size(0) * u.size(1);
-    auto solution = FuseReadout
-        ? at::empty({0}, u.options().dtype(at::kFloat))
-        : at::empty({systems, u.size(3), c.size(3)}, u.options().dtype(at::kFloat));
-    auto output = FuseReadout ? at::empty_like(c) : at::empty({0}, u.options());
+    // Preserve the logical [B,H,N,W] API while storing the activation in
+    // token-major [B,N,H,W] order. The following module output projection can
+    // consume output.transpose(1,2) without materializing a layout copy.
+    auto output = at::empty(
+        {u.size(0), u.size(2), u.size(1), c.size(3)}, c.options()
+    ).transpose(1, 2);
     auto info = at::zeros({systems}, u.options().dtype(at::kInt));
+    auto trace_options = u.options().dtype(at::kFloat);
+    auto effective_alpha_output = trace_normalize
+        ? at::empty({systems}, trace_options) : at::empty({0}, trace_options);
+    auto denominator_output = trace_normalize
+        ? at::empty({systems}, trace_options) : at::empty({0}, trace_options);
+    auto scale_squared_output = trace_normalize
+        ? at::empty({systems}, trace_options) : at::empty({0}, trace_options);
     const auto* props = at::cuda::getCurrentDeviceProperties();
     const int cc = props->major * 10 + props->minor;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(u.get_device()).stream();
 
-#define DISPATCH_MASKED_STATS(ARCH) \
-    dispatch_masked_stats_solve_rank<ARCH, FuseReadout>( \
-        u, c, valid_mask, length_scale, alpha, inv_mu, \
-        solution, output, info, stream)
-    if (cc >= 121) {
-        DISPATCH_MASKED_STATS(1210);
-    } else if (cc >= 120) {
-        DISPATCH_MASKED_STATS(1200);
-    } else if (cc >= 110) {
-        DISPATCH_MASKED_STATS(kThorMathDxArch);
-    } else if (cc >= 103) {
-        DISPATCH_MASKED_STATS(1030);
-    } else if (cc >= 100) {
-        DISPATCH_MASKED_STATS(1000);
-    } else if (cc >= 90) {
-        DISPATCH_MASKED_STATS(900);
-    } else if (cc >= 89) {
-        DISPATCH_MASKED_STATS(890);
-    } else if (cc >= 87) {
-        DISPATCH_MASKED_STATS(870);
-    } else if (cc >= 86) {
-        DISPATCH_MASKED_STATS(860);
-    } else if (cc >= 80) {
-        DISPATCH_MASKED_STATS(800);
-    } else {
-        TORCH_CHECK(false, "MathDx backend requires an Ampere-or-newer GPU");
-    }
-#undef DISPATCH_MASKED_STATS
-    return {FuseReadout ? output : solution, info};
+#define DISPATCH_MASKED_TRACE(ARCH) \
+    dispatch_masked_trace_solve_rank<ARCH>( \
+        u, c, valid_mask, length_scale, alpha, gain, output, info, \
+        trace_normalize, static_cast<float>(normalization_eps), \
+        static_cast<float>(length_reference), length_normalize, \
+        effective_alpha_output, denominator_output, scale_squared_output, stream)
+#ifdef LSSO_MATHDX_NATIVE_ARCH
+    DISPATCH_MASKED_TRACE(LSSO_MATHDX_NATIVE_ARCH);
+#else
+    if (cc >= 121) DISPATCH_MASKED_TRACE(1210);
+    else if (cc >= 120) DISPATCH_MASKED_TRACE(1200);
+    else if (cc >= 110) DISPATCH_MASKED_TRACE(kThorMathDxArch);
+    else if (cc >= 103) DISPATCH_MASKED_TRACE(1030);
+    else if (cc >= 100) DISPATCH_MASKED_TRACE(1000);
+    else if (cc >= 90) DISPATCH_MASKED_TRACE(900);
+    else if (cc >= 89) DISPATCH_MASKED_TRACE(890);
+    else if (cc >= 87) DISPATCH_MASKED_TRACE(870);
+    else if (cc >= 86) DISPATCH_MASKED_TRACE(860);
+    else if (cc >= 80) DISPATCH_MASKED_TRACE(800);
+    else TORCH_CHECK(false, "MathDx backend requires an Ampere-or-newer GPU");
+#endif
+#undef DISPATCH_MASKED_TRACE
+    return {
+        output, info, effective_alpha_output,
+        denominator_output, scale_squared_output,
+    };
 }
-
-std::tuple<at::Tensor, at::Tensor> masked_stats_solve_spd_cuda(
-    const at::Tensor& u,
-    const at::Tensor& c,
-    const at::Tensor& valid_mask,
-    const at::Tensor& length_scale,
-    const at::Tensor& alpha) {
-    auto empty = at::empty({0}, alpha.options());
-    return masked_stats_solve_impl<false>(
-        u, c, valid_mask, length_scale, alpha, empty);
-}
-
 std::tuple<at::Tensor, at::Tensor> masked_stats_solve_readout_cuda(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
     const at::Tensor& length_scale,
     const at::Tensor& alpha,
-    const at::Tensor& inv_mu) {
-    return masked_stats_solve_impl<true>(
-        u, c, valid_mask, length_scale, alpha, inv_mu);
+    const at::Tensor& gain) {
+    auto result = masked_readout_impl(
+        u, c, valid_mask, length_scale, alpha, gain,
+        false, 0.0, 1.0, false);
+    return {std::get<0>(result), std::get<1>(result)};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+masked_trace_stats_solve_readout_cuda(
+    const at::Tensor& u,
+    const at::Tensor& c,
+    const at::Tensor& valid_mask,
+    const at::Tensor& alpha,
+    const at::Tensor& gain,
+    double normalization_eps,
+    double length_reference,
+    bool length_normalize) {
+    // An empty scale is the explicit unmasked contract: the fused CTA kernel
+    // derives N directly and receives null mask/scale pointers.  Masked calls
+    // retain a per-sample unit scale because their valid lengths are read from
+    // the mask inside the kernel.
+    auto unit_scale = valid_mask.numel() == 0
+        ? at::empty({0}, u.options().dtype(at::kFloat))
+        : at::ones({u.size(0)}, u.options().dtype(at::kFloat));
+    return masked_readout_impl(
+        u, c, valid_mask, unit_scale, alpha, gain,
+        true, normalization_eps, length_reference, length_normalize);
 }
 
 at::Tensor rank_rotary_cuda(
@@ -1768,13 +1438,16 @@ at::Tensor rank_rotary_cuda(
     bool inverse) {
     TORCH_CHECK(input.is_cuda() && cos.is_cuda() && sin.is_cuda(),
                 "input, cos, and sin must be CUDA tensors");
-    TORCH_CHECK(input.is_contiguous() && cos.is_contiguous() && sin.is_contiguous(),
-                "input, cos, and sin must be contiguous");
+    TORCH_CHECK(cos.is_contiguous() && sin.is_contiguous(),
+                "cos and sin must be contiguous");
     TORCH_CHECK(input.dim() == 4, "input must have shape [B, H, N, r]");
     TORCH_CHECK(input.size(3) % 2 == 0, "rank must be even");
     TORCH_CHECK(cos.sizes() == sin.sizes(), "cos and sin shapes must match");
-    TORCH_CHECK(cos.numel() == input.size(2) * input.size(3) / 2,
-                "cos/sin must contain N * (r / 2) factors");
+    const int64_t factors_per_sample = input.size(2) * input.size(3) / 2;
+    TORCH_CHECK(
+        cos.numel() == factors_per_sample ||
+        cos.numel() == input.size(0) * factors_per_sample,
+        "cos/sin must contain N*(r/2) shared factors or B*N*(r/2) factors");
     TORCH_CHECK(input.scalar_type() == cos.scalar_type() &&
                 input.scalar_type() == sin.scalar_type(),
                 "input, cos, and sin dtypes must match");
@@ -1783,9 +1456,10 @@ at::Tensor rank_rotary_cuda(
                 "input, cos, and sin must be on the same GPU");
 
     const c10::cuda::CUDAGuard device_guard(input.device());
-    auto output = at::empty_like(input);
+    // The kernel writes logical [B,H,N,r] order regardless of input strides.
+    auto output = at::empty(input.sizes(), input.options());
     const int64_t pair_count = input.numel() / 2;
-    const int64_t factors_per_head = cos.numel();
+    const int64_t factor_batches = cos.numel() / factors_per_sample;
     constexpr int threads = 256;
     const int blocks = static_cast<int>((pair_count + threads - 1) / threads);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device()).stream();
@@ -1802,7 +1476,9 @@ at::Tensor rank_rotary_cuda(
                     sin.const_data_ptr<scalar_t>(),
                     output.mutable_data_ptr<scalar_t>(),
                     pair_count,
-                    factors_per_head);
+                    input.size(0), input.size(1), input.size(2), input.size(3) / 2,
+                    factor_batches,
+                    input.stride(0), input.stride(1), input.stride(2), input.stride(3));
             } else {
                 rank_rotary_kernel<scalar_t, false><<<blocks, threads, 0, stream>>>(
                     input.const_data_ptr<scalar_t>(),
@@ -1810,140 +1486,32 @@ at::Tensor rank_rotary_cuda(
                     sin.const_data_ptr<scalar_t>(),
                     output.mutable_data_ptr<scalar_t>(),
                     pair_count,
-                    factors_per_head);
+                    input.size(0), input.size(1), input.size(2), input.size(3) / 2,
+                    factor_batches,
+                    input.stride(0), input.stride(1), input.stride(2), input.stride(3));
             }
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
-template <bool Rotary>
-std::tuple<at::Tensor, at::Tensor> prepare_basis_cuda_impl(
-    const at::Tensor& input,
-    const at::Tensor& cos,
-    const at::Tensor& sin,
-    double eps,
-    double length_scale) {
-    TORCH_CHECK(input.is_cuda() && input.is_contiguous(), "input must be contiguous CUDA");
-    TORCH_CHECK(input.dim() == 4, "input must have shape [B, H, N, r]");
-    TORCH_CHECK(input.size(3) > 0 && input.size(3) <= 1024, "unsupported rank");
-    if constexpr (Rotary) {
-        TORCH_CHECK(input.size(3) % 2 == 0, "rotary rank must be even");
-        TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && cos.is_contiguous() && sin.is_contiguous(),
-                    "cos and sin must be contiguous CUDA tensors");
-        TORCH_CHECK(input.scalar_type() == cos.scalar_type() && input.scalar_type() == sin.scalar_type(),
-                    "input and rotary factor dtypes must match");
-        TORCH_CHECK(cos.numel() == input.size(2) * input.size(3) / 2 && cos.sizes() == sin.sizes(),
-                    "invalid rotary factor shape");
-    }
-    const c10::cuda::CUDAGuard device_guard(input.device());
-    auto output = at::empty_like(input);
-    const int64_t tokens = input.numel() / input.size(3);
-    auto inv_rms = at::empty({tokens}, input.options().dtype(at::kFloat));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device()).stream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(),
-        "prepare_basis_cuda", [&] {
-            prepare_basis_kernel<scalar_t, Rotary><<<static_cast<unsigned int>(tokens), 32, 0, stream>>>(
-                input.const_data_ptr<scalar_t>(),
-                Rotary ? cos.const_data_ptr<scalar_t>() : nullptr,
-                Rotary ? sin.const_data_ptr<scalar_t>() : nullptr,
-                output.mutable_data_ptr<scalar_t>(), inv_rms.mutable_data_ptr<float>(),
-                tokens, input.size(2), input.size(3), static_cast<float>(eps),
-                static_cast<float>(length_scale));
-        });
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {output, inv_rms};
-}
-
-template <bool Rotary>
-at::Tensor prepare_basis_backward_cuda_impl(
-    const at::Tensor& grad_output,
-    const at::Tensor& input,
-    const at::Tensor& inv_rms,
-    const at::Tensor& cos,
-    const at::Tensor& sin,
-    double length_scale) {
-    TORCH_CHECK(grad_output.is_cuda() && input.is_cuda() && inv_rms.is_cuda(),
-                "backward tensors must be CUDA");
-    TORCH_CHECK(grad_output.is_contiguous() && input.is_contiguous() && inv_rms.is_contiguous(),
-                "backward tensors must be contiguous");
-    TORCH_CHECK(grad_output.sizes() == input.sizes(), "gradient shape mismatch");
-    const c10::cuda::CUDAGuard device_guard(input.device());
-    auto grad_input = at::empty_like(input);
-    const int64_t tokens = input.numel() / input.size(3);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device()).stream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(),
-        "prepare_basis_backward_cuda", [&] {
-            prepare_basis_backward_kernel<scalar_t, Rotary><<<static_cast<unsigned int>(tokens), 32, 0, stream>>>(
-                grad_output.const_data_ptr<scalar_t>(), input.const_data_ptr<scalar_t>(),
-                inv_rms.const_data_ptr<float>(),
-                Rotary ? cos.const_data_ptr<scalar_t>() : nullptr,
-                Rotary ? sin.const_data_ptr<scalar_t>() : nullptr,
-                grad_input.mutable_data_ptr<scalar_t>(), tokens, input.size(2), input.size(3),
-                static_cast<float>(length_scale));
-        });
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return grad_input;
-}
-
-std::tuple<at::Tensor, at::Tensor> normalize_basis_cuda(
-    const at::Tensor& input, double eps, double length_scale) {
-    auto empty = at::empty({0}, input.options());
-    return prepare_basis_cuda_impl<false>(input, empty, empty, eps, length_scale);
-}
-
-at::Tensor normalize_basis_backward_cuda(
-    const at::Tensor& grad_output, const at::Tensor& input,
-    const at::Tensor& inv_rms, double length_scale) {
-    auto empty = at::empty({0}, input.options());
-    return prepare_basis_backward_cuda_impl<false>(
-        grad_output, input, inv_rms, empty, empty, length_scale);
-}
-
-std::tuple<at::Tensor, at::Tensor> normalize_rank_rotary_cuda(
-    const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin,
-    double eps, double length_scale) {
-    return prepare_basis_cuda_impl<true>(input, cos, sin, eps, length_scale);
-}
-
-at::Tensor normalize_rank_rotary_backward_cuda(
-    const at::Tensor& grad_output, const at::Tensor& input,
-    const at::Tensor& inv_rms, const at::Tensor& cos, const at::Tensor& sin,
-    double length_scale) {
-    return prepare_basis_backward_cuda_impl<true>(
-        grad_output, input, inv_rms, cos, sin, length_scale);
-}
-
 }  // namespace
 
 TORCH_LIBRARY(lsso_mathdx, m) {
+    m.def("backend_abi() -> int", []() -> int64_t { return 1; });
     m.def("solve_spd(Tensor gram, Tensor rhs) -> (Tensor solution, Tensor info)");
-    m.def("solve_spd_bpb(Tensor gram, Tensor rhs, int batches_per_block) -> (Tensor solution, Tensor info)");
-    m.def("stats_solve_spd(Tensor u, Tensor c, Tensor alpha) -> (Tensor solution, Tensor info)");
-    m.def("stats_solve_readout(Tensor u, Tensor c, Tensor alpha, Tensor inv_mu) -> (Tensor output, Tensor info)");
-    m.def("masked_stats_solve_spd(Tensor u, Tensor c, Tensor valid_mask, Tensor length_scale, Tensor alpha) -> (Tensor solution, Tensor info)");
-    m.def("masked_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor length_scale, Tensor alpha, Tensor inv_mu) -> (Tensor output, Tensor info)");
-    m.def("lsso_backward_fused(Tensor u, Tensor y, Tensor p, Tensor gamma, Tensor valid_mask, Tensor length_scale) -> (Tensor grad_u, Tensor grad_mu, Tensor grad_gamma)");
+    m.def("masked_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor length_scale, Tensor alpha, Tensor gain) -> (Tensor output, Tensor info)");
+    m.def("masked_trace_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor alpha, Tensor gain, float normalization_eps, float length_reference, bool length_normalize) -> (Tensor output, Tensor info, Tensor effective_alpha, Tensor denominator, Tensor scale_squared)");
+    m.def("dual_backward_statistics_tensorcore(Tensor u, Tensor y, Tensor p, Tensor valid_mask, int heads) -> (Tensor ytu, Tensor ptu, Tensor grad_mu)");
+    m.def("dual_grad_u_tensorcore(Tensor p, Tensor y, Tensor ytu, Tensor ptu, Tensor coefficient, Tensor radial_u, Tensor radial_coefficient, Tensor valid_mask, int heads) -> Tensor");
     m.def("rank_rotary(Tensor input, Tensor cos, Tensor sin, bool inverse=False) -> Tensor");
-    m.def("normalize_basis(Tensor input, float eps, float length_scale) -> (Tensor output, Tensor inv_rms)");
-    m.def("normalize_basis_backward(Tensor grad_output, Tensor input, Tensor inv_rms, float length_scale) -> Tensor");
-    m.def("normalize_rank_rotary(Tensor input, Tensor cos, Tensor sin, float eps, float length_scale) -> (Tensor output, Tensor inv_rms)");
-    m.def("normalize_rank_rotary_backward(Tensor grad_output, Tensor input, Tensor inv_rms, Tensor cos, Tensor sin, float length_scale) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(lsso_mathdx, CUDA, m) {
     m.impl("solve_spd", &solve_spd_cuda);
-    m.impl("solve_spd_bpb", &solve_spd_bpb_cuda);
-    m.impl("stats_solve_spd", &stats_solve_spd_cuda);
-    m.impl("stats_solve_readout", &stats_solve_readout_cuda);
-    m.impl("masked_stats_solve_spd", &masked_stats_solve_spd_cuda);
     m.impl("masked_stats_solve_readout", &masked_stats_solve_readout_cuda);
-    m.impl("lsso_backward_fused", &lsso_backward_fused_cuda);
+    m.impl("masked_trace_stats_solve_readout", &masked_trace_stats_solve_readout_cuda);
+    m.impl("dual_backward_statistics_tensorcore", &dual_backward_statistics_tensorcore_cuda);
+    m.impl("dual_grad_u_tensorcore", &dual_grad_u_tensorcore_cuda);
     m.impl("rank_rotary", &rank_rotary_cuda);
-    m.impl("normalize_basis", &normalize_basis_cuda);
-    m.impl("normalize_basis_backward", &normalize_basis_backward_cuda);
-    m.impl("normalize_rank_rotary", &normalize_rank_rotary_cuda);
-    m.impl("normalize_rank_rotary_backward", &normalize_rank_rotary_backward_cuda);
 }

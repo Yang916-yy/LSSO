@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from lsso import GroupedRRLSSO, LSSO, RRLSSO
 from lsso.modules import length_normalize_basis, lsso
@@ -95,14 +94,12 @@ def test_basis_helper_scales_from_effective_lengths() -> None:
     torch.testing.assert_close(actual[1], u[1] * (8.0 / 2.0) ** 0.5)
 
 
-def test_bidirectional_defaults_start_in_retuned_strength_interval() -> None:
+def test_bidirectional_defaults_start_at_frozen_trace_strength() -> None:
     layers = (
         LSSO(dim=32, num_heads=4, rank=8),
         RRLSSO(dim=32, num_heads=4, rank=8),
         GroupedRRLSSO(dim=32, num_heads=4, num_relation_groups=2, rank=8),
     )
     for layer in layers:
-        mu = F.softplus(layer.theta_mu) + layer.eps
-        gamma = layer.gamma_max * torch.sigmoid(layer.theta_gamma)
-        strength = gamma / mu
-        assert torch.all((strength >= 0.85) & (strength <= 1.15))
+        _gain, strength = layer.effective_gain_alpha()
+        torch.testing.assert_close(strength, torch.full_like(strength, 1.2))

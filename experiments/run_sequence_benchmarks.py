@@ -19,24 +19,22 @@ if str(ROOT) not in sys.path:
 
 from experiments.genomic_benchmarks import GENOMIC_BENCHMARKS
 from experiments.lra_benchmark import TASK_DEFAULTS
-from experiments.uea_benchmark import UEA_30
 
 
 SUITES = {
     "genomic": GENOMIC_BENCHMARKS,
     "lra": tuple(TASK_DEFAULTS),
-    "uea": UEA_30,
 }
+FORMAL_SUITES = ("genomic", "lra")
 SCRIPTS = {
     "genomic": ROOT / "experiments" / "genomic_benchmarks.py",
     "lra": ROOT / "experiments" / "lra_benchmark.py",
-    "uea": ROOT / "experiments" / "uea_benchmark.py",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--suite", choices=("genomic", "lra", "uea", "all"), default="all")
+    parser.add_argument("--suite", choices=(*FORMAL_SUITES, "all"), default="all")
     parser.add_argument(
         "--datasets",
         nargs="*",
@@ -57,12 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--genomic-cache", default="data/genomic_benchmarks")
     parser.add_argument("--lra-data-root", default="data/lra")
     parser.add_argument("--lra-cache", default="data/lra_cache")
-    parser.add_argument("--uea-data-root", default="data/uea")
     parser.add_argument("--download-aan", action="store_true")
     parser.add_argument("--download-lra", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--eval-workers", type=int, default=0)
-    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument(
+        "--grad-accum", type=int, default=0,
+        help="0 lets each benchmark select its task-specific default",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--rerun-complete", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def selected_jobs(args: argparse.Namespace):
-    suites = tuple(SUITES) if args.suite == "all" else (args.suite,)
+    suites = FORMAL_SUITES if args.suite == "all" else (args.suite,)
     known = {name for suite in suites for name in SUITES[suite]}
     unknown = set(args.datasets) - known
     if unknown:
@@ -103,11 +103,11 @@ def command_for(args: argparse.Namespace, suite: str, dataset: str, mixer: str, 
         str(args.workers),
         "--eval-workers",
         str(args.eval_workers),
-        "--grad-accum",
-        str(args.grad_accum),
         "--output",
         str(output),
     ]
+    if args.grad_accum:
+        command += ["--grad-accum", str(args.grad_accum)]
     if suite == "genomic":
         command += ["--dataset", dataset, "--cache-dir", args.genomic_cache]
         if args.genomic_data_root:
@@ -125,8 +125,6 @@ def command_for(args: argparse.Namespace, suite: str, dataset: str, mixer: str, 
             command.append("--download-aan")
         if args.download_lra and dataset in {"listops", "pathfinder"}:
             command.append("--download-lra")
-    else:
-        command += ["--dataset", dataset, "--data-root", args.uea_data_root]
     extra = list(args.extra)
     if extra[:1] == ["--"]:
         extra = extra[1:]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from lsso import LSSO, RoPELSSO
+from lsso import LSSO, RRLSSO
 from .baselines import LinearAttention, OfficialNystromAttention, PerformerAttention
 
 
@@ -32,8 +32,8 @@ class EncoderBlock(nn.Module):
         rank: int = 16,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        gamma_max: float = 1.2,
-        theta_gamma_init: float = 0.5,
+        gain_init: float = 1.0,
+        alpha_init: float = 1.2,
         normalize_u: bool = True,
     ) -> None:
         super().__init__()
@@ -69,15 +69,15 @@ class EncoderBlock(nn.Module):
                 dropout=dropout,
             )
             self._uses_mha = False
-        elif mixer in {"lsso", "lsso-no-global", "rope-lsso"}:
-            mixer_cls = RoPELSSO if mixer == "rope-lsso" else LSSO
+        elif mixer in {"lsso", "lsso-no-global", "rrlsso"}:
+            mixer_cls = RRLSSO if mixer == "rrlsso" else LSSO
             self.mixer = mixer_cls(
                 dim=dim,
                 num_heads=num_heads,
                 rank=rank,
                 dropout=dropout,
-                gamma_max=gamma_max,
-                theta_gamma_init=theta_gamma_init,
+                gain_init=gain_init,
+                alpha_init=alpha_init,
                 no_global=mixer == "lsso-no-global",
                 normalize_u=normalize_u,
             )

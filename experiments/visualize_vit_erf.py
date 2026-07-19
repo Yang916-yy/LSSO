@@ -197,14 +197,15 @@ def mixer_maps(
     U = U.view(B, N, H, r).transpose(1, 2).contiguous()
     if rr.normalize_u:
         U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + rr.eps)
-    U = apply_rank_rotary(U, None, base=rr.rope_base, scale=rr.rope_scale)
+    U = apply_rank_rotary(U, None, base=rr.rotary_base, scale=rr.rotary_scale)
     if rr.length_normalize:
         U = U * (rr.length_reference / N) ** 0.5
 
     calc = torch.float32
     U = U.to(calc)
-    mu = (torch.nn.functional.softplus(rr.theta_mu) + rr.eps).to(calc).view(1, H, 1, 1)
-    gamma = (rr.gamma_max * torch.sigmoid(rr.theta_gamma)).to(calc).view(1, H, 1, 1)
+    gain, alpha = rr.effective_gain_alpha()
+    mu = gain.reciprocal().to(calc).view(1, H, 1, 1)
+    gamma = (alpha / gain).to(calc).view(1, H, 1, 1)
     if rr.no_global:
         gamma = torch.zeros_like(gamma)
 

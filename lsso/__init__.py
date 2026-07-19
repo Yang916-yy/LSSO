@@ -11,41 +11,43 @@ from .api import (
     LSSO,
     MixerAdapter,
     RRLSSO,
-    RoPELSSO,
     RotaryMHA,
     SolveStateCache,
-    apply_2d_rank_rotary,
-    apply_2d_rotary,
-    apply_rank_rope,
     apply_rank_rotary,
     length_normalize_basis,
     lsso,
+    lsso_gain_alpha,
     make_solve_state,
-    make_2d_position_coords,
     read_solve_state,
+    trace_normalize_basis,
     update_solve_state,
 )
+from .mathdx_backend import (
+    get_mathdx_path_counters,
+    reset_mathdx_path_counters,
+)
+from .backends import MATHDX_BACKEND_ABI
 
-__version__ = "0.2.0.dev0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
+    "MATHDX_BACKEND_ABI",
     "LSSO",
     "MixerAdapter",
     "RotaryMHA",
     "GroupedLSSO",
     "GroupedRRLSSO",
     "RRLSSO",
-    "RoPELSSO",
     "SolveStateCache",
-    "apply_rank_rope",
     "apply_rank_rotary",
-    "apply_2d_rotary",
-    "apply_2d_rank_rotary",
-    "make_2d_position_coords",
     "length_normalize_basis",
     "make_solve_state",
     "update_solve_state",
     "read_solve_state",
+    "trace_normalize_basis",
     "lsso",
+    "lsso_gain_alpha",
+    "get_mathdx_path_counters",
+    "reset_mathdx_path_counters",
 ]

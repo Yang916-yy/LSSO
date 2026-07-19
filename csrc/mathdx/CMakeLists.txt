@@ -8,10 +8,13 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
-find_package(Torch REQUIRED)
 # CUDA 12.8 is the first toolkit with the SM120 compiler and the matching
 # cuSolverDx fatbin target.  Newer CUDA 13 toolkits remain accepted.
+# Resolve the requested toolkit before Torch. Torch's CMake package otherwise
+# creates CUDA:: targets from a machine-wide /usr/local/cuda symlink, which can
+# silently give a cu128 build a direct libcudart.so.13 dependency.
 find_package(CUDAToolkit 12.8 REQUIRED)
+find_package(Torch REQUIRED)
 find_package(mathdx REQUIRED CONFIG)
 
 add_library(lsso_mathdx SHARED lsso_mathdx.cu)
@@ -32,6 +35,10 @@ foreach(cuda_arch IN LISTS LSSO_MATHDX_LTO_ARCHITECTURES)
     )
 endforeach()
 target_compile_definitions(lsso_mathdx PRIVATE TORCH_EXTENSION_NAME=lsso_mathdx)
+if(DEFINED LSSO_MATHDX_NATIVE_ARCH)
+    target_compile_definitions(lsso_mathdx PRIVATE
+        LSSO_MATHDX_NATIVE_ARCH=${LSSO_MATHDX_NATIVE_ARCH})
+endif()
 target_link_libraries(lsso_mathdx PRIVATE
     ${TORCH_LIBRARIES}
     CUDA::cudart

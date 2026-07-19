@@ -59,10 +59,20 @@ def test_grouped_lsso_matches_manual_grouped_solve() -> None:
     U, C = UC.split((G * r, D), dim=-1)
     U = U.view(B, N, G, r).transpose(1, 2).contiguous()
     C = C.view(B, N, G, D // G).transpose(1, 2).contiguous()
-    U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + layer.eps)
-    mu = (torch.nn.functional.softplus(layer.theta_mu) + layer.eps).view(1, G, 1, 1)
-    gamma = (layer.gamma_max * torch.sigmoid(layer.theta_gamma)).view(1, G, 1, 1)
-    expected = lsso(U, C, mu, gamma, eye=layer._eye)
+    gain, alpha = layer.effective_gain_alpha()
+    mu = gain.reciprocal().view(1, G, 1, 1)
+    gamma = (alpha / gain).view(1, G, 1, 1)
+    expected = lsso(
+        U,
+        C,
+        mu,
+        gamma,
+        eye=layer._eye,
+        trace_normalize=True,
+        normalization_eps=layer.eps,
+        length_normalize=layer.length_normalize,
+        length_reference=layer.length_reference,
+    )
     expected = expected.transpose(1, 2).contiguous().view(B, N, D)
     expected = layer.w_o(expected)
 

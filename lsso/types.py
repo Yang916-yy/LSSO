@@ -9,9 +9,15 @@ import torch
 
 @dataclass
 class LSSODiagnostics:
-    gamma_over_mu: torch.Tensor
+    alpha: torch.Tensor
     effective_rank: torch.Tensor
     correction_ratio: torch.Tensor
+
+    @property
+    def gamma_over_mu(self) -> torch.Tensor:
+        """Historical alias for checkpoints and downstream plotting code."""
+
+        return self.alpha
 
 
 @dataclass

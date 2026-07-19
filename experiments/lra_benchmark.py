@@ -7,7 +7,6 @@ import functools
 import json
 import random
 import sys
-from itertools import chain
 from pathlib import Path
 
 import torch
@@ -49,10 +48,24 @@ from experiments.sequence_benchmarks.lra_data import (
 
 
 TASK_DEFAULTS = {
-    "listops": {"max_length": 2048, "epochs": 40, "batch_size": 50, "classes": 10},
-    "text": {"max_length": 4096, "epochs": 32, "batch_size": 32, "classes": 2},
-    "retrieval": {"max_length": 4000, "epochs": 20, "batch_size": 64, "classes": 2},
-    "pathfinder": {"max_length": 1024, "epochs": 200, "batch_size": 64, "classes": 2},
+    "listops": {
+        "max_length": 2048, "epochs": 40, "batch_size": 50, "classes": 10,
+        "patience": 0,
+    },
+    "text": {
+        "max_length": 4096, "epochs": 32, "batch_size": 32, "classes": 2,
+        "patience": 0,
+    },
+    "retrieval": {
+        "max_length": 4000, "epochs": 20, "batch_size": 64, "classes": 2,
+        "patience": 0,
+    },
+    # Match the official optimization scale without requiring a physical batch
+    # of 512: 64 samples x 8 accumulation steps, one-epoch warmup, no early stop.
+    "pathfinder": {
+        "max_length": 1024, "epochs": 200, "batch_size": 64, "classes": 2,
+        "grad_accum": 8, "lr": 1e-3, "warmup_ratio": 1 / 200, "patience": 0,
+    },
 }
 
 
@@ -133,6 +146,12 @@ def prepare_listops(data_root: Path, cache_root: Path, max_length: int):
                 "source": source_signature(path),
             },
         )
+    empty_splits = [split for split, dataset in datasets.items() if len(dataset) == 0]
+    if empty_splits:
+        raise RuntimeError(
+            f"AAN preprocessing produced empty splits: {empty_splits}; "
+            "check the source label and column format"
+        )
     return datasets["train"], datasets["val"], datasets["test"], vocabulary
 
 
@@ -186,16 +205,35 @@ def prepare_text(cache_root: Path, max_length: int, seed: int, validation_fracti
 
 def _download_aan(data_root: Path) -> Path:
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import hf_hub_download, snapshot_download
     except ImportError as error:
         raise RuntimeError("install huggingface-hub to download the OpenNLPLab AAN mirror") from error
     local = data_root / "opennlplab"
+    filenames = (
+        "data/aan/new_aan_pairs.train.tsv",
+        "data/aan/new_aan_pairs.eval.tsv",
+        "data/aan/new_aan_pairs.test.tsv",
+    )
     snapshot_download(
         repo_id="OpenNLPLab/lra",
         repo_type="dataset",
         local_dir=local,
-        allow_patterns=["data/aan/new_aan_pairs.*.tsv"],
+        allow_patterns=list(filenames),
+        # These are multi-gigabyte LFS objects. Serial downloads avoid four
+        # concurrent sparse temporary files and make progress recoverable.
+        max_workers=1,
     )
+    # A killed local-dir snapshot can leave a cached tree manifest beside
+    # incomplete LFS objects. In that state snapshot_download may return even
+    # though the materialized files are absent, so verify and resume each one.
+    for filename in filenames:
+        if not (local / filename).is_file():
+            hf_hub_download(
+                repo_id="OpenNLPLab/lra",
+                repo_type="dataset",
+                filename=filename,
+                local_dir=local,
+            )
     return local / "data" / "aan"
 
 
@@ -220,19 +258,26 @@ def prepare_retrieval(
             raise FileNotFoundError(path)
     vocab_path = cache_root / "retrieval" / "vocab.json"
 
-    def build_vocabulary():
-        texts = chain.from_iterable((first, second) for first, second, _ in iter_aan(files["train"]))
-        return CharacterVocabulary.from_texts(texts)
-
-    vocabulary = _load_or_build_vocab(vocab_path, build_vocabulary)
+    # Retrieval is a byte-level LRA task. A fixed vocabulary avoids an extra
+    # character-counting pass over the 8.5 GB training TSV and is independent
+    # of which split happens to be scanned first.
+    expected_vocabulary = CharacterVocabulary.from_bytes()
+    vocabulary = (
+        CharacterVocabulary.load(vocab_path)
+        if vocab_path.exists()
+        else expected_vocabulary
+    )
+    if vocabulary.fingerprint != expected_vocabulary.fingerprint:
+        vocabulary = expected_vocabulary
+    vocabulary.save(vocab_path)
     datasets = {}
     for split, path in files.items():
         datasets[split] = build_packed_pairs(
             cache_root / "retrieval" / f"{split}-l{max_length}",
             iter_aan(path),
-            lambda text: vocabulary.encode_chars(text, max_length),
+            lambda text: vocabulary.encode_bytes(text, max_length),
             manifest={
-                "schema": 1,
+                "schema": 2,
                 "task": "retrieval",
                 "split": split,
                 "max_length": max_length,
@@ -269,6 +314,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pathfinder-resolution", type=int, default=32)
     parser.add_argument(
+        "--pathfinder-local-kernel", type=int, default=0,
+        help="odd 2-D depthwise kernel interleaved before each Pathfinder mixer",
+    )
+    parser.add_argument(
+        "--pathfinder-local-dilations", type=int, nargs="*", default=(),
+        help="one dilation per encoder block; empty disables the local branch",
+    )
+    parser.add_argument("--pathfinder-local-layer-scale", type=float, default=1e-3)
+    parser.add_argument(
+        "--pathfinder-local-lr-multiplier", type=float, default=1.0,
+        help="learning-rate multiplier for Pathfinder local spatial blocks",
+    )
+    parser.add_argument(
         "--split-seed", type=int, default=0,
         help="fixed data-partition seed; independent of model initialization seed",
     )
@@ -282,14 +340,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--position-rank", type=int, default=0)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--pooling", choices=("mean", "max", "meanmax"), default="mean",
+        help="sequence readout; meanmax is useful for sparse visual markers",
+    )
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=0)
     parser.add_argument("--eval-batch-size", type=int, default=0)
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--grad-accum", type=int, default=0, help="0 selects the task default")
+    parser.add_argument("--lr", type=float, default=0.0, help="0 selects the task default")
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-ratio", type=float, default=0.05)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--warmup-ratio", type=float, default=-1.0, help="negative selects the task default")
+    parser.add_argument("--patience", type=int, default=-1, help="negative selects the task default")
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--eval-workers", type=int, default=0)
@@ -311,6 +373,12 @@ def main() -> None:
     epochs = args.epochs or defaults["epochs"]
     batch_size = args.batch_size or defaults["batch_size"]
     eval_batch_size = args.eval_batch_size or batch_size
+    grad_accum = args.grad_accum or defaults.get("grad_accum", 1)
+    lr = args.lr or defaults.get("lr", 3e-4)
+    warmup_ratio = (
+        args.warmup_ratio if args.warmup_ratio >= 0 else defaults.get("warmup_ratio", 0.05)
+    )
+    patience = args.patience if args.patience >= 0 else defaults.get("patience", 10)
     output = args.output or f"runs/sequence/lra-{args.task}-{args.mixer}-s{args.seed}"
     data_root, cache_root = Path(args.data_root), Path(args.cache_dir)
     if args.download_lra and args.task in {"listops", "pathfinder"}:
@@ -346,6 +414,11 @@ def main() -> None:
             num_heads=args.heads, mixer=args.mixer, rank=args.rank,
             mlp_ratio=args.mlp_ratio, dropout=args.dropout,
             position_rank=args.position_rank,
+            pooling=args.pooling,
+            spatial_shape=(args.pathfinder_resolution, args.pathfinder_resolution),
+            local_spatial_kernel=args.pathfinder_local_kernel,
+            local_spatial_dilations=tuple(args.pathfinder_local_dilations),
+            local_spatial_layer_scale=args.pathfinder_local_layer_scale,
         )
         model = SequenceClassifier(encoder, defaults["classes"])
     else:
@@ -354,7 +427,7 @@ def main() -> None:
             pad_token_id=vocabulary.pad_token_id, dim=args.dim, depth=args.depth,
             num_heads=args.heads, mixer=args.mixer, rank=args.rank,
             mlp_ratio=args.mlp_ratio, dropout=args.dropout,
-            position_rank=args.position_rank,
+            position_rank=args.position_rank, pooling=args.pooling,
         )
         model = (
             SequencePairClassifier(encoder, defaults["classes"])
@@ -381,11 +454,12 @@ def main() -> None:
         config=TrainingConfig(
             output=output,
             epochs=epochs,
-            lr=args.lr,
+            lr=lr,
             weight_decay=args.weight_decay,
-            warmup_ratio=args.warmup_ratio,
-            grad_accum=args.grad_accum,
-            patience=args.patience,
+            warmup_ratio=warmup_ratio,
+            local_spatial_lr_multiplier=args.pathfinder_local_lr_multiplier,
+            grad_accum=grad_accum,
+            patience=patience,
             seed=args.seed,
             resume=args.resume,
             max_train_batches=args.max_train_batches,
@@ -402,13 +476,28 @@ def main() -> None:
             "heads": args.heads,
             "max_length": max_length,
             "position_rank": args.position_rank,
+            "pooling": args.pooling,
             "validation_fraction": args.validation_fraction,
             "batch_size": batch_size,
             "eval_batch_size": eval_batch_size,
             "workers": args.workers,
             "eval_workers": args.eval_workers,
-            "grad_accum": args.grad_accum,
-            "effective_batch_size": batch_size * args.grad_accum,
+            "grad_accum": grad_accum,
+            "effective_batch_size": batch_size * grad_accum,
+            "lr": lr,
+            "warmup_ratio": warmup_ratio,
+            "patience": patience,
+            "spatial_positioning": (
+                "1d-rope" if args.mixer == "mha" else
+                "rank-rotary" if args.mixer == "rrlsso" else "none"
+            ) if args.task == "pathfinder" else (
+                "1d-rope" if args.mixer == "mha" else
+                "1d-rank-rotary" if args.mixer == "rrlsso" else "none"
+            ),
+            "pathfinder_local_kernel": args.pathfinder_local_kernel,
+            "pathfinder_local_dilations": list(args.pathfinder_local_dilations),
+            "pathfinder_local_layer_scale": args.pathfinder_local_layer_scale,
+            "pathfinder_local_lr_multiplier": args.pathfinder_local_lr_multiplier,
             "max_train_samples": args.max_train_samples,
             "max_eval_samples": args.max_eval_samples,
             "split_sizes": {

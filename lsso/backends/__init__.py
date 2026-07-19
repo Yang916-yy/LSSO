@@ -6,6 +6,8 @@ shapes and let the operator dispatch to the portable PyTorch implementation.
 
 from os import PathLike
 
+from ._loader import MATHDX_BACKEND_ABI
+
 
 def load(path: str | PathLike[str] | None = None) -> bool:
     """Load the optional MathDx backend without importing it eagerly."""
@@ -30,4 +32,4 @@ def load_error() -> Exception | None:
 
     return mathdx_load_error()
 
-__all__ = ["is_available", "load", "load_error"]
+__all__ = ["MATHDX_BACKEND_ABI", "is_available", "load", "load_error"]

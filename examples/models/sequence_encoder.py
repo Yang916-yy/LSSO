@@ -59,6 +59,10 @@ class SequenceMixerBlock(nn.Module):
         rank: int,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        rotary_1d: bool = False,
+        gain_init: float = 1.0,
+        alpha_init: float = 1.2,
+        alpha_max: float = 3.0,
     ) -> None:
         super().__init__()
         hidden = int(dim * mlp_ratio)
@@ -69,7 +73,10 @@ class SequenceMixerBlock(nn.Module):
             mixer,
             rank=rank,
             dropout=dropout,
-            rotary_2d=False,
+            rotary_1d=rotary_1d,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            alpha_max=alpha_max,
         )
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
@@ -123,6 +130,9 @@ class SequenceMixerEncoder(nn.Module):
         local_motif_kernel: int = 0,
         local_motif_dilations: tuple[int, ...] = (),
         local_motif_layer_scale: float = 1e-3,
+        gain_init: float = 1.0,
+        alpha_init: float = 1.2,
+        alpha_max: float = 3.0,
     ) -> None:
         super().__init__()
         if pooling not in {"mean", "max", "meanmax"}:
@@ -189,6 +199,10 @@ class SequenceMixerEncoder(nn.Module):
                 rank=rank,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                rotary_1d=True,
+                gain_init=gain_init,
+                alpha_init=alpha_init,
+                alpha_max=alpha_max,
             )
             for _ in range(depth)
         )
@@ -271,6 +285,99 @@ class ProteinFitnessModel(nn.Module):
         return self.head(self.encoder(input_ids, attention_mask)).squeeze(-1)
 
 
+class MultiScaleTemporalStem(nn.Module):
+    """Padding-safe local temporal context before the global mixer."""
+
+    def __init__(
+        self,
+        dim: int,
+        kernels: tuple[int, ...],
+        *,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if not kernels or any(kernel < 1 or kernel % 2 == 0 for kernel in kernels):
+            raise ValueError("local stem kernels must be non-empty positive odd integers")
+        self.kernels = tuple(int(kernel) for kernel in kernels)
+        self.norm = nn.LayerNorm(dim)
+        self.depthwise = nn.ModuleList(
+            nn.Conv1d(
+                dim,
+                dim,
+                kernel,
+                padding=kernel // 2,
+                groups=dim,
+                bias=False,
+            )
+            for kernel in self.kernels
+        )
+        self.pointwise = nn.Conv1d(dim, dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        weights = valid.unsqueeze(-1).to(x.dtype)
+        local_input = (self.norm(x) * weights).transpose(1, 2)
+        local = sum(branch(local_input) for branch in self.depthwise) / len(self.depthwise)
+        local = self.pointwise(F.gelu(local)).transpose(1, 2)
+        return (x + self.dropout(local)) * weights
+
+
+class SpatialLocalBlock(nn.Module):
+    """A lightweight 2-D local branch for flattened image sequences.
+
+    The depthwise convolution supplies the sparse, high-rank grid adjacency
+    that a low-rank global token mixer should not have to approximate.  The
+    pointwise projection only mixes channels; global communication remains in
+    the following mixer block.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.0,
+        layer_scale_init: float = 1e-3,
+    ) -> None:
+        super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer")
+        if dilation <= 0:
+            raise ValueError("dilation must be positive")
+        padding = dilation * (kernel_size - 1) // 2
+        self.norm = nn.LayerNorm(dim)
+        self.depthwise = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=dim,
+            bias=False,
+        )
+        self.pointwise = nn.Conv2d(dim, dim, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_scale = nn.Parameter(torch.full((dim,), float(layer_scale_init)))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid: torch.Tensor,
+        spatial_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        batch, length, dim = x.shape
+        height, width = spatial_shape
+        if length != height * width:
+            raise ValueError("flattened sequence length does not match spatial_shape")
+        mask = valid.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
+        local = (self.norm(x) * mask).reshape(batch, height, width, dim)
+        local = local.permute(0, 3, 1, 2).contiguous()
+        local = self.pointwise(F.gelu(self.depthwise(local)))
+        local = local.permute(0, 2, 3, 1).reshape(batch, length, dim)
+        return (x + self.dropout(local) * self.layer_scale) * mask
+
+
 class SequenceValueEncoder(nn.Module):
     """Bidirectional sequence encoder for continuous per-timestep features."""
 
@@ -289,13 +396,48 @@ class SequenceValueEncoder(nn.Module):
         projection_dim: int | None = None,
         position_rank: int = 0,
         pooling: str = "mean",
+        local_stem_kernels: tuple[int, ...] = (),
+        spatial_shape: tuple[int, int] | None = None,
+        local_spatial_kernel: int = 0,
+        local_spatial_dilations: tuple[int, ...] = (),
+        local_spatial_layer_scale: float = 1e-3,
     ) -> None:
         super().__init__()
         if pooling not in {"mean", "max", "meanmax"}:
             raise ValueError(f"unsupported sequence pooling: {pooling}")
         self.max_length = int(max_length)
+        if spatial_shape is not None:
+            spatial_shape = tuple(int(value) for value in spatial_shape)
+            if len(spatial_shape) != 2 or min(spatial_shape) <= 0:
+                raise ValueError("spatial_shape must contain two positive dimensions")
+            if spatial_shape[0] * spatial_shape[1] != self.max_length:
+                raise ValueError(
+                    f"spatial_shape={spatial_shape} does not match max_length={max_length}"
+                )
+        self.spatial_shape = spatial_shape
+        if local_spatial_kernel < 0 or (
+            local_spatial_kernel and local_spatial_kernel % 2 == 0
+        ):
+            raise ValueError(
+                "local_spatial_kernel must be zero or a positive odd integer"
+            )
+        if local_spatial_dilations and spatial_shape is None:
+            raise ValueError("local spatial blocks require spatial_shape")
+        if local_spatial_dilations and not local_spatial_kernel:
+            raise ValueError(
+                "local_spatial_kernel must be positive when dilations are configured"
+            )
+        if len(local_spatial_dilations) not in {0, depth}:
+            raise ValueError("local_spatial_dilations must be empty or match depth")
+        if any(dilation <= 0 for dilation in local_spatial_dilations):
+            raise ValueError("local_spatial_dilations must contain positive integers")
         self.pooling = pooling
         self.input_projection = nn.Linear(input_dim, dim)
+        self.local_temporal_stem = (
+            MultiScaleTemporalStem(dim, tuple(local_stem_kernels), dropout=dropout)
+            if local_stem_kernels
+            else None
+        )
         self.position_rank = (
             int(position_rank) if 0 < position_rank < min(max_length, dim) else 0
         )
@@ -313,8 +455,19 @@ class SequenceValueEncoder(nn.Module):
                 rank=rank,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                rotary_1d=True,
             )
             for _ in range(depth)
+        )
+        self.local_spatial_blocks = nn.ModuleList(
+            SpatialLocalBlock(
+                dim,
+                kernel_size=local_spatial_kernel,
+                dilation=int(dilation),
+                dropout=dropout,
+                layer_scale_init=local_spatial_layer_scale,
+            )
+            for dilation in local_spatial_dilations
         )
         self.norm = nn.LayerNorm(dim)
         self.pool_projection = (
@@ -356,6 +509,11 @@ class SequenceValueEncoder(nn.Module):
             raise ValueError(
                 f"sequence length {values.shape[1]} exceeds max_length={self.max_length}"
             )
+        if self.spatial_shape is not None and values.shape[1] != self.max_length:
+            raise ValueError(
+                "spatial inputs must contain the complete grid: "
+                f"expected {self.max_length} values, got {values.shape[1]}"
+            )
         if attention_mask is None:
             valid = torch.ones(values.shape[:2], dtype=torch.bool, device=values.device)
         else:
@@ -363,10 +521,19 @@ class SequenceValueEncoder(nn.Module):
             if valid.shape != values.shape[:2]:
                 raise ValueError("attention_mask must have shape [batch, length]")
         x = self.input_projection(values)
+        x = x * valid.unsqueeze(-1).to(x.dtype)
+        if self.local_temporal_stem is not None:
+            x = self.local_temporal_stem(x, valid)
         x = self.embedding_dropout(x + self._positions(values.shape[1]))
         x = x * valid.unsqueeze(-1).to(x.dtype)
-        for block in self.blocks:
-            x = block(x, valid, padding_ratio_hint=padding_ratio_hint)
+        for block_index, block in enumerate(self.blocks):
+            if self.local_spatial_blocks:
+                x = self.local_spatial_blocks[block_index](x, valid, self.spatial_shape)
+            x = block(
+                x,
+                valid,
+                padding_ratio_hint=padding_ratio_hint,
+            )
         x = self.norm(x)
         return self.projection(self._pool(x, valid))
 

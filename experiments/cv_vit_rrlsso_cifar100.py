@@ -11,6 +11,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.models.vision_transformer import VisionTransformer
@@ -19,8 +20,88 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from examples.models import create_vision_llama
 from lsso import GroupedRRLSSO, LSSO, RRLSSO
+
+
+class TimmRRLSSOAttention(nn.Module):
+    """RRLSSO replacement for a timm ViT attention module."""
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        num_heads: int,
+        rank: int,
+        dropout: float,
+        bias: bool,
+        gain_init: float,
+        alpha_init: float,
+        solve_parameterization: str = "gain_alpha",
+        alpha_max: float = 3.0,
+        basis_normalization: str = "trace",
+        length_normalize: bool,
+        length_reference: float,
+    ) -> None:
+        super().__init__()
+        self.rrlsso = RRLSSO(
+            dim=embed_dim,
+            num_heads=num_heads,
+            rank=rank,
+            dropout=dropout,
+            bias=bias,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            solve_parameterization=solve_parameterization,
+            alpha_max=alpha_max,
+            basis_normalization=basis_normalization,
+            length_normalize=length_normalize,
+            length_reference=length_reference,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        if attn_mask is not None:
+            raise ValueError("the DeiT-III Food101 path does not use an attention mask")
+        if is_causal:
+            raise ValueError("the bidirectional RRLSSO replacement is not causal")
+        return self.rrlsso(x)
+
+
+def replace_timm_attention_with_rrlsso(
+    model: nn.Module,
+    *,
+    rank: int,
+    gain_init: float,
+    alpha_init: float,
+    solve_parameterization: str = "gain_alpha",
+    alpha_max: float = 3.0,
+    basis_normalization: str = "trace",
+    length_normalize: bool,
+    length_reference: float,
+) -> int:
+    count = 0
+    for block in model.blocks:
+        old = block.attn
+        block.attn = TimmRRLSSOAttention(
+            embed_dim=int(old.qkv.in_features),
+            num_heads=int(old.num_heads),
+            rank=rank,
+            dropout=float(old.attn_drop.p),
+            bias=old.qkv.bias is not None,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            solve_parameterization=solve_parameterization,
+            alpha_max=alpha_max,
+            basis_normalization=basis_normalization,
+            length_normalize=length_normalize,
+            length_reference=length_reference,
+        )
+        count += 1
+    return count
 
 
 class RRLSSOSelfAttention(nn.Module):
@@ -34,8 +115,11 @@ class RRLSSOSelfAttention(nn.Module):
         rank: int,
         dropout: float,
         bias: bool,
-        gamma_max: float = 1.2,
-        theta_gamma_init: float = 0.5,
+        gain_init: float = 1.0,
+        alpha_init: float = 1.2,
+        solve_parameterization: str = "gain_alpha",
+        alpha_max: float = 3.0,
+        basis_normalization: str = "trace",
         relation_groups: int | None = None,
         length_normalize: bool = True,
         length_reference: float = 1.0,
@@ -50,8 +134,11 @@ class RRLSSOSelfAttention(nn.Module):
                 rank=rank,
                 dropout=dropout,
                 bias=bias,
-                gamma_max=gamma_max,
-                theta_gamma_init=theta_gamma_init,
+                gain_init=gain_init,
+                alpha_init=alpha_init,
+                solve_parameterization=solve_parameterization,
+                alpha_max=alpha_max,
+                basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
             )
@@ -63,8 +150,11 @@ class RRLSSOSelfAttention(nn.Module):
                 rank=rank,
                 dropout=dropout,
                 bias=bias,
-                gamma_max=gamma_max,
-                theta_gamma_init=theta_gamma_init,
+                gain_init=gain_init,
+                alpha_init=alpha_init,
+                solve_parameterization=solve_parameterization,
+                alpha_max=alpha_max,
+                basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
             )
@@ -86,8 +176,11 @@ def replace_vit_attention_with_rrlsso(
     model: nn.Module,
     *,
     rank: int,
-    gamma_max: float = 1.2,
-    theta_gamma_init: float = 0.5,
+    gain_init: float = 1.0,
+    alpha_init: float = 1.2,
+    solve_parameterization: str = "gain_alpha",
+    alpha_max: float = 3.0,
+    basis_normalization: str = "trace",
     relation_groups: int | None = None,
     length_normalize: bool = True,
     length_reference: float = 1.0,
@@ -101,8 +194,11 @@ def replace_vit_attention_with_rrlsso(
             rank=rank,
             dropout=float(old.dropout),
             bias=old.in_proj_bias is not None,
-            gamma_max=gamma_max,
-            theta_gamma_init=theta_gamma_init,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            solve_parameterization=solve_parameterization,
+            alpha_max=alpha_max,
+            basis_normalization=basis_normalization,
             relation_groups=relation_groups,
             length_normalize=length_normalize,
             length_reference=length_reference,
@@ -119,28 +215,43 @@ def build_model(
     rank: int,
     image_size: int,
     patch_size: int,
-    gamma_max: float = 1.2,
-    theta_gamma_init: float = 0.5,
+    gain_init: float = 1.0,
+    alpha_init: float = 1.2,
+    solve_parameterization: str = "gain_alpha",
+    alpha_max: float = 3.0,
+    basis_normalization: str = "trace",
     relation_groups: int = 4,
     length_normalize: bool = True,
     length_reference: float = 1.0,
 ) -> nn.Module:
-    if backbone in {"vision-llama-s", "vision-llama-b"}:
-        if kind not in {"mha", "lsso", "rrlsso"}:
-            raise ValueError(f"VisionLLaMA does not support model kind {kind!r}")
-        return create_vision_llama(
-            "small" if backbone == "vision-llama-s" else "base",
-            mixer=kind,
-            rank=rank,
-            image_size=image_size,
-            patch_size=patch_size,
+    if backbone == "deit3-base":
+        if image_size != 224 or patch_size != 16:
+            raise ValueError("deit3-base currently requires image_size=224 and patch_size=16")
+        if kind not in {"mha", "rrlsso"}:
+            raise ValueError(f"DeiT-III does not support model kind {kind!r}")
+        model = timm.create_model(
+            "deit3_base_patch16_224",
+            pretrained=False,
             num_classes=num_classes,
-            learned_position=True,
-            gamma_max=gamma_max,
-            theta_gamma_init=theta_gamma_init,
-            length_normalize=length_normalize,
-            length_reference=length_reference,
         )
+        if kind == "rrlsso":
+            replaced = replace_timm_attention_with_rrlsso(
+                model,
+                rank=rank,
+                gain_init=gain_init,
+                alpha_init=alpha_init,
+                solve_parameterization=solve_parameterization,
+                alpha_max=alpha_max,
+                basis_normalization=basis_normalization,
+                length_normalize=length_normalize,
+                length_reference=length_reference,
+            )
+            print(
+                f"replaced_attention_layers={replaced} "
+                "rank_rotary=ordinary",
+                flush=True,
+            )
+        return model
     if backbone != "torchvision-vit-b":
         raise ValueError(f"unknown backbone {backbone!r}")
     model = VisionTransformer(
@@ -158,8 +269,11 @@ def build_model(
         replaced = replace_vit_attention_with_rrlsso(
             model,
             rank=rank,
-            gamma_max=gamma_max,
-            theta_gamma_init=theta_gamma_init,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            solve_parameterization=solve_parameterization,
+            alpha_max=alpha_max,
+            basis_normalization=basis_normalization,
             length_normalize=length_normalize,
             length_reference=length_reference,
         )
@@ -168,8 +282,11 @@ def build_model(
         replaced = replace_vit_attention_with_rrlsso(
             model,
             rank=rank,
-            gamma_max=gamma_max,
-            theta_gamma_init=theta_gamma_init,
+            gain_init=gain_init,
+            alpha_init=alpha_init,
+            solve_parameterization=solve_parameterization,
+            alpha_max=alpha_max,
+            basis_normalization=basis_normalization,
             relation_groups=relation_groups,
             length_normalize=length_normalize,
             length_reference=length_reference,
@@ -303,9 +420,8 @@ def global_strength_stats(model: nn.Module) -> tuple[float, float, float]:
     ratios: list[torch.Tensor] = []
     for module in model.modules():
         if isinstance(module, (LSSO, RRLSSO, GroupedRRLSSO)):
-            mu = F.softplus(module.theta_mu.float()) + module.eps
-            gamma = module.gamma_max * torch.sigmoid(module.theta_gamma.float())
-            ratios.append((gamma / mu).flatten())
+            _gain, alpha = module.effective_gain_alpha()
+            ratios.append(alpha.float().flatten())
     if not ratios:
         return 0.0, 0.0, 0.0
     values = torch.cat(ratios)
@@ -360,8 +476,11 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
         rank=args.rank,
         image_size=args.image_size,
         patch_size=args.patch_size,
-        gamma_max=args.gamma_max,
-        theta_gamma_init=args.theta_gamma_init,
+        gain_init=args.gain_init,
+        alpha_init=args.alpha_init,
+        solve_parameterization=args.solve_parameterization,
+        alpha_max=args.alpha_max,
+        basis_normalization=args.basis_normalization,
         relation_groups=args.relation_groups,
         length_normalize=args.length_normalize,
         length_reference=resolved_length_reference,
@@ -372,7 +491,10 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
         f"dataset={args.dataset} backbone={args.backbone} model={kind} "
         f"params={n_params:,} device={device} dtype={dtype} "
         f"length_normalize={args.length_normalize} "
-        f"length_reference={resolved_length_reference}"
+        f"length_reference={resolved_length_reference} "
+        f"solve_parameterization={args.solve_parameterization} "
+        f"basis_normalization={args.basis_normalization} "
+        "rank_rotary=ordinary"
     )
     strength_mean, strength_min, strength_max = global_strength_stats(model)
     print(
@@ -524,7 +646,7 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Controlled ViT/VisionLLaMA mixer comparison.")
+    parser = argparse.ArgumentParser(description="Controlled ViT mixer comparison.")
     parser.add_argument(
         "--models",
         nargs="+",
@@ -534,7 +656,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=["cifar100", "food101"], default="cifar100")
     parser.add_argument(
         "--backbone",
-        choices=["torchvision-vit-b", "vision-llama-s", "vision-llama-b"],
+        choices=[
+            "torchvision-vit-b", "deit3-base",
+        ],
         default="torchvision-vit-b",
     )
     parser.add_argument("--data-dir", default="data/torchvision")
@@ -552,8 +676,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--relation-groups", type=int, default=4)
-    parser.add_argument("--gamma-max", type=float, default=1.2)
-    parser.add_argument("--theta-gamma-init", type=float, default=0.5)
+    parser.add_argument("--gain-init", type=float, default=1.0)
+    parser.add_argument("--alpha-init", type=float, default=1.2)
+    parser.add_argument(
+        "--solve-parameterization",
+        choices=["gain_alpha", "fixed_gain_alpha"],
+        default="gain_alpha",
+    )
+    parser.add_argument("--alpha-max", type=float, default=3.0)
+    parser.add_argument(
+        "--basis-normalization",
+        choices=["trace", "token_rms"],
+        default="trace",
+        help="Relation-basis normalization used by LSSO/RRLSSO mixers.",
+    )
     parser.add_argument(
         "--length-normalize",
         action=argparse.BooleanOptionalAction,

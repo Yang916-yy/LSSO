@@ -30,11 +30,13 @@ from experiments.sequence_benchmarks.common import (
     collate_tokens,
     collate_values,
     make_loader,
+    stratified_fold_indices,
     stratified_split_indices,
     stratified_subset_indices,
     train_classifier,
 )
 from experiments.run_rrlsso_dna_program import choose_with_margin
+from experiments.lra_benchmark import prepare_retrieval
 from experiments.sequence_benchmarks.lra_data import (
     KAGGLE_LRA_HANDLE,
     CharacterVocabulary,
@@ -42,11 +44,11 @@ from experiments.sequence_benchmarks.lra_data import (
     build_packed_pairs,
     build_packed_tokens,
     download_kaggle_lra,
+    iter_aan,
     iter_listops,
     resolve_listops_files,
     resolve_pathfinder_directory,
 )
-from experiments.uea_benchmark import UEACollectionDataset, fit_channel_normalizer
 from experiments.summarize_sequence_benchmarks import aggregate, average_ranks
 
 
@@ -71,6 +73,81 @@ def test_continuous_sequence_classifier_forward_backward(mixer: str):
     assert encoder.input_projection.weight.grad is not None
 
 
+@pytest.mark.parametrize("mixer", ["mha", "lsso", "rrlsso"])
+def test_spatial_value_encoder_uses_complete_2d_grid(mixer: str):
+    encoder = SequenceValueEncoder(
+        1,
+        max_length=16,
+        spatial_shape=(4, 4),
+        dim=16,
+        depth=1,
+        num_heads=4,
+        mixer=mixer,
+        rank=8,
+        dropout=0.0,
+    )
+    values = torch.randn(2, 16, 1, requires_grad=True)
+    output = encoder(values)
+    assert output.shape == (2, 16)
+    output.square().mean().backward()
+    assert values.grad is not None
+    mask = torch.tensor([[1] * 12 + [0] * 4, [1] * 16], dtype=torch.bool)
+    changed_padding = values.detach().clone()
+    changed_padding[0, 12:] += 1000
+    torch.testing.assert_close(
+        encoder(values.detach(), mask)[0],
+        encoder(changed_padding, mask)[0],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    with pytest.raises(ValueError, match="complete grid"):
+        encoder(values[:, :-1])
+
+
+def test_spatial_value_encoder_rejects_mismatched_grid():
+    with pytest.raises(ValueError, match="does not match"):
+        SequenceValueEncoder(1, max_length=16, spatial_shape=(3, 4))
+
+
+def test_spatial_local_blocks_are_interleaved_and_receive_gradients():
+    encoder = SequenceValueEncoder(
+        1,
+        max_length=64,
+        spatial_shape=(8, 8),
+        dim=16,
+        depth=3,
+        num_heads=4,
+        mixer="rrlsso",
+        rank=8,
+        local_spatial_kernel=3,
+        local_spatial_dilations=(1, 2, 3),
+        dropout=0.0,
+    )
+    values = torch.randn(2, 64, 1, requires_grad=True)
+    output = encoder(values)
+    assert output.shape == (2, 16)
+    assert [block.depthwise.dilation for block in encoder.local_spatial_blocks] == [
+        (1, 1), (2, 2), (3, 3)
+    ]
+    output.square().mean().backward()
+    assert encoder.local_spatial_blocks[0].depthwise.weight.grad is not None
+    assert encoder.local_spatial_blocks[-1].pointwise.weight.grad is not None
+
+
+def test_spatial_local_configuration_rejects_ambiguous_depth():
+    with pytest.raises(ValueError, match="match depth"):
+        SequenceValueEncoder(
+            1,
+            max_length=16,
+            spatial_shape=(4, 4),
+            dim=16,
+            depth=2,
+            num_heads=4,
+            local_spatial_kernel=3,
+            local_spatial_dilations=(1,),
+        )
+
+
 def test_low_rank_learned_position_embedding_reduces_long_table():
     full = SequenceValueEncoder(
         3, max_length=1000, dim=64, depth=1, num_heads=4,
@@ -89,6 +166,42 @@ def test_low_rank_learned_position_embedding_reduces_long_table():
     values = torch.randn(2, 20, 3)
     mask = torch.ones(2, 20, dtype=torch.bool)
     assert low_rank(values, mask).shape == (2, 64)
+
+
+def test_multiscale_temporal_stem_is_padding_invariant_and_differentiable():
+    encoder = SequenceValueEncoder(
+        3,
+        max_length=16,
+        dim=16,
+        depth=1,
+        num_heads=4,
+        mixer="rrlsso",
+        rank=8,
+        pooling="meanmax",
+        local_stem_kernels=(3, 7),
+        dropout=0.0,
+    ).eval()
+    values = torch.randn(2, 8, 3, requires_grad=True)
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    padded = torch.cat((values.detach(), torch.randn(2, 5, 3)), dim=1)
+    padded_valid = torch.cat((valid, torch.zeros(2, 5, dtype=torch.bool)), dim=1)
+    expected = encoder(values, valid)
+    actual = encoder(padded, padded_valid)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    expected.square().mean().backward()
+    assert encoder.local_temporal_stem.depthwise[0].weight.grad is not None
+
+
+def test_multiscale_temporal_stem_rejects_even_kernels():
+    with pytest.raises(ValueError, match="positive odd"):
+        SequenceValueEncoder(
+            3,
+            max_length=8,
+            dim=16,
+            depth=1,
+            num_heads=4,
+            local_stem_kernels=(3, 4),
+        )
 
 
 def test_pair_classifier_and_collates():
@@ -131,6 +244,21 @@ def test_stratified_split_is_disjoint_and_keeps_each_class_in_train():
     assert set(train).isdisjoint(validation)
     assert sorted(train + validation) == list(range(len(labels)))
     assert {labels[index] for index in train} == {0, 1, 2}
+
+
+def test_stratified_folds_are_disjoint_balanced_and_cover_validation_once():
+    labels = [0] * 6 + [1] * 6 + [2] * 6
+    validation_sets = []
+    for fold in range(3):
+        train, validation = stratified_fold_indices(labels, 3, fold, seed=11)
+        assert set(train).isdisjoint(validation)
+        assert sorted(train + validation) == list(range(len(labels)))
+        assert [labels[index] for index in validation].count(0) == 2
+        assert [labels[index] for index in validation].count(1) == 2
+        assert [labels[index] for index in validation].count(2) == 2
+        validation_sets.append(set(validation))
+    assert set.union(*validation_sets) == set(range(len(labels)))
+    assert sum(map(len, validation_sets)) == len(labels)
 
 
 def test_classification_metrics_include_multiclass_matthews_correlation():
@@ -279,6 +407,45 @@ def test_packed_cache_manifest_invalidates_stale_tokens(tmp_path: Path):
     assert len(rebuilt[0][0]) == 3
 
 
+def test_aan_reader_accepts_integral_float_labels(tmp_path: Path):
+    source = tmp_path / "aan.tsv"
+    source.write_text(
+        "1.0\tA\tB\tb'first paper'\tb'second paper'\n"
+        "0\tC\tD\tb'third paper'\tb'fourth paper'\n"
+        "0.5\tE\tF\tb'invalid'\tb'label'\n",
+        encoding="utf-8",
+    )
+    assert list(iter_aan(source)) == [
+        ("b'first paper'", "b'second paper'", 1),
+        ("b'third paper'", "b'fourth paper'", 0),
+    ]
+
+
+def test_fixed_byte_vocabulary_handles_utf8_without_training_scan():
+    vocabulary = CharacterVocabulary.from_bytes()
+    encoded = vocabulary.encode_bytes("Aé", max_length=8)
+    assert encoded[:-1] == [
+        vocabulary.lookup[chr(value)] for value in "Aé".encode("utf-8")
+    ]
+    assert encoded[-1] == vocabulary.eos_token_id
+
+
+def test_retrieval_preprocessing_builds_nonempty_byte_cache(tmp_path: Path):
+    source = tmp_path / "data" / "aan"
+    source.mkdir(parents=True)
+    for split in ("train", "eval", "test"):
+        (source / f"new_aan_pairs.{split}.tsv").write_text(
+            "1.0\tA\tB\tb'first paper'\tb'second paper'\n",
+            encoding="utf-8",
+        )
+    train, validation, test, vocabulary = prepare_retrieval(
+        tmp_path / "data", tmp_path / "cache", max_length=32, download=False
+    )
+    assert (len(train), len(validation), len(test)) == (1, 1, 1)
+    assert vocabulary.vocab_size == 259
+    assert train[0][0][-1] == vocabulary.eos_token_id
+
+
 def test_pathfinder_reader_uses_official_metadata_layout(tmp_path: Path):
     root = tmp_path / "pathfinder32"
     metadata = root / "curv_contour_length_14" / "metadata"
@@ -291,24 +458,6 @@ def test_pathfinder_reader_uses_official_metadata_layout(tmp_path: Path):
     values, label = dataset[0]
     assert values.shape == (1024, 1)
     assert label == 1
-
-
-def test_uea_normalization_is_fit_on_training_indices_only():
-    collection = np.asarray(
-        [
-            [[1.0, 2.0, np.nan], [2.0, 4.0, 6.0]],
-            [[3.0, 4.0, 5.0], [8.0, 10.0, 12.0]],
-            [[100.0, 100.0, 100.0], [100.0, 100.0, 100.0]],
-        ],
-        dtype=np.float32,
-    )
-    mean, std = fit_channel_normalizer(collection, [0, 1])
-    assert mean[0] < 10.0
-    dataset = UEACollectionDataset(collection, [0, 1, 1], mean, std, max_length=2)
-    values, label = dataset[0]
-    assert values.shape == (2, 2)
-    assert torch.isfinite(values).all()
-    assert label == 0
 
 
 def test_genomic_tokenizer_and_dataset():
@@ -565,17 +714,17 @@ def test_validation_only_training_never_writes_test_metrics(tmp_path: Path, monk
 
 def test_summary_uses_only_complete_model_dataset_intersection():
     runs = [
-        {"suite": "uea", "dataset": "a", "model": "rrlsso", "accuracy": 0.8,
+        {"suite": "genomic", "dataset": "a", "model": "rrlsso", "accuracy": 0.8,
          "macro_f1": 0.7, "parameters": 10},
-        {"suite": "uea", "dataset": "a", "model": "rrlsso", "accuracy": 1.0,
+        {"suite": "genomic", "dataset": "a", "model": "rrlsso", "accuracy": 1.0,
          "macro_f1": 0.9, "parameters": 10},
-        {"suite": "uea", "dataset": "b", "model": "rrlsso", "accuracy": 0.6,
+        {"suite": "genomic", "dataset": "b", "model": "rrlsso", "accuracy": 0.6,
          "macro_f1": 0.5, "parameters": 10},
     ]
     summary = aggregate(runs)
     reported = [
-        {"suite": "uea", "dataset": "a", "model": "baseline", "accuracy": 0.7},
-        {"suite": "uea", "dataset": "b", "model": "baseline", "accuracy": 0.7},
+        {"suite": "genomic", "dataset": "a", "model": "baseline", "accuracy": 0.7},
+        {"suite": "genomic", "dataset": "b", "model": "baseline", "accuracy": 0.7},
     ]
     ranks = average_ranks(summary, reported)
     by_model = {row["model"]: row for row in ranks}

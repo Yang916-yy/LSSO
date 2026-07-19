@@ -28,13 +28,15 @@ jobs:
       - name: Check repository hygiene
         run: python tools/check_repository_hygiene.py
       - name: Check Python sources
-        run: python -m compileall -q lsso experiments benchmarks integrations tools
+        run: python -m compileall -q lsso experiments benchmarks tools
       - name: Run portable operator tests
         run: >-
           pytest -q
           tests/smoke_test.py
           tests/length_normalization_test.py
           tests/mixer_adapter_test.py
-          tests/rope_lsso_test.py
+          tests/rank_rotary_test.py
+          tests/public_api_test.py
+          tests/trace_normalization_test.py
       - name: Build wheel and source distribution
         run: python -m build

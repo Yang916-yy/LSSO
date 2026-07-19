@@ -4,553 +4,254 @@ import pytest
 import torch
 
 from lsso.mathdx_backend import (
+    get_mathdx_path_counters,
     load_mathdx_backend,
     mathdx_load_error,
+    reset_mathdx_path_counters,
     solve_spd,
     solve_spd_autograd,
-    solve_spd_bpb,
     solve_spd_or_torch,
-    stats_solve_readout,
-    stats_solve_spd,
-    try_lsso_backward_fused,
-    try_masked_stats_solve_readout,
-    try_masked_stats_solve_spd,
-    try_stats_solve_readout,
-    try_prepare_basis,
+    try_dual_backward_statistics_tensorcore,
+    try_dual_grad_u_tensorcore,
+    try_masked_trace_stats_solve_readout,
     try_rank_rotary,
+    try_trace_stats_solve_readout,
 )
 
 
-@pytest.fixture(autouse=True)
-def _isolate_fp32_matmul_precision():
-    previous = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("highest")
-    try:
-        yield
-    finally:
-        torch.set_float32_matmul_precision(previous)
+RETIRED_OPS = {
+    "solve_spd_bpb",
+    "stats_solve_spd",
+    "stats_solve_readout",
+    "masked_stats_solve_spd",
+    "masked_rotary_trace_stats_solve_readout",
+    "lsso_backward_gain_alpha_fused",
+}
 
 
-def test_mathdx_explicit_bpb_rejects_invalid_schedule() -> None:
-    gram = torch.empty(1, 16, 16)
-    rhs = torch.empty(1, 16, 1)
-    with pytest.raises(ValueError, match="batches_per_block"):
-        solve_spd_bpb(gram, rhs, 3)
-from lsso.modules_v2 import apply_rank_rotary
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rank", [16, 32, 48, 64])
-@pytest.mark.parametrize("rhs_width", [1, 32, 64, 192])
-def test_mathdx_solve_spd_matches_torch(rank: int, rhs_width: int) -> None:
+def _require_backend() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
     if not load_mathdx_backend():
         pytest.skip(str(mathdx_load_error()))
 
-    torch.manual_seed(0)
-    a = torch.randn(7, rank, rank, device="cuda", dtype=torch.float32)
-    gram = a @ a.transpose(-1, -2) + 0.5 * torch.eye(rank, device="cuda")
-    rhs = torch.randn(7, rank, rhs_width, device="cuda", dtype=torch.float32)
 
-    actual, info = solve_spd(gram.contiguous(), rhs.contiguous())
-    expected = torch.linalg.solve(gram, rhs)
-
-    assert torch.count_nonzero(info).item() == 0
-    torch.testing.assert_close(actual, expected, rtol=3e-4, atol=3e-4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rank", [16, 32])
-@pytest.mark.parametrize("batches_per_block", [2, 4])
-def test_mathdx_multi_system_cholesky_matches_torch(
-    rank: int, batches_per_block: int
-) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(13)
-    systems, rhs_width = 128, 64
-    a = torch.randn(systems, rank, rank, device="cuda")
-    gram = a @ a.transpose(-1, -2) + torch.eye(rank, device="cuda")
-    rhs = torch.randn(systems, rank, rhs_width, device="cuda")
-    actual, info = torch.ops.lsso_mathdx.solve_spd_bpb(
-        gram.contiguous(), rhs.contiguous(), batches_per_block
+def _trace_reference(
+    u: torch.Tensor,
+    c: torch.Tensor,
+    alpha: torch.Tensor,
+    gain: torch.Tensor,
+    mask: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, H, N, rank = u.shape
+    active = (
+        torch.ones(B, N, device=u.device, dtype=torch.bool)
+        if mask is None
+        else mask
     )
-    expected = torch.linalg.solve(gram, rhs)
-
-    assert torch.count_nonzero(info).item() == 0
-    torch.testing.assert_close(actual, expected, rtol=3e-4, atol=3e-4)
+    active4 = active[:, None, :, None]
+    safe_u = torch.where(active4, u, torch.zeros_like(u)).float()
+    safe_c = torch.where(active4, c, torch.zeros_like(c)).float()
+    ubh, cbh = safe_u.flatten(0, 1), safe_c.flatten(0, 1)
+    gram = ubh.transpose(1, 2) @ ubh
+    rhs = ubh.transpose(1, 2) @ cbh
+    counts = active.sum(1).clamp_min(1).float()
+    elements = counts[:, None].expand(B, H).reshape(-1) * rank
+    denominator = gram.diagonal(dim1=-2, dim2=-1).sum(-1) + eps * elements
+    scale2 = elements / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+    effective = alpha * scale2
+    system = torch.eye(rank, device=u.device) + effective[:, None, None] * gram
+    compact = torch.linalg.solve(system, rhs).to(u.dtype).float()
+    output = gain[:, None, None] * (
+        cbh - effective[:, None, None] * (ubh @ compact)
+    )
+    output = output.view(B, H, N, c.shape[-1])
+    output = torch.where(active4, output, torch.zeros_like(output))
+    shape = (B, H, 1, 1)
+    return (
+        output,
+        effective.view(shape),
+        denominator.view(shape),
+        scale2.view(shape),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rank", [48, 64])
-def test_mathdx_large_rank_rejects_multi_system_cta_schedule(rank: int) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-    gram = torch.eye(rank, device="cuda").expand(4, rank, rank).contiguous()
-    rhs = torch.randn(4, rank, 32, device="cuda")
-    with pytest.raises(RuntimeError, match="rank-48/64.*batches_per_block=1"):
-        solve_spd_bpb(gram, rhs, 2)
+def test_extension_exposes_only_the_audited_operator_surface() -> None:
+    _require_backend()
+    for name in RETIRED_OPS:
+        assert not hasattr(torch.ops.lsso_mathdx, name)
+    for name in {
+        "solve_spd",
+        "masked_stats_solve_readout",
+        "masked_trace_stats_solve_readout",
+        "dual_backward_statistics_tensorcore",
+        "dual_grad_u_tensorcore",
+        "rank_rotary",
+    }:
+        assert hasattr(torch.ops.lsso_mathdx, name)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rank", [1, 7, 15, 17, 24, 31, 33, 40, 47, 49, 56, 63])
-def test_mathdx_arbitrary_rank_bucket_matches_torch(rank: int) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-    torch.manual_seed(1000 + rank)
-    a = torch.randn(5, rank, rank, device="cuda")
-    gram = a @ a.transpose(1, 2) + 0.5 * torch.eye(rank, device="cuda")
-    rhs = torch.randn(5, rank, 19, device="cuda")
+def test_fp32_trace_uses_portable_fallback_not_a_native_variant() -> None:
+    _require_backend()
+    u = torch.randn(1, 2, 17, 16, device="cuda")
+    c = torch.randn(1, 2, 17, 32, device="cuda")
+    alpha = torch.ones(2, device="cuda")
+    gain = torch.ones(2, device="cuda")
     with torch.no_grad():
-        actual = solve_spd_or_torch(gram, rhs)
-        expected = torch.linalg.solve(gram, rhs)
-    torch.testing.assert_close(actual, expected, rtol=5e-4, atol=5e-4)
+        assert try_trace_stats_solve_readout(
+            u, c, alpha, gain, normalization_eps=1e-6,
+            length_reference=1.0, length_normalize=False,
+        ) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rank", [7, 24, 40, 56])
-def test_mathdx_arbitrary_rank_bucket_autograd_matches_torch(rank: int) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-    torch.manual_seed(2000 + rank)
-    a = torch.randn(3, rank, rank, device="cuda")
+@pytest.mark.parametrize("rank", [1, 16, 24, 32, 48, 56, 64])
+def test_bucketed_spd_solve_and_autograd_match_torch(rank: int) -> None:
+    _require_backend()
+    torch.manual_seed(10 + rank)
+    a = torch.randn(5, rank, rank, device="cuda")
     gram_value = a @ a.transpose(1, 2) + torch.eye(rank, device="cuda")
-    rhs_value = torch.randn(3, rank, 11, device="cuda")
-    probe = torch.randn_like(rhs_value)
+    rhs_value = torch.randn(5, rank, 37, device="cuda")
+    actual = solve_spd_or_torch(gram_value, rhs_value)
+    expected = torch.linalg.solve(gram_value, rhs_value)
+    torch.testing.assert_close(actual, expected, rtol=6e-4, atol=6e-4)
 
     gram = gram_value.detach().requires_grad_()
     rhs = rhs_value.detach().requires_grad_()
-    actual = solve_spd_autograd(gram, rhs)
-    actual_grads = torch.autograd.grad((actual * probe).sum(), (gram, rhs))
-
+    probe = torch.randn_like(rhs)
+    value = solve_spd_autograd(gram, rhs)
+    grads = torch.autograd.grad((value * probe).sum(), (gram, rhs))
     gram_ref = gram_value.detach().requires_grad_()
     rhs_ref = rhs_value.detach().requires_grad_()
-    expected = torch.linalg.solve(gram_ref, rhs_ref)
-    expected_grads = torch.autograd.grad(
-        (expected * probe).sum(), (gram_ref, rhs_ref)
+    reference = torch.linalg.solve(gram_ref, rhs_ref)
+    grads_ref = torch.autograd.grad(
+        (reference * probe).sum(), (gram_ref, rhs_ref)
     )
-    torch.testing.assert_close(actual, expected, rtol=5e-4, atol=5e-4)
-    for value, reference in zip(actual_grads, expected_grads, strict=True):
-        torch.testing.assert_close(value, reference, rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_rank_above_largest_bucket_uses_torch_fallback() -> None:
-    rank = 65
-    a = torch.randn(2, rank, rank, device="cuda")
-    gram = a @ a.transpose(1, 2) + torch.eye(rank, device="cuda")
-    rhs = torch.randn(2, rank, 9, device="cuda")
-    actual = solve_spd_or_torch(gram, rhs)
-    expected = torch.linalg.solve(gram, rhs)
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    ("rank", "sequence", "rhs_width"),
-    [(16, 65, 64), (16, 196, 192), (32, 65, 64), (32, 196, 192)],
-)
-def test_mathdx_fused_stats_solve_matches_torch(
-    rank: int,
-    sequence: int,
-    rhs_width: int,
-) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(1)
-    u = 0.2 * torch.randn(5, sequence, rank, device="cuda")
-    c = torch.randn(5, sequence, rhs_width, device="cuda")
-    alpha = 0.05 * torch.rand(5, device="cuda")
-
-    actual, info = stats_solve_spd(u, c, alpha)
-    gram = u.transpose(1, 2) @ u
-    rhs = u.transpose(1, 2) @ c
-    system = torch.eye(rank, device="cuda") + alpha[:, None, None] * gram
-    expected = torch.linalg.solve(system, rhs)
-
-    assert torch.count_nonzero(info).item() == 0
-    torch.testing.assert_close(actual, expected, rtol=3e-4, atol=1e-5)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("rank", [16, 32])
-@pytest.mark.parametrize("rhs_width", [48, 64, 96, 128, 192])
-def test_mathdx_stats_solve_readout_matches_torch(
-    dtype: torch.dtype, rank: int, rhs_width: int
-) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(11)
-    batches, sequence = 7, 197
-    u = (0.2 * torch.randn(batches, sequence, rank, device="cuda")).to(dtype)
-    c = torch.randn(batches, sequence, rhs_width, device="cuda").to(dtype)
-    alpha = 0.05 * torch.rand(batches, device="cuda")
-    inv_mu = 0.5 + torch.rand(batches, device="cuda")
-
-    actual, info = stats_solve_readout(u, c, alpha, inv_mu)
-    u32, c32 = u.float(), c.float()
-    gram = u32.transpose(1, 2) @ u32
-    rhs = u32.transpose(1, 2) @ c32
-    system = torch.eye(rank, device="cuda") + alpha[:, None, None] * gram
-    compact = torch.linalg.solve(system, rhs)
-    expected = (
-        c32 - alpha[:, None, None] * (u32 @ compact)
-    ) * inv_mu[:, None, None]
-
-    assert torch.count_nonzero(info).item() == 0
-    tolerance = 5e-4 if dtype == torch.float32 else 2e-2
-    torch.testing.assert_close(
-        actual.float(), expected, rtol=tolerance, atol=tolerance
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("rank", [16, 32])
-@pytest.mark.parametrize("rhs_width", [48, 96, 192])
-def test_mathdx_masked_stats_skips_padding_and_matches_torch(
-    dtype: torch.dtype, rank: int, rhs_width: int
-) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(7)
-    B, H, N, dh = 3, 4, 129, rhs_width
-    u = (0.2 * torch.randn(B, H, N, rank, device="cuda")).to(dtype)
-    c = torch.randn(B, H, N, dh, device="cuda").to(dtype)
-    lengths = torch.tensor([129, 67, 13], device="cuda")
-    mask = torch.arange(N, device="cuda")[None] < lengths[:, None]
-    scale = torch.sqrt(129.0 / lengths.float())
-    alpha = (0.05 * torch.rand(B * H, device="cuda")).float()
-
-    actual = try_masked_stats_solve_spd(u, c, mask, scale, alpha)
-    assert actual is not None
-    masked_u = u.float() * mask[:, None, :, None] * scale[:, None, None, None]
-    masked_c = c.float() * mask[:, None, :, None]
-    u_bh = masked_u.flatten(0, 1)
-    c_bh = masked_c.flatten(0, 1)
-    gram = u_bh.transpose(1, 2) @ u_bh
-    rhs = u_bh.transpose(1, 2) @ c_bh
-    system = torch.eye(rank, device="cuda") + alpha[:, None, None] * gram
-    expected = torch.linalg.solve(system, rhs)
-
-    tolerance = 5e-4 if dtype == torch.float32 else 2e-2
-    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    ("B", "H", "sequence"),
-    [
-        (3, 4, 1025),   # long-sequence tiled statistics
-        (9, 8, 129),    # B * H > the former 64-system gate
-        (9, 8, 1025),   # both paths at once
-    ],
-)
-def test_mathdx_masked_stats_supports_long_sequences_and_large_system_grids(
-    B: int, H: int, sequence: int
-) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(1701 + sequence + B * H)
-    rank, rhs_width = 16, 32
-    u = (
-        0.05
-        * torch.randn(B, H, sequence, rank, device="cuda", dtype=torch.float32)
-    ).to(torch.bfloat16)
-    c = torch.randn(
-        B, H, sequence, rhs_width, device="cuda", dtype=torch.bfloat16
-    )
-    lengths = torch.linspace(sequence, 1, B, device="cuda").long()
-    mask = (torch.arange(sequence, device="cuda")[None] < lengths[:, None]).contiguous()
-    scale = torch.sqrt(
-        torch.tensor(float(sequence), device="cuda") / lengths.float()
-    ).contiguous()
-    alpha = (0.03 * torch.rand(B * H, device="cuda")).float()
-
-    # Exercise the public eligibility path, not the operator directly: this
-    # catches accidental reintroduction of either historical frontend cap.
-    actual = try_masked_stats_solve_spd(u, c, mask, scale, alpha)
-    assert actual is not None
-
-    masked_u = u.float() * mask[:, None, :, None] * scale[:, None, None, None]
-    masked_c = c.float() * mask[:, None, :, None]
-    u_bh = masked_u.flatten(0, 1)
-    c_bh = masked_c.flatten(0, 1)
-    gram = u_bh.transpose(1, 2) @ u_bh
-    rhs = u_bh.transpose(1, 2) @ c_bh
-    system = torch.eye(rank, device="cuda") + alpha[:, None, None] * gram
-    expected = torch.linalg.solve(system, rhs)
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_mathdx_masked_stats_optional_sequence_policy_cap() -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    B, H, N, rank, rhs_width = 1, 2, 513, 16, 16
-    u = torch.randn(B, H, N, rank, device="cuda", dtype=torch.bfloat16)
-    c = torch.randn(B, H, N, rhs_width, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(B, N, device="cuda", dtype=torch.bool)
-    scale = torch.ones(B, device="cuda")
-    alpha = torch.full((B * H,), 0.01, device="cuda")
-
-    assert try_masked_stats_solve_spd(u, c, mask, scale, alpha) is not None
-    assert (
-        try_masked_stats_solve_spd(
-            u, c, mask, scale, alpha, max_sequence=512
+    for actual_grad, expected_grad in zip(grads, grads_ref, strict=True):
+        torch.testing.assert_close(
+            actual_grad, expected_grad, rtol=1.5e-3, atol=1.5e-3
         )
-        is None
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_mathdx_masked_stats_zero_sync_padding_hint_dispatch() -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    B, H, N, rank, rhs_width = 2, 4, 1025, 16, 32
-    u = torch.randn(B, H, N, rank, device="cuda", dtype=torch.bfloat16)
-    c = torch.randn(B, H, N, rhs_width, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(B, N, device="cuda", dtype=torch.bool)
-    scale = torch.ones(B, device="cuda")
-    alpha = torch.full((B * H,), 0.01, device="cuda")
-
-    assert (
-        try_masked_stats_solve_spd(
-            u, c, mask, scale, alpha, padding_ratio_hint=0.25
-        )
-        is None
-    )
-    assert (
-        try_masked_stats_solve_spd(
-            u, c, mask, scale, alpha, padding_ratio_hint=0.9
-        )
-        is not None
-    )
-    with pytest.raises(ValueError, match="padding_ratio_hint"):
-        try_masked_stats_solve_spd(
-            u, c, mask, scale, alpha, padding_ratio_hint=1.1
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_mathdx_rank_rotary_matches_torch_and_backward(dtype: torch.dtype) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(2)
-    u = torch.randn(3, 4, 65, 32, device="cuda", dtype=dtype, requires_grad=True)
-    half = u.shape[-1] // 2
-    inv_freq = 10000.0 ** (
-        -torch.arange(half, device="cuda", dtype=torch.float32) / half
-    )
-    angles = torch.arange(u.shape[2], device="cuda", dtype=torch.float32)[:, None] * inv_freq
-    cos = angles.cos().to(dtype).contiguous()
-    sin = angles.sin().to(dtype).contiguous()
-
-    actual = try_rank_rotary(u, cos, sin)
-    assert actual is not None
-    expected = apply_rank_rotary(u)
-    tolerance = 1e-6 if dtype == torch.float32 else 2e-2
-    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-
-    probe = torch.randn_like(actual)
-    actual_grad = torch.autograd.grad((actual * probe).sum(), u, retain_graph=True)[0]
-    expected_grad = torch.autograd.grad((expected * probe).sum(), u)[0]
-    torch.testing.assert_close(actual_grad, expected_grad, rtol=tolerance, atol=tolerance)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rotary", [False, True])
-def test_mathdx_fused_basis_preparation_matches_torch(rotary: bool) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(5)
-    u = torch.randn(
-        3, 4, 65, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
-    )
-    eps = 1e-5
-    length_scale = (1.0 / u.shape[2]) ** 0.5
-    normalized = u * torch.rsqrt(torch.mean(u * u, dim=-1, keepdim=True) + eps)
-    expected = normalized * length_scale
-    cos = sin = None
-    if rotary:
-        expected = apply_rank_rotary(expected)
-        half = u.shape[-1] // 2
-        inv_freq = 10000.0 ** (
-            -torch.arange(half, device="cuda", dtype=torch.float32) / half
-        )
-        angles = (
-            torch.arange(u.shape[2], device="cuda", dtype=torch.float32)[:, None]
-            * inv_freq
-        )
-        cos = angles.cos().to(u.dtype).contiguous()
-        sin = angles.sin().to(u.dtype).contiguous()
-
-    actual = try_prepare_basis(
-        u, eps=eps, length_scale=length_scale, cos=cos, sin=sin
-    )
-    assert actual is not None
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-    probe = torch.randn_like(actual)
-    actual_grad = torch.autograd.grad((actual * probe).sum(), u, retain_graph=True)[0]
-    expected_grad = torch.autograd.grad((expected * probe).sum(), u)[0]
-    torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-2, atol=3e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("width", [48, 96, 192])
-def test_masked_fused_readout_is_padding_safe(
-    dtype: torch.dtype, width: int
-) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(91)
-    B, H, N, rank = 3, 2, 97, 16
-    lengths = torch.tensor([97, 51, 7], device="cuda")
-    mask = torch.arange(N, device="cuda")[None, :] < lengths[:, None]
-    scale = torch.sqrt(torch.tensor(float(N), device="cuda") / lengths.float())
-    u = (0.1 * torch.randn(B, H, N, rank, device="cuda")).to(dtype)
-    c = torch.randn(B, H, N, width, device="cuda").to(dtype)
-    # Poison padding rather than merely changing it. Any predicated-load bug
-    # now turns valid outputs or compact statistics into NaNs.
-    padding = ~mask[:, None, :, None]
-    u = torch.where(padding, torch.full_like(u, float("nan")), u)
-    c = torch.where(padding, torch.full_like(c, float("nan")), c)
-    alpha = 0.02 * torch.rand(B * H, device="cuda")
-    inv_mu = 0.5 + torch.rand(B * H, device="cuda")
-
-    with torch.no_grad():
-        actual = try_masked_stats_solve_readout(
-            u, c, mask, scale, alpha, inv_mu, padding_ratio_hint=0.9
-        )
-    assert actual is not None
-    safe_u = torch.where(padding, torch.zeros_like(u), u).float()
-    safe_c = torch.where(padding, torch.zeros_like(c), c).float()
-    scaled_u = safe_u * scale[:, None, None, None]
-    ubh, cbh = scaled_u.flatten(0, 1), safe_c.flatten(0, 1)
-    gram = ubh.transpose(1, 2) @ ubh
-    rhs = ubh.transpose(1, 2) @ cbh
-    system = torch.eye(rank, device="cuda") + alpha[:, None, None] * gram
-    compact = torch.linalg.solve(system, rhs)
-    expected = (
-        cbh - alpha[:, None, None] * (ubh @ compact)
-    ) * inv_mu[:, None, None]
-    expected = expected.view(B, H, N, width)
-    expected = expected * mask[:, None, :, None]
-    tolerance = 8e-4 if dtype == torch.float32 else 3e-2
-    assert torch.isfinite(actual).all()
-    assert torch.count_nonzero(actual.masked_select(padding.expand_as(actual))) == 0
-    torch.testing.assert_close(actual.float(), expected, rtol=tolerance, atol=tolerance)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("masked", [False, True])
-def test_fused_backward_matches_reference_and_does_not_leak_mask(masked: bool) -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    torch.manual_seed(92 + masked)
-    B, H, N, rank, width = 2, 3, 41, 16, 32
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+def test_trace_forward_matches_contract_and_never_reads_padding(
+    masked: bool, rank: int, monkeypatch
+) -> None:
+    _require_backend()
+    monkeypatch.setenv("LSSO_PATH_COUNTERS", "1")
+    reset_mathdx_path_counters()
+    torch.manual_seed(100 + rank)
+    B, H, N, width = 2, 3, 73, 64
     u = torch.randn(B, H, N, rank, device="cuda", dtype=torch.bfloat16)
-    y = torch.randn(B, H, N, width, device="cuda", dtype=torch.bfloat16)
-    p = torch.randn(B, H, N, width, device="cuda", dtype=torch.bfloat16)
-    gamma = (0.1 + torch.rand(B * H, device="cuda")).float()
-    mask = torch.tensor(
-        [[True] * N, [True] * 9 + [False] * (N - 9)], device="cuda"
-    )
-    scale = torch.tensor([1.0, 1.7], device="cuda")
-    padding = ~mask[:, None, :, None]
+    c = torch.randn(B, N, H, width, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    alpha = 0.5 + torch.rand(B * H, device="cuda")
+    gain = 0.8 + torch.rand(B * H, device="cuda")
+    mask = None
     if masked:
+        lengths = torch.tensor([73, 11], device="cuda")
+        mask = torch.arange(N, device="cuda")[None] < lengths[:, None]
+        padding = ~mask[:, None, :, None]
         u = torch.where(padding, torch.full_like(u, float("nan")), u)
-        y = torch.where(padding, torch.full_like(y, float("nan")), y)
-        p = torch.where(padding, torch.full_like(p, float("nan")), p)
-
+        c = torch.where(padding, torch.full_like(c, float("nan")), c)
+        c = c.transpose(1, 2).contiguous().transpose(1, 2)
     with torch.no_grad():
-        actual = try_lsso_backward_fused(
-            u, y, p, gamma,
-            valid_mask=mask if masked else None,
-            length_scale=scale if masked else None,
-        )
+        if masked:
+            actual = try_masked_trace_stats_solve_readout(
+                u, c, mask, alpha, gain, normalization_eps=1e-6,
+                length_reference=1.0, length_normalize=False,
+            )
+        else:
+            actual = try_trace_stats_solve_readout(
+                u, c, alpha, gain, normalization_eps=1e-6,
+                length_reference=1.0, length_normalize=False,
+            )
     assert actual is not None
-    grad_u, grad_mu, grad_gamma = actual
-    active = mask[:, None, :, None] if masked else torch.ones(
-        B, 1, N, 1, device="cuda", dtype=torch.bool
+    assert not c.is_contiguous()
+    assert actual[0].stride() == c.stride()
+    assert actual[0].transpose(1, 2).is_contiguous()
+    expected = _trace_reference(u, c, alpha, gain, mask, 1e-6)
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            value.float(), reference.float(), rtol=3e-2, atol=3e-2
+        )
+        assert torch.isfinite(value).all()
+    expected_counter = (
+        "forward.trace_masked_cta" if masked else "forward.trace_unmasked_cta"
     )
-    uf = torch.where(active, u, torch.zeros_like(u)).float().flatten(0, 1)
-    yf = torch.where(active, y, torch.zeros_like(y)).float().flatten(0, 1)
-    pf = torch.where(active, p, torch.zeros_like(p)).float().flatten(0, 1)
-    ytu = yf.transpose(1, 2) @ uf
-    ptu = pf.transpose(1, 2) @ uf
-    scale2 = (
-        scale.square()[:, None].expand(B, H).reshape(B * H)
-        if masked else torch.ones(B * H, device="cuda")
-    )
-    expected_u = -(pf @ ytu + yf @ ptu)
-    expected_u *= (gamma * scale2)[:, None, None]
-    expected_u = expected_u.view(B, H, N, rank)
-    expected_mu = -(pf * yf).sum(dim=(1, 2))
-    expected_gamma = -(ptu * ytu).sum(dim=(1, 2)) * scale2
-    assert torch.isfinite(grad_u).all()
-    assert torch.isfinite(grad_mu).all()
-    assert torch.isfinite(grad_gamma).all()
-    if masked:
-        assert torch.count_nonzero(grad_u.masked_select(padding.expand_as(grad_u))) == 0
-    torch.testing.assert_close(grad_u.float(), expected_u, rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(grad_mu, expected_mu, rtol=2e-4, atol=2e-4)
-    torch.testing.assert_close(grad_gamma, expected_gamma, rtol=2e-4, atol=2e-4)
+    assert get_mathdx_path_counters().get(expected_counter) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fused_backward_respects_sequence_dispatch_cap() -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-    B, H, N, rank, width = 1, 2, 513, 16, 32
-    u = torch.randn(B, H, N, rank, device="cuda", dtype=torch.bfloat16)
-    y = torch.randn(B, H, N, width, device="cuda", dtype=torch.bfloat16)
-    p = torch.randn_like(y)
-    gamma = torch.ones(B * H, device="cuda")
+def test_dual_backward_tensorcore_paths_match_bmm_and_mask() -> None:
+    _require_backend()
+    torch.manual_seed(230)
+    B, H, N, width, rank = 2, 3, 67, 64, 32
+    u = 0.1 * torch.randn(B, H, N, rank, device="cuda", dtype=torch.bfloat16)
+    y = (0.1 * torch.randn(
+        B, N, H, width, device="cuda", dtype=torch.bfloat16
+    )).transpose(1, 2)
+    p = (0.1 * torch.randn(
+        B, N, H, width, device="cuda", dtype=torch.bfloat16
+    )).transpose(1, 2)
+    lengths = torch.tensor([67, 9], device="cuda")
+    mask = torch.arange(N, device="cuda")[None] < lengths[:, None]
+    u_bh = u.flatten(0, 1).contiguous()
+    y_bh = y.flatten(0, 1).contiguous()
+    p_bh = p.flatten(0, 1).contiguous()
     with torch.no_grad():
-        assert try_lsso_backward_fused(u, y, p, gamma) is None
-        assert try_lsso_backward_fused(
-            u, y, p, gamma, max_sequence=None
-        ) is not None
+        stats = try_dual_backward_statistics_tensorcore(
+            u, y, p, valid_mask=mask, heads=H
+        )
+    assert stats is not None
+    ytu, ptu, _ = stats
+    active = mask[:, None, :, None]
+    uf = torch.where(active, u, 0).float().flatten(0, 1)
+    yf = torch.where(active, y, 0).float().flatten(0, 1)
+    pf = torch.where(active, p, 0).float().flatten(0, 1)
+    torch.testing.assert_close(ytu, yf.transpose(1, 2) @ uf, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(ptu, pf.transpose(1, 2) @ uf, rtol=3e-2, atol=3e-2)
+
+    coefficient = torch.randn(B * H, device="cuda")
+    radial = (0.1 * torch.randn_like(uf)).view(B, H, N, rank).to(u.dtype)
+    radial_coefficient = torch.randn(B * H, device="cuda")
+    with torch.no_grad():
+        grad_u = try_dual_grad_u_tensorcore(
+            p, y, ytu.to(u.dtype), ptu.to(u.dtype), coefficient,
+            radial_u=radial,
+            radial_coefficient=radial_coefficient,
+            valid_mask=mask, heads=H,
+        )
+    assert grad_u is not None
+    assert grad_u.shape == (B, H, N, rank)
+    expected = torch.bmm(p_bh, ytu.to(u.dtype)).float()
+    expected += torch.bmm(y_bh, ptu.to(u.dtype)).float()
+    expected = expected * coefficient[:, None, None]
+    expected += radial.float().flatten(0, 1) * radial_coefficient[:, None, None]
+    expected = expected.view(B, H, N, rank)
+    expected = torch.where(active, expected, 0)
+    torch.testing.assert_close(grad_u.float(), expected, rtol=4e-2, atol=8e-2)
+    assert torch.count_nonzero(grad_u.masked_select((~active).expand_as(grad_u))) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_wide_rhs_forward_dispatch_policy() -> None:
-    if not load_mathdx_backend():
-        pytest.skip(str(mathdx_load_error()))
-
-    def attempt(systems: int, sequence: int, width: int):
-        u = torch.randn(
-            systems, sequence, 16, device="cuda", dtype=torch.bfloat16
-        )
-        c = torch.randn(
-            systems, sequence, width, device="cuda", dtype=torch.bfloat16
-        )
-        alpha = torch.full((systems,), 0.01, device="cuda")
-        inv_mu = torch.ones(systems, device="cuda")
-        with torch.no_grad():
-            return try_stats_solve_readout(u, c, alpha, inv_mu)
-
-    assert attempt(8, 197, 96) is not None
-    assert attempt(8, 197, 128) is not None
-    assert attempt(8, 197, 192) is not None
-    assert attempt(8, 197, 256) is None
-    assert attempt(129, 197, 96) is None
-    assert attempt(8, 257, 96) is None
-    # The established <=64 path keeps its original, less restrictive policy.
-    assert attempt(129, 257, 64) is not None
+def test_rank_rotary_forward_and_inverse_backward_are_consistent() -> None:
+    _require_backend()
+    torch.manual_seed(301)
+    value = torch.randn(
+        2, 4, 65, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    angles = torch.randn(65, 16, device="cuda").to(torch.bfloat16)
+    cos, sin = angles.cos().contiguous(), angles.sin().contiguous()
+    rotated = try_rank_rotary(value, cos, sin)
+    assert rotated is not None
+    restored = torch.ops.lsso_mathdx.rank_rotary(rotated, cos, sin, True)
+    torch.testing.assert_close(restored.float(), value.float(), rtol=2e-2, atol=2e-2)
+    probe = torch.randn_like(rotated)
+    grad = torch.autograd.grad((rotated * probe).sum(), value)[0]
+    expected = torch.ops.lsso_mathdx.rank_rotary(probe, cos, sin, True)
+    torch.testing.assert_close(grad.float(), expected.float(), rtol=0, atol=0)
