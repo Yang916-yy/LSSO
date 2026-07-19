@@ -101,6 +101,16 @@ def command_for(
         "--local-motif-kernel", str(frozen["local_motif_kernel"]),
         "--training-profile", str(recipe["training_profile"]),
     ]
+    regularization = frozen.get("regularization", {})
+    if mixer == "rrlsso" and regularization:
+        command += [
+            "--rrlsso-gain-reg",
+            str(regularization["gain_anchor_weight_base144"]),
+            "--rrlsso-alpha-reg",
+            str(regularization["alpha_saturation_weight_base144"]),
+            "--rrlsso-alpha-saturation",
+            str(regularization.get("alpha_saturation_fraction", 0.8)),
+        ]
     if recipe.get("posthoc_rc_eval", False):
         command.append("--posthoc-rc-eval")
     if args.data_root:

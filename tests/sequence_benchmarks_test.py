@@ -619,7 +619,13 @@ def test_shared_trainer_writes_and_resumes_checkpoints(tmp_path: Path, monkeypat
         num_heads=2, mixer="rrlsso", rank=4, dropout=0.0,
     )
     model = SequenceClassifier(encoder, 2)
-    config = TrainingConfig(output=str(tmp_path / "run"), epochs=1, seed=0)
+    config = TrainingConfig(
+        output=str(tmp_path / "run"),
+        epochs=1,
+        seed=0,
+        rrlsso_gain_reg=1e-4,
+        rrlsso_alpha_reg=1e-4,
+    )
     result = train_classifier(
         model,
         train,
@@ -636,6 +642,16 @@ def test_shared_trainer_writes_and_resumes_checkpoints(tmp_path: Path, monkeypat
     state = torch.load(tmp_path / "run" / "last.pt", map_location="cpu", weights_only=False)
     assert state["run_config"]["source_revision"]["git_commit"]
     assert isinstance(state["run_config"]["argv"], list)
+    assert state["run_config"]["rrlsso_gain_scalars"] == 2
+    assert state["run_config"]["rrlsso_effective_gain_mean_weight"] == pytest.approx(
+        1e-4 * 2 / 144
+    )
+    assert state["rrlsso_gain_reference"]
+    assert {group["weight_decay"] for group in state["optimizer"]["param_groups"]} == {
+        0.0,
+        0.01,
+    }
+    assert "gain_anchor_rms" in state["metrics"]
     # A completed one-epoch run can be loaded and evaluated without retraining.
     train_classifier(
         model,
