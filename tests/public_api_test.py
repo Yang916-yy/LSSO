@@ -1,5 +1,4 @@
-import tomllib
-from pathlib import Path
+from importlib.metadata import version
 
 import lsso
 import lsso.backends
@@ -16,7 +15,4 @@ def test_public_namespaces_export_supported_symbols() -> None:
 
 
 def test_package_version_matches_project_metadata() -> None:
-    metadata = tomllib.loads(
-        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
-    )
-    assert lsso.__version__ == metadata["project"]["version"]
+    assert lsso.__version__ == version("lsso-operator")
