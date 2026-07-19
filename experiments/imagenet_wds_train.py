@@ -722,7 +722,10 @@ def train(args: argparse.Namespace) -> None:
             writer.writeheader()
         for epoch in range(start_epoch, args.epochs):
             model.train()
-            optimizer.zero_grad(set_to_none=True)
+            # Apex's deprecated FusedLAMB does not expose PyTorch's
+            # set_to_none keyword. Clearing through the model preserves the
+            # desired None-gradient semantics for every optimizer backend.
+            model.zero_grad(set_to_none=True)
             started = time.time()
             torch.cuda.reset_peak_memory_stats()
             loss_sum = data_loss_sum = regularization_sum = 0.0
@@ -782,7 +785,7 @@ def train(args: argparse.Namespace) -> None:
                     scaler.update()
                     if sample_diagnostics:
                         sampled_updates = solve_update_norms(model, sampled_parameters_before)
-                    optimizer.zero_grad(set_to_none=True)
+                    model.zero_grad(set_to_none=True)
                     global_update += 1
                     if model_ema is not None:
                         model_ema.update(model)
@@ -807,7 +810,7 @@ def train(args: argparse.Namespace) -> None:
                 scaler.update()
                 if args.rrlsso_extended_diagnostics:
                     sampled_updates = solve_update_norms(model, sampled_parameters_before)
-                optimizer.zero_grad(set_to_none=True)
+                model.zero_grad(set_to_none=True)
                 global_update += 1
                 if model_ema is not None:
                     model_ema.update(model)
