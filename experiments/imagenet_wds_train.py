@@ -70,6 +70,19 @@ def hf_shard_filenames(split: str) -> list[str]:
     ]
 
 
+def hf_split_cache_complete(
+    split: str, cache_dir: Path, *, shard_limit: int = 0
+) -> bool:
+    filenames = hf_shard_filenames(split)
+    if shard_limit:
+        filenames = filenames[:shard_limit]
+    return all(
+        (cache_dir / filename).is_file()
+        and (cache_dir / filename).stat().st_size > 0
+        for filename in filenames
+    )
+
+
 def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
     helper = ROOT / "tools" / "hf_wds_stream.py"
     return [
@@ -209,7 +222,9 @@ def local_shards(root: Path, split: str) -> list[str]:
     return shards
 
 
-def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
+def make_loaders(
+    args: argparse.Namespace, *, train_seed_offset: int = 0
+) -> tuple[DataLoader, DataLoader]:
     train_transform = (
         three_augment_transform(args.image_size)
         if args.augmentation == "three_augment"
@@ -223,7 +238,14 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         factory = local_webdataset
     else:
         cache_dir = Path(args.cache_dir)
-        train_shards = shard_commands("train", cache_dir, args.hf_repo)
+        train_cache_hot = hf_split_cache_complete(
+            "train", cache_dir, shard_limit=args.shard_limit
+        )
+        train_shards = (
+            [str(cache_dir / filename) for filename in hf_shard_filenames("train")]
+            if train_cache_hot
+            else shard_commands("train", cache_dir, args.hf_repo)
+        )
         val_shards = shard_commands("validation", cache_dir, args.hf_repo)
 
         def factory(shards, *, shardshuffle, seed):
@@ -247,9 +269,11 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     train = factory(
         train_shards,
         shardshuffle=min(100, len(train_shards)) if len(train_shards) > 1 else False,
-        seed=args.seed,
+        seed=args.seed + train_seed_offset,
     ).compose(
-        wds.detshuffle(args.shuffle_buffer, seed=args.seed + 1009),
+        wds.detshuffle(
+            args.shuffle_buffer, seed=args.seed + 1009 + train_seed_offset
+        ),
         partial(
             virtual_group_repeated_samples,
             repeats=args.repeated_aug,
@@ -273,13 +297,11 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         batch_size=None,
         num_workers=args.workers,
         pin_memory=True,
-        # A finite remote epoch stops before the underlying shard stream is
-        # exhausted (notably with repeated augmentation).  Persistent workers
-        # would therefore keep prefetched train-shard pipes alive while the
-        # validation pool starts downloading validation shards.  Tear the
-        # remote pool down at the epoch boundary so the two split streams never
-        # contend.  Fully local WDS has no download pipe and can stay resident.
-        persistent_workers=args.workers > 0 and bool(args.local_wds_dir),
+        # Cold remote streams must terminate before the cache barrier and
+        # validation. Once every train shard is local, use direct tar paths and
+        # retain the worker pool across all subsequent epochs.
+        persistent_workers=args.workers > 0
+        and (bool(args.local_wds_dir) or train_cache_hot),
     ).with_epoch(steps)
     val_loader = wds.WebLoader(
         validation,
@@ -709,7 +731,6 @@ def train(args: argparse.Namespace) -> None:
     run_mode = resolve_run_mode(args, last)
     print(f"checkpoint_mode={run_mode}", flush=True)
 
-    train_loader, val_loader = make_loaders(args)
     model = create_training_model(args).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(
@@ -784,6 +805,9 @@ def train(args: argparse.Namespace) -> None:
         model,
         anchor_to_current=args.stage != "pretrain",
         state=saved_gain_reference,
+    )
+    train_loader, val_loader = make_loaders(
+        args, train_seed_offset=start_epoch
     )
     output.mkdir(parents=True, exist_ok=True)
     config = vars(args) | {
@@ -939,6 +963,20 @@ def train(args: argparse.Namespace) -> None:
                     workers=args.workers,
                     shard_limit=args.shard_limit,
                 )
+                if not train_loader.pipeline[0].persistent_workers:
+                    # The first cold epoch has now filled the atomic cache.
+                    # Rebuild once onto direct local tar paths; this new pool
+                    # remains alive from the next epoch onward.
+                    train_loader, _ = make_loaders(
+                        args, train_seed_offset=epoch + 1
+                    )
+                    if args.workers > 0:
+                        assert train_loader.pipeline[0].persistent_workers
+                    print(
+                        "hf_cache_hot train_loader=direct-local "
+                        f"persistent_workers={args.workers > 0}",
+                        flush=True,
+                    )
             val_loss, val_acc = evaluate(
                 model, val_loader, device, amp_dtype, args.max_val_steps
             )

@@ -151,6 +151,27 @@ def test_remote_train_workers_do_not_persist_into_validation(tmp_path) -> None:
     assert not val_loader.pipeline[0].persistent_workers
 
 
+def test_complete_remote_train_cache_enables_persistent_workers(tmp_path) -> None:
+    (tmp_path / "imagenet1k-train-0000.tar").write_bytes(b"cached")
+    args = parse_args(
+        [
+            "--cache-dir",
+            str(tmp_path),
+            "--workers",
+            "2",
+            "--eval-workers",
+            "1",
+            "--shard-limit",
+            "1",
+            "--steps-per-epoch",
+            "1",
+        ]
+    )
+    train_loader, val_loader = make_loaders(args, train_seed_offset=1)
+    assert train_loader.pipeline[0].persistent_workers
+    assert not val_loader.pipeline[0].persistent_workers
+
+
 def test_hf_cache_barrier_is_a_noop_when_bounded_split_is_complete(tmp_path) -> None:
     (tmp_path / "imagenet1k-train-0000.tar").write_bytes(b"cached")
     complete_hf_split_cache(
