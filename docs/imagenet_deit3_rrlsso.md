@@ -60,8 +60,10 @@ they are not generic anti-overfitting penalties. With
 `g = exp(theta_g)` and `alpha/alpha_max = sigmoid(theta_alpha)`, the defaults are
 
 ```text
-L_gain  = 1e-4 * mean((theta_g - theta_g_ref)^2)
-L_alpha = 1e-4 * mean(ReLU(theta_alpha - logit(0.8))^2).
+M_ref   = 144  (12 Base layers x 12 heads)
+L_gain  = 1e-4 * (M_gain / M_ref) * mean((theta_g - theta_g_ref)^2)
+L_alpha = 1e-4 * (M_alpha / M_ref)
+          * mean(ReLU(theta_alpha - logit(0.8))^2).
 ```
 
 The gain term fixes the redundant scale shared by a head gain and the
@@ -76,8 +78,16 @@ does not disappear when the sigmoid approaches saturation. It preserves
 optimization controllability rather than algebraic invertibility—the SPD solve
 remains invertible for every finite nonnegative alpha.
 
-Both penalties are true means over all participating layers and heads, are
-scaled together with the task loss under gradient accumulation, and can be
+The reported penalty diagnostics remain true global means over all participating
+layers and heads. In the training objective, each mean is multiplied by
+`M/144`, where `M` is its static number of participating scalars. Thus the CLI
+weight retains its Base-model meaning while the raw restoring gradient on one
+head is invariant to model depth and head count. At the default reference
+weight, the effective mean coefficients are `5e-5`, `1e-4`, and approximately
+`2.667e-4` for Small (72 scalars), Base (144), and Large (384), respectively.
+This also prevents a rarely active alpha hinge from becoming weaker merely
+because the surrounding model contains more inactive heads. The losses are
+scaled together with the task loss under gradient accumulation and can be
 disabled with zero weights for the exact-recipe ablation. The scalar parameters
 are excluded from ordinary optimizer weight decay, so the gain constraint is
 not duplicated.

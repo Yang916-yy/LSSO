@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from experiments.deit3_official_recipe import (
+    RRLSSO_REGULARIZATION_REFERENCE_SCALARS,
     make_rrlsso_gain_reference,
     official_recipe,
     rrlsso_parameter_diagnostics,
@@ -96,8 +97,14 @@ def test_rrlsso_regularizer_is_zero_at_default_initialization_and_differentiable
     assert penalty.item() > 0
     assert module.theta_gain.grad is not None
     assert module.theta_alpha.grad is not None
-    # A post-sigmoid barrier would vanish here; the logit hinge remains strong.
-    assert module.theta_alpha.grad.abs().min().item() > 1e-4
+    # The logit hinge retains its analytic pullback without sigmoid attenuation.
+    expected_alpha_gradient = (
+        2.0 * 1e-4 * (10.0 - torch.tensor(4.0).log().item())
+        / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+    )
+    assert module.theta_alpha.grad.abs().min().item() == pytest.approx(
+        expected_alpha_gradient
+    )
 
 
 def test_finetuning_gain_reference_anchors_loaded_head_specialization() -> None:
@@ -122,13 +129,49 @@ def test_finetuning_gain_reference_anchors_loaded_head_specialization() -> None:
         alpha_saturation_weight=0.0,
         alpha_saturation_fraction=0.8,
     )
-    assert penalty.item() == pytest.approx(0.25**2)
+    assert penalty.item() == pytest.approx(
+        0.25**2 * module.num_heads / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+    )
     restored = make_rrlsso_gain_reference(
         module,
         anchor_to_current=False,
         state={key: value.cpu() for key, value in reference.items()},
     )
     torch.testing.assert_close(restored["<root>"], reference["<root>"])
+
+
+@pytest.mark.parametrize("module_heads", [(4,), (4, 8), (6, 12, 16)])
+def test_regularizer_has_model_size_invariant_per_head_gradient(module_heads) -> None:
+    modules = torch.nn.ModuleList(
+        [RRLSSO(dim=heads * 8, num_heads=heads, rank=4) for heads in module_heads]
+    )
+    reference = make_rrlsso_gain_reference(modules, anchor_to_current=False)
+    threshold = torch.tensor(4.0).log()
+    with torch.no_grad():
+        for module in modules:
+            module.theta_gain.fill_(0.25)
+            module.theta_alpha.fill_(threshold + 0.5)
+    penalty, components = rrlsso_regularization(
+        modules,
+        gain_reference=reference,
+        gain_anchor_weight=1.0,
+        alpha_saturation_weight=1.0,
+        alpha_saturation_fraction=0.8,
+    )
+    penalty.backward()
+    expected_gain = 2.0 * 0.25 / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+    expected_alpha = 2.0 * 0.5 / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+    for module in modules:
+        torch.testing.assert_close(
+            module.theta_gain.grad,
+            torch.full_like(module.theta_gain, expected_gain),
+        )
+        torch.testing.assert_close(
+            module.theta_alpha.grad,
+            torch.full_like(module.theta_alpha, expected_alpha),
+        )
+    assert components["gain_anchor"].item() == pytest.approx(0.25**2)
+    assert components["alpha_saturation"].item() == pytest.approx(0.5**2)
 
 
 def test_rrlsso_diagnostics_report_saturation_fractions() -> None:

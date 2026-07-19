@@ -40,6 +40,7 @@ if str(ROOT) not in sys.path:
 import examples.models  # noqa: E402,F401  registers project models
 from examples.models.deit3_rrlsso import DEIT3_RRLSSO_MODELS  # noqa: E402
 from experiments.deit3_official_recipe import (  # noqa: E402
+    RRLSSO_REGULARIZATION_REFERENCE_SCALARS,
     make_rrlsso_gain_reference,
     official_recipe,
     randaugment_finetune_transform,
@@ -55,7 +56,7 @@ TRAIN_SAMPLES = 1_281_167
 VAL_SAMPLES = 50_000
 TRAIN_SHARDS = 1024
 VAL_SHARDS = 64
-CHECKPOINT_SCHEMA = 2
+CHECKPOINT_SCHEMA = 3
 
 
 def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
@@ -481,6 +482,9 @@ def checkpoint_metadata(
         "rank": args.rank,
         "alpha_max": args.alpha_max,
         "init_weights": "raw",
+        "rrlsso_regularization_reference_scalars": (
+            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+        ),
         "gain_reference_origin": gain_reference_origin,
     }
 
@@ -502,6 +506,9 @@ def validate_resume_checkpoint(
         "rank": args.rank,
         "alpha_max": args.alpha_max,
         "init_weights": "raw",
+        "rrlsso_regularization_reference_scalars": (
+            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+        ),
     }
     mismatches = {
         key: (metadata.get(key), value)
@@ -540,6 +547,9 @@ def validate_initialization_checkpoint(
         "rank": args.rank,
         "alpha_max": args.alpha_max,
         "init_weights": "raw",
+        "rrlsso_regularization_reference_scalars": (
+            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+        ),
     }
     mismatches = {
         key: (metadata.get(key), expected_value)
@@ -658,6 +668,9 @@ def train(args: argparse.Namespace) -> None:
     config = vars(args) | {
         "checkpoint_mode": run_mode,
         "run_metadata": run_metadata,
+        "rrlsso_regularization_reference_scalars": (
+            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+        ),
         "parameter_count": parameter_count,
         "optimizer_impl": optimizer_impl,
         "actual_effective_batch": actual_effective_batch,
@@ -675,7 +688,8 @@ def train(args: argparse.Namespace) -> None:
         f"drop_path={args.drop_path_rate:g} repeated_aug={args.repeated_aug} "
         f"amp={args.amp_dtype} effective_batch={actual_effective_batch} "
         f"virtual_group={args.runtime_augmentation_group_size} "
-        f"rrlsso_reg=(gain={args.rrlsso_gain_reg:g},alpha={args.rrlsso_alpha_reg:g})",
+        f"rrlsso_reg_base{RRLSSO_REGULARIZATION_REFERENCE_SCALARS}="
+        f"(gain={args.rrlsso_gain_reg:g},alpha={args.rrlsso_alpha_reg:g})",
         flush=True,
     )
 

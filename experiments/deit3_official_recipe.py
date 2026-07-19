@@ -18,6 +18,10 @@ from lsso import RRLSSO
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+# The CLI regularization weights retain their original DeiT-III Base meaning.
+# Scaling each global mean by M / 144 makes the raw per-head restoring force
+# invariant to model depth and head count (Base has 12 layers x 12 heads).
+RRLSSO_REGULARIZATION_REFERENCE_SCALARS = 12 * 12
 T = TypeVar("T")
 
 
@@ -226,7 +230,12 @@ def rrlsso_regularization(
         raise KeyError(f"gain reference contains unknown RRLSSO modules: {sorted(unused)}")
     gain_penalty = gain_square_sum / max(gain_count, 1)
     alpha_penalty = alpha_square_sum / max(alpha_count, 1)
-    total = gain_anchor_weight * gain_penalty + alpha_saturation_weight * alpha_penalty
+    gain_scale = gain_count / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+    alpha_scale = alpha_count / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
+    total = (
+        gain_anchor_weight * gain_scale * gain_penalty
+        + alpha_saturation_weight * alpha_scale * alpha_penalty
+    )
     return total, {"gain_anchor": gain_penalty, "alpha_saturation": alpha_penalty}
 
 
@@ -301,6 +310,7 @@ def rrlsso_parameter_diagnostics(
 
 __all__ = [
     "DEIT3_OFFICIAL_RECIPES",
+    "RRLSSO_REGULARIZATION_REFERENCE_SCALARS",
     "DeiT3Recipe",
     "model_size",
     "make_rrlsso_gain_reference",
