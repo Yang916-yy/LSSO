@@ -133,6 +133,11 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
                 detshuffle=True,
                 seed=seed,
                 handler=wds.reraise_exception,
+                # A bounded gate may intentionally expose fewer shards than
+                # DataLoader workers. Empty workers are valid there; the one
+                # owning the shard still supplies the requested epoch length.
+                # Formal training keeps WebDataset's strict empty check.
+                empty_check=not bool(args.shard_limit),
             )
 
     if args.shard_limit:
