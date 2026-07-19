@@ -53,15 +53,39 @@ contains duplicate views of the same source image. This reproduces the relevant
 semantics of Meta's distributed RASampler without sacrificing single-GPU
 throughput.
 
-## RRLSSO-specific safeguards
+## RRLSSO-specific gauge fixing and saturation control
 
-Two optional regularizers are intentionally zero at initialization:
+These terms address two identifiable properties of the solve parameterization;
+they are not generic anti-overfitting penalties. With
+`g = exp(theta_g)` and `alpha/alpha_max = sigmoid(theta_alpha)`, the defaults are
 
-- `--rrlsso-gain-reg 1e-4` anchors excessive logarithmic output-gain drift;
-- `--rrlsso-alpha-reg 1e-4` activates only when `alpha/alpha_max` exceeds 0.8.
+```text
+L_gain  = 1e-4 * mean((theta_g - theta_g_ref)^2)
+L_alpha = 1e-4 * mean(ReLU(theta_alpha - logit(0.8))^2).
+```
 
-They do not weaken the initialized solve and can be disabled with zero weights
-for the exact recipe ablation.
+The gain term fixes the redundant scale shared by a head gain and the
+corresponding columns of the output projection. Pretraining uses
+`theta_g_ref=0` (`g_ref=1`). Refinement captures the loaded checkpoint's
+per-layer, per-head `theta_g` values so it preserves learned head specialization.
+This reference is saved in every checkpoint and restored unchanged on resume.
+
+The alpha term acts directly in logit space. It is exactly zero, with zero
+gradient, below `alpha/alpha_max=0.8`; unlike a post-sigmoid penalty, its pullback
+does not disappear when the sigmoid approaches saturation. It preserves
+optimization controllability rather than algebraic invertibility—the SPD solve
+remains invertible for every finite nonnegative alpha.
+
+Both penalties are true means over all participating layers and heads, are
+scaled together with the task loss under gradient accumulation, and can be
+disabled with zero weights for the exact-recipe ablation. The scalar parameters
+are excluded from ordinary optimizer weight decay, so the gain constraint is
+not duplicated.
+
+At each epoch boundary, `metrics.csv` records log-gain drift, alpha-ratio mean
+and spread, fractions above 0.8 and 0.95, solve-scalar gradient norms,
+regularizer/total-gradient ratios, and actual optimizer update norms. Sampling
+once per epoch avoids continuous host-device synchronization.
 
 ## Formal launch
 
@@ -98,5 +122,5 @@ The position embedding is bicubically resized between patch grids. A refinement
 stage initializes a fresh EMA from the resized main model; only an actual resume
 restores the stage's saved EMA. Each stage has independent atomic `last.pt` and
 `best.pt` checkpoints, including model, EMA, optimizer, scheduler, GradScaler,
-completed epoch, update count, and RNG state. Streaming order after a restart
-remains newly stochastic.
+completed epoch, update count, gain gauge reference, and RNG state. Streaming
+order after a restart remains newly stochastic.

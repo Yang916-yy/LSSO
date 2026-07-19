@@ -105,7 +105,8 @@ official class-token initialization, virtual-device grouped Mixup/CutMix,
 distributed-style repeated augmentation, BCE, EMA, and Apex FusedLAMB
 pretraining, plus the published 224/384 refinement stages. See
 [`docs/imagenet_deit3_rrlsso.md`](docs/imagenet_deit3_rrlsso.md) for model
-names, parameter counts, exact recipes, and launch commands.
+names, parameter counts, exact recipes, virtual augmentation semantics, and the
+RRLSSO log-gain gauge fixing/logit-space saturation control used for long runs.
 
 ## Install
 

@@ -40,9 +40,11 @@ if str(ROOT) not in sys.path:
 import examples.models  # noqa: E402,F401  registers project models
 from examples.models.deit3_rrlsso import DEIT3_RRLSSO_MODELS  # noqa: E402
 from experiments.deit3_official_recipe import (  # noqa: E402
+    make_rrlsso_gain_reference,
     official_recipe,
     randaugment_finetune_transform,
     rrlsso_regularization,
+    rrlsso_parameter_diagnostics,
     three_augment_transform,
     validation_transform,
     virtual_group_repeated_samples,
@@ -354,6 +356,80 @@ def create_model_ema(
     return model_ema
 
 
+def _solve_parameter_groups(
+    model: torch.nn.Module,
+) -> dict[str, list[torch.nn.Parameter]]:
+    groups: dict[str, list[torch.nn.Parameter]] = {"gain": [], "alpha": []}
+    for name, parameter in model.named_parameters():
+        if name.endswith("theta_gain"):
+            groups["gain"].append(parameter)
+        elif name.endswith("theta_alpha"):
+            groups["alpha"].append(parameter)
+    return groups
+
+
+def regularization_gradient_norms(
+    regularization: torch.Tensor,
+    model: torch.nn.Module,
+) -> dict[str, torch.Tensor]:
+    """Measure explicit-regularizer gradients without populating ``.grad``."""
+
+    groups = _solve_parameter_groups(model)
+    parameters = groups["gain"] + groups["alpha"]
+    gradients = torch.autograd.grad(
+        regularization,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    split = len(groups["gain"])
+    result = {}
+    for key, values in (
+        ("gain", gradients[:split]),
+        ("alpha", gradients[split:]),
+    ):
+        squares = [value.detach().float().square().sum() for value in values if value is not None]
+        result[key] = torch.stack(squares).sum().sqrt() if squares else regularization.new_zeros(())
+    return result
+
+
+def solve_gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    groups = _solve_parameter_groups(model)
+    reference = next(model.parameters()).detach().new_zeros((), dtype=torch.float32)
+    result = {}
+    for key, parameters in groups.items():
+        squares = [
+            parameter.grad.detach().float().square().sum()
+            for parameter in parameters
+            if parameter.grad is not None
+        ]
+        result[key] = torch.stack(squares).sum().sqrt() if squares else reference.clone()
+    return result
+
+
+def solve_parameter_snapshot(model: torch.nn.Module) -> dict[str, list[torch.Tensor]]:
+    return {
+        key: [parameter.detach().clone() for parameter in parameters]
+        for key, parameters in _solve_parameter_groups(model).items()
+    }
+
+
+def solve_update_norms(
+    model: torch.nn.Module,
+    before: dict[str, list[torch.Tensor]],
+) -> dict[str, torch.Tensor]:
+    groups = _solve_parameter_groups(model)
+    reference = next(model.parameters()).detach().new_zeros((), dtype=torch.float32)
+    result = {}
+    for key, parameters in groups.items():
+        squares = [
+            (parameter.detach().float() - old.float()).square().sum()
+            for parameter, old in zip(parameters, before[key], strict=True)
+        ]
+        result[key] = torch.stack(squares).sum().sqrt() if squares else reference.clone()
+    return result
+
+
 def train(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("formal ImageNet training requires CUDA")
@@ -458,6 +534,21 @@ def train(args: argparse.Namespace) -> None:
         decay=args.ema_decay,
         resume_checkpoint=resume_checkpoint,
     )
+    saved_gain_reference = (
+        resume_checkpoint.get("rrlsso_gain_reference")
+        if resume_checkpoint is not None
+        else None
+    )
+    if resume_checkpoint is not None and saved_gain_reference is None and args.stage != "pretrain":
+        raise RuntimeError(
+            "the refinement checkpoint predates persistent gain references; "
+            "restart refinement from its pretraining checkpoint"
+        )
+    gain_reference = make_rrlsso_gain_reference(
+        model,
+        anchor_to_current=args.stage != "pretrain",
+        state=saved_gain_reference,
+    )
 
     print(
         f"recipe=official_deit3 optimizer={optimizer_impl} lr={args.lr:g} "
@@ -472,7 +563,12 @@ def train(args: argparse.Namespace) -> None:
     mode = "a" if start_epoch and metrics.exists() else "w"
     fields = (
         "epoch", "train_loss", "train_data_loss", "train_regularization", "lr",
-        "val_loss", "val_acc", "seconds", "peak_gb",
+        "gain_penalty", "alpha_penalty", "gain_log_mean", "gain_log_std",
+        "gain_log_max_abs", "gain_anchor_rms", "alpha_ratio_mean", "alpha_ratio_std",
+        "alpha_fraction_gt_080", "alpha_fraction_gt_095", "gain_grad_norm",
+        "alpha_grad_norm", "gain_reg_grad_ratio", "alpha_reg_grad_ratio",
+        "gain_update_norm", "alpha_update_norm", "global_update", "val_loss",
+        "val_acc", "seconds", "peak_gb",
     )
     with metrics.open(mode, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -484,6 +580,11 @@ def train(args: argparse.Namespace) -> None:
             started = time.time()
             torch.cuda.reset_peak_memory_stats()
             loss_sum = data_loss_sum = regularization_sum = 0.0
+            gain_penalty_sum = alpha_penalty_sum = 0.0
+            sampled_regularizer_gradients = None
+            sampled_total_gradients = None
+            sampled_updates = None
+            sampled_parameters_before = None
             observed_steps = 0
             for step, (images, labels) in enumerate(train_loader):
                 if step >= steps_per_epoch:
@@ -501,24 +602,38 @@ def train(args: argparse.Namespace) -> None:
                     labels = labels.gt(0.0).to(labels.dtype)
                 with torch.autocast("cuda", dtype=amp_dtype):
                     data_loss = criterion(model(images), labels)
-                    regularization, _ = rrlsso_regularization(
+                    regularization, regularization_components = rrlsso_regularization(
                         model,
+                        gain_reference=gain_reference,
                         gain_anchor_weight=args.rrlsso_gain_reg,
                         alpha_saturation_weight=args.rrlsso_alpha_reg,
                         alpha_saturation_fraction=args.rrlsso_alpha_saturation,
                     )
                     total_loss = data_loss + regularization
                     loss = total_loss / args.grad_accum
+                if step + 1 == steps_per_epoch:
+                    sampled_regularizer_gradients = regularization_gradient_norms(
+                        regularization, model
+                    )
                 scaler.scale(loss).backward()
                 loss_sum += total_loss.detach().item()
                 data_loss_sum += data_loss.detach().item()
                 regularization_sum += regularization.detach().item()
+                gain_penalty_sum += regularization_components["gain_anchor"].detach().item()
+                alpha_penalty_sum += regularization_components["alpha_saturation"].detach().item()
                 if (step + 1) % args.grad_accum == 0:
-                    if args.clip_grad:
+                    sample_diagnostics = step + 1 == steps_per_epoch
+                    if args.clip_grad or sample_diagnostics:
                         scaler.unscale_(optimizer)
+                    if sample_diagnostics:
+                        sampled_total_gradients = solve_gradient_norms(model)
+                        sampled_parameters_before = solve_parameter_snapshot(model)
+                    if args.clip_grad:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                     scaler.step(optimizer)
                     scaler.update()
+                    if sample_diagnostics:
+                        sampled_updates = solve_update_norms(model, sampled_parameters_before)
                     optimizer.zero_grad(set_to_none=True)
                     global_update += 1
                     if model_ema is not None:
@@ -533,11 +648,14 @@ def train(args: argparse.Namespace) -> None:
             if observed_steps == 0:
                 raise RuntimeError("ImageNet training stream produced no batches")
             if observed_steps % args.grad_accum:
+                scaler.unscale_(optimizer)
+                sampled_total_gradients = solve_gradient_norms(model)
+                sampled_parameters_before = solve_parameter_snapshot(model)
                 if args.clip_grad:
-                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 scaler.step(optimizer)
                 scaler.update()
+                sampled_updates = solve_update_norms(model, sampled_parameters_before)
                 optimizer.zero_grad(set_to_none=True)
                 global_update += 1
                 if model_ema is not None:
@@ -546,6 +664,36 @@ def train(args: argparse.Namespace) -> None:
             val_loss, val_acc = evaluate(
                 model, val_loader, device, amp_dtype, args.max_val_steps
             )
+            parameter_diagnostics = rrlsso_parameter_diagnostics(model, gain_reference)
+            if sampled_regularizer_gradients is None:
+                sampled_regularizer_gradients = {
+                    "gain": parameter_diagnostics["gain_log_mean"].new_zeros(()),
+                    "alpha": parameter_diagnostics["gain_log_mean"].new_zeros(()),
+                }
+            if sampled_total_gradients is None:
+                sampled_total_gradients = {
+                    key: value.new_zeros(())
+                    for key, value in sampled_regularizer_gradients.items()
+                }
+            if sampled_updates is None:
+                sampled_updates = {
+                    key: value.new_zeros(()) for key, value in sampled_total_gradients.items()
+                }
+            diagnostic_values = {
+                key: float(value.item()) for key, value in parameter_diagnostics.items()
+            }
+            gradient_values = {
+                "gain_grad_norm": float(sampled_total_gradients["gain"].item()),
+                "alpha_grad_norm": float(sampled_total_gradients["alpha"].item()),
+                "gain_reg_grad_ratio": float(
+                    (sampled_regularizer_gradients["gain"] / sampled_total_gradients["gain"].clamp_min(1e-30)).item()
+                ),
+                "alpha_reg_grad_ratio": float(
+                    (sampled_regularizer_gradients["alpha"] / sampled_total_gradients["alpha"].clamp_min(1e-30)).item()
+                ),
+                "gain_update_norm": float(sampled_updates["gain"].item()),
+                "alpha_update_norm": float(sampled_updates["alpha"].item()),
+            }
             current_lr = float(optimizer.param_groups[0]["lr"])
             row = {
                 "epoch": epoch + 1,
@@ -553,6 +701,11 @@ def train(args: argparse.Namespace) -> None:
                 "train_data_loss": data_loss_sum / observed_steps,
                 "train_regularization": regularization_sum / observed_steps,
                 "lr": current_lr,
+                "gain_penalty": gain_penalty_sum / observed_steps,
+                "alpha_penalty": alpha_penalty_sum / observed_steps,
+                **diagnostic_values,
+                **gradient_values,
+                "global_update": global_update,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
                 "seconds": time.time() - started,
@@ -570,6 +723,9 @@ def train(args: argparse.Namespace) -> None:
                 "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
                 "model_ema": model_ema.module.state_dict() if model_ema is not None else None,
+                "rrlsso_gain_reference": {
+                    key: value.detach().cpu() for key, value in gain_reference.items()
+                },
                 "epoch": epoch + 1,
                 "global_update": global_update,
                 "best_acc": best_acc,

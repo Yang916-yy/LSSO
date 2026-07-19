@@ -148,3 +148,23 @@ def test_pretraining_never_silently_drops_fused_lamb() -> None:
     args.allow_unfused_lamb = True
     _, implementation = create_official_optimizer(model, args)
     assert implementation in {"apex_fusedlamb", "lamb"}
+
+
+def test_solve_scalars_are_excluded_from_ordinary_weight_decay() -> None:
+    args = parse_args(
+        ["--model", "deit3_small_patch16_rrlsso", "--rank", "8", "--allow-unfused-lamb"]
+    )
+    model = create_training_model(args)
+    optimizer, _ = create_official_optimizer(model, args)
+    decay_by_parameter = {
+        id(parameter): float(group["weight_decay"])
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    solve_scalars = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.endswith(("theta_gain", "theta_alpha"))
+    ]
+    assert solve_scalars
+    assert all(decay_by_parameter[id(parameter)] == 0.0 for parameter in solve_scalars)
