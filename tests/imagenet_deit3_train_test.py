@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-import torch
+import subprocess
+from unittest.mock import patch
+
 import pytest
+import torch
 
 from experiments.imagenet_wds_train import (
     apply_virtual_group_mixup,
     checkpoint_metadata,
+    complete_hf_split_cache,
     create_model_ema,
     create_official_optimizer,
     create_training_model,
+    make_loaders,
     parse_args,
     resolve_run_mode,
     resize_position_embedding,
@@ -124,6 +129,64 @@ def test_hf_shard_commands_have_stable_non_overlapping_names(tmp_path) -> None:
     assert len(set(train + validation)) == 1088
     assert "imagenet1k-train-0000.tar" in train[0]
     assert "imagenet1k-validation-63.tar" in validation[-1]
+
+
+def test_remote_train_workers_do_not_persist_into_validation(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--cache-dir",
+            str(tmp_path),
+            "--workers",
+            "2",
+            "--eval-workers",
+            "1",
+            "--shard-limit",
+            "1",
+            "--steps-per-epoch",
+            "1",
+        ]
+    )
+    train_loader, val_loader = make_loaders(args)
+    assert not train_loader.pipeline[0].persistent_workers
+    assert not val_loader.pipeline[0].persistent_workers
+
+
+def test_hf_cache_barrier_is_a_noop_when_bounded_split_is_complete(tmp_path) -> None:
+    (tmp_path / "imagenet1k-train-0000.tar").write_bytes(b"cached")
+    complete_hf_split_cache(
+        "train",
+        tmp_path,
+        "owner/repo",
+        workers=1,
+        shard_limit=1,
+    )
+
+
+def test_hf_cache_barrier_fills_every_missing_shard_before_return(tmp_path) -> None:
+    downloaded = []
+
+    def fake_run(command, **kwargs):
+        filename = command[command.index("--filename") + 1]
+        cache_dir = command[command.index("--cache-dir") + 1]
+        downloaded.append(filename)
+        (tmp_path / filename).write_bytes(b"complete")
+        assert cache_dir == str(tmp_path)
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with patch("experiments.imagenet_wds_train.subprocess.run", side_effect=fake_run):
+        complete_hf_split_cache(
+            "train",
+            tmp_path,
+            "owner/repo",
+            workers=0,
+            shard_limit=3,
+        )
+    assert sorted(downloaded) == [
+        "imagenet1k-train-0000.tar",
+        "imagenet1k-train-0001.tar",
+        "imagenet1k-train-0002.tar",
+    ]
 
 
 def test_registered_model_configuration_is_trace_normalized() -> None:

@@ -9,12 +9,14 @@ checkpoints and can resume at epoch boundaries.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import math
 import os
 import random
 import shlex
+import subprocess
 import sys
 import time
 from functools import partial
@@ -59,10 +61,16 @@ VAL_SHARDS = 64
 CHECKPOINT_SCHEMA = 3
 
 
-def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
+def hf_shard_filenames(split: str) -> list[str]:
     count = TRAIN_SHARDS if split == "train" else VAL_SHARDS
     prefix = "train" if split == "train" else "validation"
     digits = 4 if split == "train" else 2
+    return [
+        f"imagenet1k-{prefix}-{index:0{digits}d}.tar" for index in range(count)
+    ]
+
+
+def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
     helper = ROOT / "tools" / "hf_wds_stream.py"
     return [
         "pipe:"
@@ -73,13 +81,106 @@ def shard_commands(split: str, cache_dir: Path, repo: str) -> list[str]:
                 "--repo",
                 shlex.quote(repo),
                 "--filename",
-                shlex.quote(f"imagenet1k-{prefix}-{index:0{digits}d}.tar"),
+                shlex.quote(filename),
                 "--cache-dir",
                 shlex.quote(str(cache_dir)),
             )
         )
-        for index in range(count)
+        for filename in hf_shard_filenames(split)
     ]
+
+
+def complete_hf_split_cache(
+    split: str,
+    cache_dir: Path,
+    repo: str,
+    *,
+    workers: int,
+    shard_limit: int = 0,
+    attempts: int = 5,
+) -> None:
+    """Block until one HF split is completely present in the atomic cache.
+
+    This deliberately invokes the same proven one-shard streaming helper used
+    by WebDataset.  Redirecting stdout merely drains its pipe while it fills the
+    cache; no second download implementation is introduced.
+    """
+
+    filenames = hf_shard_filenames(split)
+    if shard_limit:
+        filenames = filenames[:shard_limit]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    missing = [
+        name
+        for name in filenames
+        if not (cache_dir / name).is_file() or (cache_dir / name).stat().st_size == 0
+    ]
+    if not missing:
+        print(
+            f"hf_cache_barrier split={split} "
+            f"complete={len(filenames)}/{len(filenames)}",
+            flush=True,
+        )
+        return
+
+    helper = ROOT / "tools" / "hf_wds_stream.py"
+    cache_workers = min(max(1, workers), len(missing))
+    print(
+        f"hf_cache_barrier split={split} complete={len(filenames) - len(missing)}/"
+        f"{len(filenames)} missing={len(missing)} workers={cache_workers}",
+        flush=True,
+    )
+
+    def download(filename: str) -> str:
+        command = [
+            sys.executable,
+            str(helper),
+            "--repo",
+            repo,
+            "--filename",
+            filename,
+            "--cache-dir",
+            str(cache_dir),
+        ]
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and (cache_dir / filename).is_file():
+                return filename
+            last_error = result.stderr.strip()
+            if attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 15))
+        raise RuntimeError(
+            f"failed to cache {filename} after {attempts} attempts: {last_error}"
+        )
+
+    completed = len(filenames) - len(missing)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cache_workers) as executor:
+        futures = [executor.submit(download, filename) for filename in missing]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+            completed += 1
+            if completed == len(filenames) or completed % 32 == 0:
+                print(
+                    f"hf_cache_barrier split={split} complete={completed}/{len(filenames)}",
+                    flush=True,
+                )
+
+    partials = [
+        cache_dir / f"{filename}.partial"
+        for filename in filenames
+        if (cache_dir / f"{filename}.partial").is_file()
+    ]
+    if partials:
+        raise RuntimeError(
+            f"HF {split} cache barrier left {len(partials)} partial shards"
+        )
 
 
 def local_webdataset(
@@ -172,7 +273,13 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         batch_size=None,
         num_workers=args.workers,
         pin_memory=True,
-        persistent_workers=args.workers > 0,
+        # A finite remote epoch stops before the underlying shard stream is
+        # exhausted (notably with repeated augmentation).  Persistent workers
+        # would therefore keep prefetched train-shard pipes alive while the
+        # validation pool starts downloading validation shards.  Tear the
+        # remote pool down at the epoch boundary so the two split streams never
+        # contend.  Fully local WDS has no download pipe and can stay resident.
+        persistent_workers=args.workers > 0 and bool(args.local_wds_dir),
     ).with_epoch(steps)
     val_loader = wds.WebLoader(
         validation,
@@ -820,6 +927,18 @@ def train(args: argparse.Namespace) -> None:
                 if model_ema is not None:
                     model_ema.update(model)
 
+            if not args.local_wds_dir:
+                # The finite RA epoch consumes only part of the shuffled train
+                # stream.  Finish the train cache after its non-persistent
+                # worker pool has exited, and do not allow validation downloads
+                # to overlap any train-shard transfer.
+                complete_hf_split_cache(
+                    "train",
+                    Path(args.cache_dir),
+                    args.hf_repo,
+                    workers=args.workers,
+                    shard_limit=args.shard_limit,
+                )
             val_loss, val_acc = evaluate(
                 model, val_loader, device, amp_dtype, args.max_val_steps
             )
