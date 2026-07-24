@@ -5,14 +5,11 @@ import torch.nn as nn
 
 from .modules import (
     DEFAULT_ALPHA_INIT,
-    DEFAULT_ALPHA_MAX,
     DEFAULT_GAIN_INIT,
     LSSODiagnostics,
     _initialize_solve_parameters,
-    _legacy_solve_state_dict_pre_hook,
     _fold_fixed_gain_into_output,
     _solve_parameters,
-    _sync_alpha_max_after_load,
     lsso_gain_alpha,
 )
 from .modules_v2 import apply_rank_rotary
@@ -41,7 +38,6 @@ class _GroupedLSSOBase(nn.Module):
         gain_init: float = DEFAULT_GAIN_INIT,
         alpha_init: float = DEFAULT_ALPHA_INIT,
         solve_parameterization: str = "gain_alpha",
-        alpha_max: float = DEFAULT_ALPHA_MAX,
         no_global: bool = False,
         normalize_u: bool = True,
         basis_normalization: str = "trace",
@@ -106,10 +102,7 @@ class _GroupedLSSOBase(nn.Module):
             solve_parameterization=solve_parameterization,
             gain_init=gain_init,
             alpha_init=alpha_init,
-            alpha_max=alpha_max,
         )
-        self.register_load_state_dict_pre_hook(_legacy_solve_state_dict_pre_hook)
-        self.register_load_state_dict_post_hook(_sync_alpha_max_after_load)
         _fold_fixed_gain_into_output(
             self,
             groups=num_relation_groups,

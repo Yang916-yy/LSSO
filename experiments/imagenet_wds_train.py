@@ -42,23 +42,20 @@ if str(ROOT) not in sys.path:
 import examples.models  # noqa: E402,F401  registers project models
 from examples.models.deit3_rrlsso import DEIT3_RRLSSO_MODELS  # noqa: E402
 from experiments.deit3_official_recipe import (  # noqa: E402
-    RRLSSO_REGULARIZATION_REFERENCE_SCALARS,
-    make_rrlsso_gain_reference,
     official_recipe,
     randaugment_finetune_transform,
-    rrlsso_regularization,
-    rrlsso_parameter_diagnostics,
     three_augment_transform,
     validation_transform,
     virtual_group_repeated_samples,
 )
+from experiments.rrlsso_diagnostics import rrlsso_parameter_diagnostics  # noqa: E402
 from lsso.mathdx_backend import is_mathdx_available, mathdx_load_error  # noqa: E402
 
 TRAIN_SAMPLES = 1_281_167
 VAL_SAMPLES = 50_000
 TRAIN_SHARDS = 1024
 VAL_SHARDS = 64
-CHECKPOINT_SCHEMA = 3
+CHECKPOINT_SCHEMA = 4
 
 
 def hf_shard_filenames(split: str) -> list[str]:
@@ -379,7 +376,6 @@ def create_training_model(args: argparse.Namespace) -> torch.nn.Module:
             rank=args.rank,
             gain_init=args.gain_init,
             alpha_init=args.alpha_init,
-            alpha_max=args.alpha_max,
             basis_normalization="trace",
             length_normalize=True,
             length_reference=1.0,
@@ -501,80 +497,6 @@ def create_model_ema(
     return model_ema
 
 
-def _solve_parameter_groups(
-    model: torch.nn.Module,
-) -> dict[str, list[torch.nn.Parameter]]:
-    groups: dict[str, list[torch.nn.Parameter]] = {"gain": [], "alpha": []}
-    for name, parameter in model.named_parameters():
-        if name.endswith("theta_gain"):
-            groups["gain"].append(parameter)
-        elif name.endswith("theta_alpha"):
-            groups["alpha"].append(parameter)
-    return groups
-
-
-def regularization_gradient_norms(
-    regularization: torch.Tensor,
-    model: torch.nn.Module,
-) -> dict[str, torch.Tensor]:
-    """Measure explicit-regularizer gradients without populating ``.grad``."""
-
-    groups = _solve_parameter_groups(model)
-    parameters = groups["gain"] + groups["alpha"]
-    gradients = torch.autograd.grad(
-        regularization,
-        parameters,
-        retain_graph=True,
-        allow_unused=True,
-    )
-    split = len(groups["gain"])
-    result = {}
-    for key, values in (
-        ("gain", gradients[:split]),
-        ("alpha", gradients[split:]),
-    ):
-        squares = [value.detach().float().square().sum() for value in values if value is not None]
-        result[key] = torch.stack(squares).sum().sqrt() if squares else regularization.new_zeros(())
-    return result
-
-
-def solve_gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    groups = _solve_parameter_groups(model)
-    reference = next(model.parameters()).detach().new_zeros((), dtype=torch.float32)
-    result = {}
-    for key, parameters in groups.items():
-        squares = [
-            parameter.grad.detach().float().square().sum()
-            for parameter in parameters
-            if parameter.grad is not None
-        ]
-        result[key] = torch.stack(squares).sum().sqrt() if squares else reference.clone()
-    return result
-
-
-def solve_parameter_snapshot(model: torch.nn.Module) -> dict[str, list[torch.Tensor]]:
-    return {
-        key: [parameter.detach().clone() for parameter in parameters]
-        for key, parameters in _solve_parameter_groups(model).items()
-    }
-
-
-def solve_update_norms(
-    model: torch.nn.Module,
-    before: dict[str, list[torch.Tensor]],
-) -> dict[str, torch.Tensor]:
-    groups = _solve_parameter_groups(model)
-    reference = next(model.parameters()).detach().new_zeros((), dtype=torch.float32)
-    result = {}
-    for key, parameters in groups.items():
-        squares = [
-            (parameter.detach().float() - old.float()).square().sum()
-            for parameter, old in zip(parameters, before[key], strict=True)
-        ]
-        result[key] = torch.stack(squares).sum().sqrt() if squares else reference.clone()
-    return result
-
-
 def resolve_run_mode(args: argparse.Namespace, last: Path) -> str:
     """Resolve one unambiguous checkpoint state before mutating the output."""
 
@@ -612,23 +534,14 @@ def resolve_run_mode(args: argparse.Namespace, last: Path) -> str:
     return "new_pretrain"
 
 
-def checkpoint_metadata(
-    args: argparse.Namespace,
-    *,
-    gain_reference_origin: str,
-) -> dict[str, Any]:
+def checkpoint_metadata(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema": CHECKPOINT_SCHEMA,
         "training_stage": args.stage,
         "model_name": args.model,
         "image_size": args.image_size,
         "rank": args.rank,
-        "alpha_max": args.alpha_max,
         "init_weights": "raw",
-        "rrlsso_regularization_reference_scalars": (
-            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
-        ),
-        "gain_reference_origin": gain_reference_origin,
     }
 
 
@@ -647,27 +560,15 @@ def validate_resume_checkpoint(
         "model_name": args.model,
         "image_size": args.image_size,
         "rank": args.rank,
-        "alpha_max": args.alpha_max,
         "init_weights": "raw",
-        "rrlsso_regularization_reference_scalars": (
-            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
-        ),
     }
     mismatches = {
         key: (metadata.get(key), value)
         for key, value in expected.items()
         if metadata.get(key) != value
     }
-    expected_origin = "pretrain_zero" if args.stage == "pretrain" else "raw_finetune_init"
-    if metadata.get("gain_reference_origin") != expected_origin:
-        mismatches["gain_reference_origin"] = (
-            metadata.get("gain_reference_origin"),
-            expected_origin,
-        )
     if mismatches:
         raise RuntimeError(f"resume checkpoint metadata mismatch: {mismatches}")
-    if checkpoint.get("rrlsso_gain_reference") is None:
-        raise RuntimeError("resume checkpoint is missing its persistent gain reference")
     return metadata
 
 
@@ -688,11 +589,7 @@ def validate_initialization_checkpoint(
         "training_stage": expected_source_stage,
         "model_name": args.model,
         "rank": args.rank,
-        "alpha_max": args.alpha_max,
         "init_weights": "raw",
-        "rrlsso_regularization_reference_scalars": (
-            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
-        ),
     }
     mismatches = {
         key: (metadata.get(key), expected_value)
@@ -785,26 +682,14 @@ def train(args: argparse.Namespace) -> None:
         model_state = resize_position_embedding(initialization["model"], model)
         model.load_state_dict(model_state)
         print(f"initialized model from {args.init_checkpoint}", flush=True)
-        run_metadata = checkpoint_metadata(
-            args, gain_reference_origin="raw_finetune_init"
-        )
+        run_metadata = checkpoint_metadata(args)
     else:
-        run_metadata = checkpoint_metadata(args, gain_reference_origin="pretrain_zero")
+        run_metadata = checkpoint_metadata(args)
     model_ema = create_model_ema(
         model,
         enabled=args.ema,
         decay=args.ema_decay,
         resume_checkpoint=resume_checkpoint,
-    )
-    saved_gain_reference = (
-        resume_checkpoint.get("rrlsso_gain_reference")
-        if resume_checkpoint is not None
-        else None
-    )
-    gain_reference = make_rrlsso_gain_reference(
-        model,
-        anchor_to_current=args.stage != "pretrain",
-        state=saved_gain_reference,
     )
     train_loader, val_loader = make_loaders(
         args, train_seed_offset=start_epoch
@@ -813,9 +698,6 @@ def train(args: argparse.Namespace) -> None:
     config = vars(args) | {
         "checkpoint_mode": run_mode,
         "run_metadata": run_metadata,
-        "rrlsso_regularization_reference_scalars": (
-            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
-        ),
         "parameter_count": parameter_count,
         "optimizer_impl": optimizer_impl,
         "actual_effective_batch": actual_effective_batch,
@@ -832,26 +714,19 @@ def train(args: argparse.Namespace) -> None:
         f"recipe=official_deit3 optimizer={optimizer_impl} lr={args.lr:g} "
         f"drop_path={args.drop_path_rate:g} repeated_aug={args.repeated_aug} "
         f"amp={args.amp_dtype} effective_batch={actual_effective_batch} "
-        f"virtual_group={args.runtime_augmentation_group_size} "
-        f"rrlsso_reg_base{RRLSSO_REGULARIZATION_REFERENCE_SCALARS}="
-        f"(gain={args.rrlsso_gain_reg:g},alpha={args.rrlsso_alpha_reg:g})",
+        f"virtual_group={args.runtime_augmentation_group_size}",
         flush=True,
     )
 
     metrics = output / "metrics.csv"
     mode = "a" if start_epoch and metrics.exists() else "w"
     fields = (
-        "epoch", "train_loss", "train_data_loss", "train_regularization", "lr",
-        "alpha_penalty", "gain_log_mean", "gain_log_std", "gain_anchor_rms",
-        "alpha_ratio_mean", "alpha_ratio_std", "alpha_fraction_gt_080",
-        "alpha_fraction_gt_095", "global_update", "val_loss", "val_acc",
+        "epoch", "train_loss", "lr", "gain_log_mean", "gain_log_std",
+        "alpha_mean", "alpha_std", "alpha_observed_min",
+        "alpha_observed_max", "beta_mean",
+        "global_update", "val_loss", "val_acc",
         "seconds", "peak_gb",
     )
-    if args.rrlsso_extended_diagnostics:
-        fields = fields + (
-            "gain_grad_norm", "alpha_grad_norm", "gain_reg_grad_ratio",
-            "alpha_reg_grad_ratio", "gain_update_norm", "alpha_update_norm",
-        )
     with metrics.open(mode, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         if mode == "w":
@@ -864,12 +739,7 @@ def train(args: argparse.Namespace) -> None:
             model.zero_grad(set_to_none=True)
             started = time.time()
             torch.cuda.reset_peak_memory_stats()
-            loss_sum = data_loss_sum = regularization_sum = 0.0
-            alpha_penalty_sum = 0.0
-            sampled_regularizer_gradients = None
-            sampled_total_gradients = None
-            sampled_updates = None
-            sampled_parameters_before = None
+            loss_sum = 0.0
             observed_steps = 0
             for step, (images, labels) in enumerate(train_loader):
                 if step >= steps_per_epoch:
@@ -887,40 +757,16 @@ def train(args: argparse.Namespace) -> None:
                     labels = labels.gt(0.0).to(labels.dtype)
                 with torch.autocast("cuda", dtype=amp_dtype):
                     data_loss = criterion(model(images), labels)
-                    regularization, regularization_components = rrlsso_regularization(
-                        model,
-                        gain_reference=gain_reference,
-                        gain_anchor_weight=args.rrlsso_gain_reg,
-                        alpha_saturation_weight=args.rrlsso_alpha_reg,
-                        alpha_saturation_fraction=args.rrlsso_alpha_saturation,
-                    )
-                    total_loss = data_loss + regularization
-                    loss = total_loss / args.grad_accum
-                if args.rrlsso_extended_diagnostics and step + 1 == steps_per_epoch:
-                    sampled_regularizer_gradients = regularization_gradient_norms(
-                        regularization, model
-                    )
+                    loss = data_loss / args.grad_accum
                 scaler.scale(loss).backward()
-                loss_sum += total_loss.detach().item()
-                data_loss_sum += data_loss.detach().item()
-                regularization_sum += regularization.detach().item()
-                alpha_penalty_sum += regularization_components["alpha_saturation"].detach().item()
+                loss_sum += data_loss.detach().item()
                 if (step + 1) % args.grad_accum == 0:
-                    sample_diagnostics = (
-                        args.rrlsso_extended_diagnostics
-                        and step + 1 == steps_per_epoch
-                    )
-                    if args.clip_grad or sample_diagnostics:
+                    if args.clip_grad:
                         scaler.unscale_(optimizer)
-                    if sample_diagnostics:
-                        sampled_total_gradients = solve_gradient_norms(model)
-                        sampled_parameters_before = solve_parameter_snapshot(model)
                     if args.clip_grad:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                     scaler.step(optimizer)
                     scaler.update()
-                    if sample_diagnostics:
-                        sampled_updates = solve_update_norms(model, sampled_parameters_before)
                     model.zero_grad(set_to_none=True)
                     global_update += 1
                     if model_ema is not None:
@@ -928,24 +774,18 @@ def train(args: argparse.Namespace) -> None:
                 if (step + 1) % args.log_interval == 0:
                     print(
                         f"epoch={epoch + 1} step={step + 1}/{steps_per_epoch} "
-                        f"loss={loss_sum / (step + 1):.4f} "
-                        f"reg={regularization_sum / (step + 1):.6g}",
+                        f"loss={loss_sum / (step + 1):.4f}",
                         flush=True,
                     )
             if observed_steps == 0:
                 raise RuntimeError("ImageNet training stream produced no batches")
             if observed_steps % args.grad_accum:
-                if args.clip_grad or args.rrlsso_extended_diagnostics:
+                if args.clip_grad:
                     scaler.unscale_(optimizer)
-                if args.rrlsso_extended_diagnostics:
-                    sampled_total_gradients = solve_gradient_norms(model)
-                    sampled_parameters_before = solve_parameter_snapshot(model)
                 if args.clip_grad:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 scaler.step(optimizer)
                 scaler.update()
-                if args.rrlsso_extended_diagnostics:
-                    sampled_updates = solve_update_norms(model, sampled_parameters_before)
                 model.zero_grad(set_to_none=True)
                 global_update += 1
                 if model_ema is not None:
@@ -980,37 +820,16 @@ def train(args: argparse.Namespace) -> None:
             val_loss, val_acc = evaluate(
                 model, val_loader, device, amp_dtype, args.max_val_steps
             )
-            parameter_diagnostics = rrlsso_parameter_diagnostics(model, gain_reference)
+            parameter_diagnostics = rrlsso_parameter_diagnostics(model)
             diagnostic_values = {
                 key: float(value.item()) for key, value in parameter_diagnostics.items()
             }
-            gradient_values = {}
-            if args.rrlsso_extended_diagnostics:
-                assert sampled_regularizer_gradients is not None
-                assert sampled_total_gradients is not None
-                assert sampled_updates is not None
-                gradient_values = {
-                    "gain_grad_norm": float(sampled_total_gradients["gain"].item()),
-                    "alpha_grad_norm": float(sampled_total_gradients["alpha"].item()),
-                    "gain_reg_grad_ratio": float(
-                        (sampled_regularizer_gradients["gain"] / sampled_total_gradients["gain"].clamp_min(1e-30)).item()
-                    ),
-                    "alpha_reg_grad_ratio": float(
-                        (sampled_regularizer_gradients["alpha"] / sampled_total_gradients["alpha"].clamp_min(1e-30)).item()
-                    ),
-                    "gain_update_norm": float(sampled_updates["gain"].item()),
-                    "alpha_update_norm": float(sampled_updates["alpha"].item()),
-                }
             current_lr = float(optimizer.param_groups[0]["lr"])
             row = {
                 "epoch": epoch + 1,
                 "train_loss": loss_sum / observed_steps,
-                "train_data_loss": data_loss_sum / observed_steps,
-                "train_regularization": regularization_sum / observed_steps,
                 "lr": current_lr,
-                "alpha_penalty": alpha_penalty_sum / observed_steps,
                 **diagnostic_values,
-                **gradient_values,
                 "global_update": global_update,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
@@ -1030,9 +849,6 @@ def train(args: argparse.Namespace) -> None:
                 "scaler": scaler.state_dict(),
                 "model_ema": model_ema.module.state_dict() if model_ema is not None else None,
                 "run_metadata": run_metadata,
-                "rrlsso_gain_reference": {
-                    key: value.detach().cpu() for key, value in gain_reference.items()
-                },
                 "epoch": epoch + 1,
                 "global_update": global_update,
                 "best_acc": best_acc,
@@ -1104,8 +920,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--gain-init", type=float, default=1.0)
-    parser.add_argument("--alpha-init", type=float, default=1.2)
-    parser.add_argument("--alpha-max", type=float, default=3.0)
+    parser.add_argument("--alpha-init", type=float, default=1.0)
     parser.add_argument("--hf-repo", default="timm/imagenet-1k-wds")
     parser.add_argument("--cache-dir", default="/local_nvme/imagenet-wds")
     parser.add_argument("--local-wds-dir", default="")
@@ -1126,10 +941,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--amp-dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ema-decay", type=float, default=0.99996)
-    parser.add_argument("--rrlsso-gain-reg", type=float, default=1e-4)
-    parser.add_argument("--rrlsso-alpha-reg", type=float, default=1e-4)
-    parser.add_argument("--rrlsso-alpha-saturation", type=float, default=0.8)
-    parser.add_argument("--rrlsso-extended-diagnostics", action="store_true")
     parser.add_argument("--allow-unfused-lamb", action="store_true")
     parser.add_argument("--allow-batch-mismatch", action="store_true")
     parser.add_argument("--log-interval", type=int, default=100)

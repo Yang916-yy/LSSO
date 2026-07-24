@@ -1,4 +1,4 @@
-"""Official DeiT-III ImageNet-1K recipes and RRLSSO-only regularizers."""
+"""Official DeiT-III ImageNet-1K recipes."""
 
 from __future__ import annotations
 
@@ -12,13 +12,6 @@ from PIL import ImageFilter, ImageOps
 from timm.data import create_transform
 from timm.data.transforms import RandomResizedCropAndInterpolation
 from torchvision import transforms
-
-from experiments.rrlsso_regularization import (
-    RRLSSO_REGULARIZATION_REFERENCE_SCALARS,
-    make_rrlsso_gain_reference,
-    rrlsso_parameter_diagnostics,
-    rrlsso_regularization,
-)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -185,15 +178,11 @@ def virtual_group_repeated_samples(
 
 __all__ = [
     "DEIT3_OFFICIAL_RECIPES",
-    "RRLSSO_REGULARIZATION_REFERENCE_SCALARS",
     "DeiT3Recipe",
     "model_size",
-    "make_rrlsso_gain_reference",
     "official_recipe",
     "randaugment_finetune_transform",
     "virtual_group_repeated_samples",
-    "rrlsso_regularization",
-    "rrlsso_parameter_diagnostics",
     "three_augment_transform",
     "validation_transform",
 ]

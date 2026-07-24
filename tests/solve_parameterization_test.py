@@ -37,55 +37,22 @@ def _copy_shared_state(source: torch.nn.Module, target: torch.nn.Module) -> None
 def test_defaults_use_frozen_trace_initialization(factory) -> None:
     layer = factory("gain_alpha")
     gain, alpha = layer.effective_gain_alpha()
-    assert layer.alpha_max == 3.0
-    torch.testing.assert_close(layer._alpha_max_state, torch.tensor(3.0))
+    assert not hasattr(layer, "alpha_max")
+    assert not hasattr(layer, "_alpha_max_state")
     torch.testing.assert_close(
         gain, torch.full_like(gain, 1.0), rtol=2e-7, atol=2e-7
     )
     torch.testing.assert_close(
-        alpha, torch.full_like(alpha, 1.2), rtol=2e-7, atol=2e-7
+        alpha, torch.full_like(alpha, 1.0), rtol=2e-7, atol=2e-7
     )
 
 
-def test_pre_metadata_gain_alpha_checkpoint_preserves_legacy_ceiling() -> None:
-    legacy = RRLSSO(
-        32,
-        4,
-        rank=8,
-        gain_init=1.4426742274994273,
-        alpha_init=1.0776072417497349,
-        alpha_max=2.0,
-    )
-    state = legacy.state_dict()
-    state.pop("_alpha_max_state")
-
-    restored = RRLSSO(32, 4, rank=8)
-    restored.load_state_dict(state, strict=True)
-    gain, alpha = restored.effective_gain_alpha()
-    assert restored.alpha_max == 2.0
-    torch.testing.assert_close(
-        gain, torch.full_like(gain, 1.4426742274994273), rtol=2e-7, atol=2e-7
-    )
-    torch.testing.assert_close(
-        alpha, torch.full_like(alpha, 1.0776072417497349), rtol=2e-7, atol=2e-7
-    )
-
-
-def test_legacy_state_dict_is_migrated_exactly() -> None:
+def test_removed_bounded_checkpoint_is_rejected_instead_of_silently_migrated() -> None:
     layer = RRLSSO(32, 4, rank=8)
     state = layer.state_dict()
-    state.pop("theta_gain")
-    state.pop("theta_alpha")
-    state["theta_mu"] = torch.zeros(4)
-    state["theta_gamma"] = torch.full((4,), 0.5)
-    layer.load_state_dict(state, strict=True)
-    gain, alpha = layer.effective_gain_alpha()
-    torch.testing.assert_close(
-        gain, torch.full_like(gain, 1.4426742274994273), rtol=2e-7, atol=2e-7
-    )
-    torch.testing.assert_close(
-        alpha, torch.full_like(alpha, 1.0776072417497349), rtol=2e-7, atol=2e-7
-    )
+    state["_alpha_max_state"] = torch.tensor(3.0)
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        layer.load_state_dict(state, strict=True)
 
 
 def test_gain_alpha_coordinates_are_decoupled() -> None:
@@ -144,12 +111,52 @@ def test_fixed_gain_initialization_is_function_matched(factory, groups, width) -
     assert not hasattr(fixed, "theta_gain")
 
 
-def test_gain_alpha_rejects_initial_strength_above_bound() -> None:
+def test_gain_alpha_requires_positive_but_has_no_upper_bound() -> None:
     with pytest.raises(ValueError, match="alpha_init"):
         RRLSSO(
             32,
             4,
             rank=8,
             solve_parameterization="gain_alpha",
-            alpha_max=1.0,
+            alpha_init=0.0,
         )
+    layer = RRLSSO(32, 4, rank=8, alpha_init=100.0)
+    _, alpha = layer.effective_gain_alpha()
+    torch.testing.assert_close(alpha, torch.full_like(alpha, 100.0))
+
+
+def test_log_alpha_parameterization_is_exact_and_unbounded() -> None:
+    layer = RRLSSO(32, 4, rank=8, alpha_init=1.0).double()
+    values = torch.tensor([-8.0, -1.0, 2.0, 8.0], dtype=torch.float64)
+    with torch.no_grad():
+        layer.theta_alpha.copy_(values)
+    _, alpha = layer.effective_gain_alpha()
+    torch.testing.assert_close(alpha, values.exp(), rtol=1e-12, atol=0.0)
+    assert alpha[-1] > 1_000.0
+
+
+def test_reciprocal_woodbury_matches_direct_solve_at_large_alpha() -> None:
+    torch.manual_seed(41)
+    tokens, rank, rhs = 19, 5, 7
+    basis = torch.randn(tokens, rank, dtype=torch.float64)
+    values = torch.randn(tokens, rhs, dtype=torch.float64)
+    alpha = torch.tensor(10_000.0, dtype=torch.float64)
+    beta = alpha.reciprocal()
+
+    direct = torch.linalg.solve(
+        torch.eye(tokens, dtype=torch.float64) + alpha * (basis @ basis.mT),
+        values,
+    )
+    reciprocal = values - basis @ torch.linalg.solve(
+        beta * torch.eye(rank, dtype=torch.float64) + basis.mT @ basis,
+        basis.mT @ values,
+    )
+    torch.testing.assert_close(reciprocal, direct, rtol=2e-10, atol=2e-10)
+
+
+def test_log_alpha_spectral_response_derivative_is_bounded_by_one_quarter() -> None:
+    theta = torch.linspace(-12.0, 12.0, 4097, dtype=torch.float64)
+    eigenvalues = torch.logspace(-6, 6, 25, dtype=torch.float64)
+    scaled = theta.exp().unsqueeze(1) * eigenvalues.unsqueeze(0)
+    derivative_magnitude = scaled / (1.0 + scaled).square()
+    assert derivative_magnitude.max() <= 0.25 + 1e-15

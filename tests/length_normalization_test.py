@@ -102,4 +102,4 @@ def test_bidirectional_defaults_start_at_frozen_trace_strength() -> None:
     )
     for layer in layers:
         _gain, strength = layer.effective_gain_alpha()
-        torch.testing.assert_close(strength, torch.full_like(strength, 1.2))
+        torch.testing.assert_close(strength, torch.full_like(strength, 1.0))

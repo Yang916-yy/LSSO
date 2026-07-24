@@ -18,12 +18,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler
 
-from experiments.rrlsso_regularization import (
-    RRLSSO_REGULARIZATION_REFERENCE_SCALARS,
-    make_rrlsso_gain_reference,
-    rrlsso_parameter_diagnostics,
-    rrlsso_regularization,
-)
+from experiments.rrlsso_diagnostics import rrlsso_parameter_diagnostics
 
 
 @dataclass
@@ -46,9 +41,6 @@ class TrainingConfig:
     max_eval_batches: int = 0
     max_parameters: int = 0
     select_last: bool = False
-    rrlsso_gain_reg: float = 0.0
-    rrlsso_alpha_reg: float = 0.0
-    rrlsso_alpha_saturation: float = 0.8
 
 
 def seed_all(seed: int) -> None:
@@ -499,16 +491,6 @@ def train_classifier(
     output = Path(config.output)
     output.mkdir(parents=True, exist_ok=True)
     named_parameters = list(model.named_parameters())
-    solve_gain_scalars = sum(
-        parameter.numel()
-        for name, parameter in named_parameters
-        if name.endswith("theta_gain")
-    )
-    solve_alpha_scalars = sum(
-        parameter.numel()
-        for name, parameter in named_parameters
-        if name.endswith("theta_alpha")
-    )
     parameter_breakdown = {
         "total": sum(parameter.numel() for _, parameter in named_parameters),
         "position": sum(
@@ -546,21 +528,6 @@ def train_classifier(
         "source_revision": source_revision(),
         "parameters": parameter_breakdown["total"],
         "parameter_breakdown": parameter_breakdown,
-        "rrlsso_regularization_reference_scalars": (
-            RRLSSO_REGULARIZATION_REFERENCE_SCALARS
-        ),
-        "rrlsso_gain_scalars": solve_gain_scalars,
-        "rrlsso_alpha_scalars": solve_alpha_scalars,
-        "rrlsso_effective_gain_mean_weight": (
-            config.rrlsso_gain_reg
-            * solve_gain_scalars
-            / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
-        ),
-        "rrlsso_effective_alpha_mean_weight": (
-            config.rrlsso_alpha_reg
-            * solve_alpha_scalars
-            / RRLSSO_REGULARIZATION_REFERENCE_SCALARS
-        ),
     }
     (output / "config.json").write_text(
         json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
@@ -574,12 +541,11 @@ def train_classifier(
             if "local_spatial_blocks" in name
             else 1.0
         )
-        explicitly_regularized = (
-            config.rrlsso_gain_reg > 0.0 and name.endswith("theta_gain")
-        ) or (
-            config.rrlsso_alpha_reg > 0.0 and name.endswith("theta_alpha")
+        weight_decay = (
+            0.0
+            if name.endswith(("theta_gain", "theta_alpha"))
+            else config.weight_decay
         )
-        weight_decay = 0.0 if explicitly_regularized else config.weight_decay
         parameter_groups.setdefault((lr, weight_decay), []).append(parameter)
     optimizer_parameters = [
         {"params": parameters, "lr": lr, "weight_decay": weight_decay}
@@ -609,10 +575,8 @@ def train_classifier(
     )
     start_epoch, best, stale_epochs = 0, float("-inf"), 0
     last_path = output / "last.pt"
-    resume_state = None
     if config.resume and last_path.exists():
         state = torch.load(last_path, map_location="cpu", weights_only=False)
-        resume_state = state
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
@@ -621,15 +585,6 @@ def train_classifier(
         stale_epochs = int(state.get("stale_epochs", 0))
         _restore_loader_state(train_loader, state.get("train_loader"))
         _restore_rng_state(state.get("rng"))
-    gain_reference = make_rrlsso_gain_reference(
-        model,
-        anchor_to_current=False,
-        state=(
-            resume_state.get("rrlsso_gain_reference")
-            if resume_state is not None
-            else None
-        ),
-    )
     metrics_path = output / "metrics.jsonl"
     for epoch in range(start_epoch, config.epochs):
         started = time.perf_counter()
@@ -638,7 +593,7 @@ def train_classifier(
         if hasattr(model, "set_augmentation_epoch"):
             model.set_augmentation_epoch(epoch)
         model.train()
-        train_loss, train_regularization, examples = 0.0, 0.0, 0
+        train_loss, examples = 0.0, 0
         accumulated_examples = 0
         optimizer.zero_grad(set_to_none=True)
         for batch_index, raw_batch in enumerate(train_loader):
@@ -654,19 +609,11 @@ def train_classifier(
                     batch["labels"],
                     label_smoothing=config.label_smoothing,
                 )
-                regularization, _ = rrlsso_regularization(
-                    model,
-                    gain_reference=gain_reference,
-                    gain_anchor_weight=config.rrlsso_gain_reg,
-                    alpha_saturation_weight=config.rrlsso_alpha_reg,
-                    alpha_saturation_fraction=config.rrlsso_alpha_saturation,
-                )
-                total_loss = loss + regularization
             batch_size = batch["labels"].numel()
             # Accumulate summed-example gradients, then normalize once per
             # optimizer update. This exactly matches a large batch even when
             # the final micro-batch is short.
-            (total_loss * batch_size).backward()
+            (loss * batch_size).backward()
             accumulated_examples += batch_size
             update_due = (batch_index - group_start + 1) == group_size
             if update_due:
@@ -679,7 +626,6 @@ def train_classifier(
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_examples = 0
             train_loss += float(loss.detach()) * batch_size
-            train_regularization += float(regularization.detach()) * batch_size
             examples += batch_size
         train_finished = time.perf_counter()
         validation = evaluate(
@@ -692,9 +638,7 @@ def train_classifier(
         score = validation["accuracy"]
         solve_diagnostics = {
             key: float(value.item())
-            for key, value in rrlsso_parameter_diagnostics(
-                model, gain_reference
-            ).items()
+            for key, value in rrlsso_parameter_diagnostics(model).items()
         }
         improved = (
             config.select_last
@@ -709,7 +653,6 @@ def train_classifier(
         metrics = {
             "epoch": epoch,
             "train_loss": train_loss / max(examples, 1),
-            "train_regularization": train_regularization / max(examples, 1),
             "val_loss": validation["loss"],
             "val_accuracy": validation["accuracy"],
             "val_macro_f1": validation["macro_f1"],
@@ -737,9 +680,6 @@ def train_classifier(
             "rng": _rng_state(),
             "train_loader": _loader_state(train_loader),
             "run_config": run_config,
-            "rrlsso_gain_reference": {
-                key: value.detach().cpu() for key, value in gain_reference.items()
-            },
         }
         atomic_save(state, last_path)
         if improved:

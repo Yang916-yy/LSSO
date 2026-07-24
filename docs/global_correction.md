@@ -21,19 +21,33 @@ backward is orthogonal to the single global radial direction. The custom
 backward includes the derivative of `s(Z)`; omitting it breaks that invariant.
 
 The canonical learnable scalars are per-head output gain `g` and solve strength
-`alpha`. The frozen default is the deliberately simple `g=1`, `alpha=1.2`,
-with `alpha_max=3.0`. Controlled ten-epoch CIFAR-100 screens found a broad
-operating plateau: `alpha_init` from roughly 1.08 to 1.60 and `g_init` from
-roughly 0.75 to 1.44 trained comparably. A separate normalization comparison
-at matched initialization reached 50.46% validation accuracy for trace
-normalization and 48.39% for token RMS. Increasing the ceiling from 2 to 3
-changed ten-epoch accuracy by only 0.18 percentage points while keeping the
-initial sigmoid coordinate away from saturation and leaving room for long-run
-head specialization.
+`alpha`. Both use log coordinates:
 
-This is a robust starting interval, not a universal optimum. New image
-resolutions, ranks, or downstream tasks should first use this default and then
-run a small controlled bracket around it. The maintained initialization search
+```text
+g     = exp(theta_gain)
+alpha = exp(theta_alpha)
+beta  = 1 / alpha
+```
+
+The default `theta_gain=theta_alpha=0` gives `g=alpha=beta=1`. Ignoring
+epsilon, trace normalization fixes `trace(U.T @ U)=r`, so the mean compact
+eigenvalue is one and the initial resolvent response there is exactly one half.
+There is no learned-strength ceiling or dedicated scalar regularizer: positive
+alpha already preserves the SPD resolvent, while its unbounded range spans the
+continuous path from identity propagation to relation-subspace projection.
+
+The maintained Woodbury implementation uses the reciprocal form
+
+```text
+Y = g * (C - U @ solve(beta * I + U.T @ U, U.T @ C))
+```
+
+which avoids forming a large `alpha * Gram` term and naturally approaches the
+projection limit as `beta` tends to zero.
+
+New image resolutions, ranks, or downstream tasks should first use this
+dimensionless default and then inspect the learned per-head alpha distribution.
+The maintained initialization search
 is `experiments/search/sweep_trace_alpha_init_cifar100.py`; the superseded
 RMS/length-normalization diagnostic is preserved under
 `archive/retired_auxiliary_benchmarks/experiments/`.

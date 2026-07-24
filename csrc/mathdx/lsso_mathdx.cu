@@ -304,10 +304,17 @@ __global__ void masked_trace_solve_readout_kernel(
     }
     __syncthreads();
     const float alpha_batch = effective_alpha_shared;
+    const float beta_batch = 1.0f / alpha_batch;
     for (int linear = threadIdx.x; linear < Rank * Rank; linear += blockDim.x) {
         const int row = linear / Rank;
         const int col = linear - row * Rank;
-        a[row * lda + col] = alpha_batch * gemm_output[linear] + (row == col ? 1.0f : 0.0f);
+        // Reciprocal-strength Woodbury:
+        //   (I + alpha U U^T)^-1 C
+        //     = C - U (alpha^-1 I + U^T U)^-1 U^T C.
+        // This avoids forming alpha * Gram and removes the matching alpha
+        // multiplication from the readout as alpha grows.
+        a[row * lda + col] =
+            gemm_output[linear] + (row == col ? beta_batch : 0.0f);
     }
     __syncthreads();
     Potrf().execute(a, lda, info + batch);
@@ -409,7 +416,7 @@ __global__ void masked_trace_solve_readout_kernel(
                                 sample * output_stride_b + head * output_stride_h +
                                 token * output_stride_n + global_col * output_stride_w;
                             output[output_index] = static_cast<scalar_t>(
-                                (local - alpha_batch * gemm_output[linear]) *
+                                (local - gemm_output[linear]) *
                                 gain[batch]);
                         } else {
                             const int64_t output_index =

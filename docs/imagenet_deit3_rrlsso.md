@@ -53,56 +53,28 @@ contains duplicate views of the same source image. This reproduces the relevant
 semantics of Meta's distributed RASampler without sacrificing single-GPU
 throughput.
 
-## RRLSSO-specific gauge fixing and saturation control
+## RRLSSO solve-scale parameterization
 
-These terms address two identifiable properties of the solve parameterization;
-they are not generic anti-overfitting penalties. With
-`g = exp(theta_g)` and `alpha/alpha_max = sigmoid(theta_alpha)`, the defaults are
+Trace normalization removes the relation basis' arbitrary global energy scale.
+Each layer and head then learns an unrestricted positive resolvent strength:
 
 ```text
-M_ref   = 144  (12 Base layers x 12 heads)
-L_gain  = 1e-4 * (M_gain / M_ref) * mean((theta_g - theta_g_ref)^2)
-L_alpha = 1e-4 * (M_alpha / M_ref)
-          * mean(ReLU(theta_alpha - logit(0.8))^2).
+g     = exp(theta_gain)
+alpha = exp(theta_alpha)
+beta  = exp(-theta_alpha)
 ```
 
-The gain term fixes the redundant scale shared by a head gain and the
-corresponding columns of the output projection. Pretraining uses
-`theta_g_ref=0` (`g_ref=1`). Refinement captures the loaded checkpoint's
-per-layer, per-head `theta_g` values so it preserves learned head specialization.
-This reference is saved in every checkpoint and restored unchanged on resume.
+Both log coordinates start at zero. With epsilon ignored,
+`trace(U.T @ U)=rank`, so the average compact spectral scale is one and
+`alpha=beta=1` places the initial response at its half-response point.
 
-The alpha term acts directly in logit space. It is exactly zero, with zero
-gradient, below `alpha/alpha_max=0.8`; unlike a post-sigmoid penalty, its pullback
-does not disappear when the sigmoid approaches saturation. It preserves
-optimization controllability rather than algebraic invertibility—the SPD solve
-remains invertible for every finite nonnegative alpha.
-
-The reported penalty diagnostics remain true global means over all participating
-layers and heads. In the training objective, each mean is multiplied by
-`M/144`, where `M` is its static number of participating scalars. Thus the CLI
-weight retains its Base-model meaning while the raw restoring gradient on one
-head is invariant to model depth and head count. At the default reference
-weight, the effective mean coefficients are `5e-5`, `1e-4`, and approximately
-`2.667e-4` for Small (72 scalars), Base (144), and Large (384), respectively.
-This also prevents a rarely active alpha hinge from becoming weaker merely
-because the surrounding model contains more inactive heads. The losses are
-scaled together with the task loss under gradient accumulation and can be
-disabled with zero weights for the exact-recipe ablation. The scalar parameters
-are excluded from ordinary optimizer weight decay, so the gain constraint is
-not duplicated.
-
-At each epoch boundary, `metrics.csv` records the core interpretable statistics:
-log-gain mean/spread and reference-relative RMS drift, alpha-ratio mean/spread,
-fractions above 0.8 and 0.95, and alpha-barrier magnitude. The redundant raw
-gain penalty is omitted because it is exactly the square of gain-anchor RMS;
-single-head extrema are left to post-hoc checkpoint analysis.
-
-`--rrlsso-extended-diagnostics` additionally records solve-scalar gradient
-norms, regularizer/total-gradient ratios, and actual optimizer update norms.
-This developer diagnostic is off by default, so formal training does not invoke
-an extra `autograd.grad`, force a diagnostic GradScaler unscale, or snapshot
-parameters at every epoch boundary.
+No RRLSSO-specific loss term or alpha ceiling is applied. The conditional map
+in `C` remains an SPD resolvent for every positive alpha. The fused
+implementation evaluates the reciprocal Woodbury system
+`beta I + U.T @ U`, avoiding both a large `alpha * Gram` matrix and a repeated
+alpha multiplication in the readout. The solve scalars remain outside ordinary
+weight decay. `metrics.csv` records log-gain spread and the absolute
+alpha/beta distribution without altering training.
 
 ## Formal launch
 
@@ -139,7 +111,7 @@ The position embedding is bicubically resized between patch grids. A refinement
 stage initializes a fresh EMA from the resized main model; only an actual resume
 restores the stage's saved EMA. Each stage has independent atomic `last.pt` and
 `best.pt` checkpoints, including model, EMA, optimizer, scheduler, GradScaler,
-completed epoch, update count, gain gauge reference, and RNG state. Streaming
+completed epoch, update count, and RNG state. Streaming
 order after a restart remains newly stochastic.
 
 ### Checkpoint state machine
@@ -147,18 +119,18 @@ order after a restart remains newly stochastic.
 Initialization and resume are separate operations, not two aliases for loading a
 checkpoint:
 
-| Intended operation | Required arguments | Gain reference |
-|---|---|---|
-| New pretraining | no stage checkpoint exists | zero (`g_ref=1`) |
-| Resume pretraining | `--resume`, with this stage's `last.pt` | restored zero reference |
-| New refinement | `--no-resume --init-checkpoint PREVIOUS/best.pt` | captured from the loaded raw model |
-| Resume refinement | `--resume`, with this stage's `last.pt`; no initializer | restored unchanged |
+| Intended operation | Required arguments |
+|---|---|
+| New pretraining | no stage checkpoint exists |
+| Resume pretraining | `--resume`, with this stage's `last.pt` |
+| New refinement | `--no-resume --init-checkpoint PREVIOUS/best.pt` |
+| Resume refinement | `--resume`, with this stage's `last.pt`; no initializer |
 
 The official path deliberately initializes refinement from the raw model rather
 than EMA. A fresh refinement EMA is then created from exactly those raw weights,
-so its gain reference and trained model agree. Checkpoints carry a schema and
+so its starting state and trained model agree. Checkpoints carry a schema and
 stage/model/resolution/rank/alpha metadata; resume fails loudly on incompatible
-or legacy state rather than silently moving the gauge anchor. Likewise,
+or legacy state rather than silently changing parameter semantics. Likewise,
 `--init-checkpoint` together with `--resume` is rejected. `--overwrite-output`
 is required to replace an existing stage checkpoint and is intended only for
 deliberate smoke reruns or discarded experiments.

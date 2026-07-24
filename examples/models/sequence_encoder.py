@@ -61,8 +61,7 @@ class SequenceMixerBlock(nn.Module):
         dropout: float = 0.0,
         rotary_1d: bool = False,
         gain_init: float = 1.0,
-        alpha_init: float = 1.2,
-        alpha_max: float = 3.0,
+        alpha_init: float = 1.0,
     ) -> None:
         super().__init__()
         hidden = int(dim * mlp_ratio)
@@ -76,7 +75,6 @@ class SequenceMixerBlock(nn.Module):
             rotary_1d=rotary_1d,
             gain_init=gain_init,
             alpha_init=alpha_init,
-            alpha_max=alpha_max,
         )
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
@@ -131,8 +129,7 @@ class SequenceMixerEncoder(nn.Module):
         local_motif_dilations: tuple[int, ...] = (),
         local_motif_layer_scale: float = 1e-3,
         gain_init: float = 1.0,
-        alpha_init: float = 1.2,
-        alpha_max: float = 3.0,
+        alpha_init: float = 1.0,
     ) -> None:
         super().__init__()
         if pooling not in {"mean", "max", "meanmax"}:
@@ -202,7 +199,6 @@ class SequenceMixerEncoder(nn.Module):
                 rotary_1d=True,
                 gain_init=gain_init,
                 alpha_init=alpha_init,
-                alpha_max=alpha_max,
             )
             for _ in range(depth)
         )

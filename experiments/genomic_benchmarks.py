@@ -246,11 +246,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--gain-init", type=float, default=1.0)
-    parser.add_argument("--alpha-init", type=float, default=1.2)
-    parser.add_argument("--alpha-max", type=float, default=3.0)
-    parser.add_argument("--rrlsso-gain-reg", type=float, default=0.0)
-    parser.add_argument("--rrlsso-alpha-reg", type=float, default=0.0)
-    parser.add_argument("--rrlsso-alpha-saturation", type=float, default=0.8)
+    parser.add_argument("--alpha-init", type=float, default=1.0)
     parser.add_argument("--position-rank", type=int, default=0)
     parser.add_argument(
         "--local-motif-kernel",
@@ -405,7 +401,6 @@ def main() -> None:
         local_motif_layer_scale=args.local_motif_layer_scale,
         gain_init=args.gain_init,
         alpha_init=args.alpha_init,
-        alpha_max=args.alpha_max,
     )
     model = ReverseComplementSequenceClassifier(
         encoder,
@@ -475,9 +470,6 @@ def main() -> None:
             max_train_batches=args.max_train_batches,
             max_eval_batches=args.max_eval_batches,
             max_parameters=args.max_parameters,
-            rrlsso_gain_reg=args.rrlsso_gain_reg,
-            rrlsso_alpha_reg=args.rrlsso_alpha_reg,
-            rrlsso_alpha_saturation=args.rrlsso_alpha_saturation,
         ),
         metadata={
             "suite": "genomic",
@@ -487,10 +479,6 @@ def main() -> None:
             "rank": args.rank,
             "gain_init": args.gain_init,
             "alpha_init": args.alpha_init,
-            "alpha_max": args.alpha_max,
-            "rrlsso_gain_reg": args.rrlsso_gain_reg,
-            "rrlsso_alpha_reg": args.rrlsso_alpha_reg,
-            "rrlsso_alpha_saturation": args.rrlsso_alpha_saturation,
             "dim": args.dim,
             "depth": args.depth,
             "heads": args.heads,

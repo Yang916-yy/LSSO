@@ -61,10 +61,12 @@ def _trace_reference(
     denominator = gram.diagonal(dim1=-2, dim2=-1).sum(-1) + eps * elements
     scale2 = elements / denominator.clamp_min(torch.finfo(torch.float32).tiny)
     effective = alpha * scale2
-    system = torch.eye(rank, device=u.device) + effective[:, None, None] * gram
+    system = gram + effective.reciprocal()[:, None, None] * torch.eye(
+        rank, device=u.device
+    )
     compact = torch.linalg.solve(system, rhs).to(u.dtype).float()
     output = gain[:, None, None] * (
-        cbh - effective[:, None, None] * (ubh @ compact)
+        cbh - ubh @ compact
     )
     output = output.view(B, H, N, c.shape[-1])
     output = torch.where(active4, output, torch.zeros_like(output))

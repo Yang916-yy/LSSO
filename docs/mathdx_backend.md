@@ -21,7 +21,9 @@ statistics in FP32, performs FP32 POTRF/POTRS, rounds the compact solution once
 to the activation dtype, and writes
 
 ```text
-Y = gain * (C - effective_alpha * U @ K)
+beta_eff = 1 / effective_alpha
+K = solve(beta_eff * I + U.T @ U, U.T @ C)
+Y = gain * (C - U @ K)
 ```
 
 directly. Mask predicates are evaluated before U/C loads, so poisoned padding

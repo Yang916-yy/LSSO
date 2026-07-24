@@ -73,9 +73,8 @@ def command_for(
     solve = frozen.get(
         "solve",
         {
-            "gain_init": 1.4426742274994273,
-            "alpha_init": 1.0776072417497349,
-            "alpha_max": 2.0,
+            "gain_init": 1.0,
+            "alpha_init": 1.0,
         },
     )
     command = [
@@ -93,7 +92,6 @@ def command_for(
         "--rank", str(size["rank"]),
         "--gain-init", str(solve["gain_init"]),
         "--alpha-init", str(solve["alpha_init"]),
-        "--alpha-max", str(solve["alpha_max"]),
         "--max-parameters", str(size["max_parameters"]),
         "--pooling", str(recipe["pooling"]),
         "--reverse-complement-probability",
@@ -101,16 +99,6 @@ def command_for(
         "--local-motif-kernel", str(frozen["local_motif_kernel"]),
         "--training-profile", str(recipe["training_profile"]),
     ]
-    regularization = frozen.get("regularization", {})
-    if mixer == "rrlsso" and regularization:
-        command += [
-            "--rrlsso-gain-reg",
-            str(regularization["gain_anchor_weight_base144"]),
-            "--rrlsso-alpha-reg",
-            str(regularization["alpha_saturation_weight_base144"]),
-            "--rrlsso-alpha-saturation",
-            str(regularization.get("alpha_saturation_fraction", 0.8)),
-        ]
     if recipe.get("posthoc_rc_eval", False):
         command.append("--posthoc-rc-eval")
     if args.data_root:

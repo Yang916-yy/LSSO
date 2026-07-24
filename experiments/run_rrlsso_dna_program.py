@@ -76,8 +76,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--rrlsso-gain-reg", type=float, default=1e-4)
-    parser.add_argument("--rrlsso-alpha-reg", type=float, default=1e-4)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument(
@@ -117,8 +115,6 @@ def common_command(args: argparse.Namespace, output: Path, dataset: str) -> list
         "--eval-batch-size", str(args.eval_batch_size),
         "--lr", str(args.lr),
         "--weight-decay", str(args.weight_decay),
-        "--rrlsso-gain-reg", str(args.rrlsso_gain_reg),
-        "--rrlsso-alpha-reg", str(args.rrlsso_alpha_reg),
         "--warmup-ratio", str(args.warmup_ratio),
         "--dropout", str(args.dropout),
     ]
@@ -392,15 +388,7 @@ def freeze_base(
         },
         "solve": {
             "gain_init": 1.0,
-            "alpha_init": 1.2,
-            "alpha_max": 3.0,
-        },
-        "regularization": {
-            "gain_anchor_weight_base144": args.rrlsso_gain_reg,
-            "alpha_saturation_weight_base144": args.rrlsso_alpha_reg,
-            "alpha_saturation_fraction": 0.8,
-            "active_scalars": candidate["size"].depth * candidate["size"].heads,
-            "reference_scalars": 144,
+            "alpha_init": 1.0,
         },
         "training": {
             "epochs": 100,

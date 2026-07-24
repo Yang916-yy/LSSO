@@ -39,8 +39,8 @@ def _read_result(path: Path, epochs: int) -> dict[str, float] | None:
         "peak_mem_gb": max(float(row["peak_mem_gb"]) for row in rows),
         "train_seconds": sum(float(row["epoch_sec"]) for row in rows),
         "final_alpha_mean": float(rows[-1]["gamma_over_mu_mean"]),
-        "final_alpha_min": float(rows[-1]["gamma_over_mu_min"]),
-        "final_alpha_max": float(rows[-1]["gamma_over_mu_max"]),
+        "final_alpha_observed_min": float(rows[-1]["gamma_over_mu_min"]),
+        "final_alpha_observed_max": float(rows[-1]["gamma_over_mu_max"]),
     }
 
 
@@ -69,7 +69,6 @@ def main() -> None:
         default=[0.25, 0.5, 0.8, 1.0776072417497349, 1.35, 1.6, 1.85],
     )
     parser.add_argument("--gain", type=float, default=1.4426742274994273)
-    parser.add_argument("--alpha-max", type=float, default=2.0)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -89,8 +88,8 @@ def main() -> None:
         raise ValueError("initialization screening requires at least 10 epochs")
     if args.gain <= 0:
         raise ValueError("gain must be positive")
-    if any(not 0 < alpha < args.alpha_max for alpha in args.alphas):
-        raise ValueError(f"every alpha must lie in (0, {args.alpha_max})")
+    if any(alpha <= 0 for alpha in args.alphas):
+        raise ValueError("every alpha must be positive")
     if len(set(args.alphas)) != len(args.alphas):
         raise ValueError("alpha initializations must be unique")
 
@@ -124,7 +123,6 @@ def main() -> None:
                 "--rank", "32",
                 "--gain-init", str(args.gain),
                 "--alpha-init", str(alpha),
-                "--alpha-max", str(args.alpha_max),
                 "--solve-parameterization", "gain_alpha",
                 "--basis-normalization", "trace",
                 "--length-normalize",

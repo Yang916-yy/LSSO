@@ -20,9 +20,7 @@ from .types import LSSOAux, LSSODiagnostics, SolveStateCache
 
 
 DEFAULT_GAIN_INIT = 1.0
-DEFAULT_ALPHA_INIT = 1.2
-DEFAULT_ALPHA_MAX = 3.0
-_LEGACY_GAIN_ALPHA_MAX = 2.0
+DEFAULT_ALPHA_INIT = 1.0
 
 
 def _initialize_solve_parameters(
@@ -32,9 +30,8 @@ def _initialize_solve_parameters(
     solve_parameterization: str,
     gain_init: float,
     alpha_init: float,
-    alpha_max: float,
 ) -> None:
-    """Create the canonical gain/strength parameter pair."""
+    """Create the canonical gain and unbounded positive solve strength."""
 
     if solve_parameterization not in {"gain_alpha", "fixed_gain_alpha"}:
         raise ValueError(
@@ -43,32 +40,12 @@ def _initialize_solve_parameters(
         )
     if gain_init <= 0:
         raise ValueError(f"gain_init must be positive, got {gain_init}")
-    if alpha_max < 0:
-        raise ValueError(f"alpha_max must be non-negative, got {alpha_max}")
-    if not 0 <= alpha_init <= alpha_max:
-        raise ValueError(
-            f"alpha_init must lie in [0, alpha_max], got {alpha_init} "
-            f"for alpha_max={alpha_max}"
-        )
+    if alpha_init <= 0:
+        raise ValueError(f"alpha_init must be positive, got {alpha_init}")
 
     module.solve_parameterization = solve_parameterization
-    module.alpha_max = float(alpha_max)
-    module.register_buffer(
-        "_alpha_max_state",
-        torch.tensor(float(alpha_max), dtype=torch.float32),
-        persistent=True,
-    )
-    module._global_disabled = bool(module.no_global or alpha_max == 0.0)
-    if alpha_max == 0:
-        theta_alpha0 = torch.tensor(0.0, dtype=torch.float64)
-    else:
-        fraction = torch.tensor(alpha_init / float(alpha_max), dtype=torch.float64)
-        if not 0.0 < float(fraction) < 1.0:
-            raise ValueError(
-                "finite sigmoid initialization requires "
-                f"0 < alpha_init < alpha_max, got {alpha_init}, {alpha_max}"
-            )
-        theta_alpha0 = torch.logit(fraction)
+    module._global_disabled = bool(module.no_global)
+    theta_alpha0 = torch.log(torch.tensor(alpha_init, dtype=torch.float64))
     if solve_parameterization == "gain_alpha":
         module.theta_gain = nn.Parameter(
             torch.full(
@@ -90,15 +67,13 @@ def _initialize_solve_parameters(
 
 
 def _solve_parameters(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the canonical per-head output gain and solve strength."""
+    """Return gain and an unbounded positive log-parameterized strength."""
 
-    alpha_max = module._alpha_max_state.to(dtype=module.theta_alpha.dtype)
     if module.solve_parameterization == "gain_alpha":
         gain = torch.exp(module.theta_gain)
-        alpha = alpha_max * torch.sigmoid(module.theta_alpha)
     else:
         gain = torch.ones_like(module.theta_alpha)
-        alpha = alpha_max * torch.sigmoid(module.theta_alpha)
+    alpha = torch.exp(module.theta_alpha)
     if module.no_global:
         alpha = torch.zeros_like(alpha)
     return gain, alpha
@@ -110,75 +85,6 @@ def _solve_coefficients(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
     gain, alpha = _solve_parameters(module)
     mu = gain.reciprocal()
     return mu, alpha * mu
-
-
-def _legacy_solve_state_dict_pre_hook(
-    module: nn.Module,
-    state_dict: dict[str, torch.Tensor],
-    prefix: str,
-    local_metadata: dict,
-    strict: bool,
-    missing_keys: list[str],
-    unexpected_keys: list[str],
-    error_msgs: list[str],
-) -> None:
-    """Migrate historical theta_mu/theta_gamma checkpoints on load.
-
-    Historical released configurations used gamma_max=1.2. The conversion is
-    exact whenever the resulting alpha lies inside the new configured bound.
-    """
-
-    del local_metadata, strict, missing_keys, unexpected_keys
-    max_key = prefix + "_alpha_max_state"
-    mu_key = prefix + "theta_mu"
-    gamma_key = prefix + "theta_gamma"
-    theta_alpha_key = prefix + "theta_alpha"
-    legacy_mu_gamma = mu_key in state_dict or gamma_key in state_dict
-    if max_key not in state_dict:
-        # Gain/alpha checkpoints created before the ceiling became persistent
-        # used alpha_max=2 by default. Preserve their represented function on
-        # raw state-dict load. An explicitly non-default constructor ceiling is
-        # respected for uncommon historical experiments.
-        fallback = (
-            module.alpha_max
-            if module.alpha_max != DEFAULT_ALPHA_MAX
-            else _LEGACY_GAIN_ALPHA_MAX
-        )
-        state_dict[max_key] = torch.tensor(
-            module.alpha_max if legacy_mu_gamma else fallback,
-            dtype=module._alpha_max_state.dtype,
-            device=module._alpha_max_state.device,
-        )
-    if not legacy_mu_gamma:
-        return
-    if module.solve_parameterization != "gain_alpha":
-        error_msgs.append(
-            f"{prefix[:-1]}: legacy solve scalars can only migrate into gain_alpha"
-        )
-        return
-    if mu_key not in state_dict or gamma_key not in state_dict:
-        error_msgs.append(f"{prefix[:-1]}: incomplete legacy solve scalar pair")
-        return
-    theta_mu = state_dict.pop(mu_key).float()
-    theta_gamma = state_dict.pop(gamma_key).float()
-    mu = F.softplus(theta_mu) + module.eps
-    gain = mu.reciprocal()
-    alpha = 1.2 * torch.sigmoid(theta_gamma) / mu
-    alpha_max = float(state_dict[max_key].item())
-    if torch.any(alpha <= 0) or torch.any(alpha >= alpha_max):
-        error_msgs.append(
-            f"{prefix[:-1]}: legacy alpha falls outside (0, alpha_max={alpha_max})"
-        )
-        return
-    state_dict[prefix + "theta_gain"] = gain.log()
-    state_dict[theta_alpha_key] = torch.logit(alpha / alpha_max)
-
-
-def _sync_alpha_max_after_load(module: nn.Module, incompatible_keys) -> None:
-    """Keep the public scalar mirror aligned with checkpoint metadata."""
-
-    del incompatible_keys
-    module.alpha_max = float(module._alpha_max_state.item())
 
 
 def _fold_fixed_gain_into_output(
@@ -1160,13 +1066,15 @@ def _trace_gain_alpha_forward(
     )
     if eye is None:
         eye = torch.eye(rank, device=U.device, dtype=solve_dtype).view(1, 1, rank, rank)
-    beta = effective_alpha.expand(B, H, 1, 1).to(solve_dtype)
-    system = eye.to(solve_dtype) + beta * gram_bh.view(B, H, rank, rank)
+    effective_beta = effective_alpha.expand(B, H, 1, 1).to(solve_dtype).reciprocal()
+    system = (
+        gram_bh.view(B, H, rank, rank)
+        + effective_beta * eye.to(solve_dtype)
+    )
     compact = _solve_no_check(
         system.reshape(B * H, rank, rank),
         cross_bh.reshape(B * H, rank, width),
     ).to(U_bh.dtype)
-    compact.mul_(beta.reshape(B * H, 1, 1).to(compact.dtype))
     output = torch.baddbmm(
         C_safe.flatten(0, 1), U_bh, compact, beta=1.0, alpha=-1.0
     ).view(B, H, N, width)
@@ -1282,16 +1190,16 @@ def _trace_statistics_forward(
 
     if eye is None:
         eye = torch.eye(rank, device=U.device, dtype=solve_dtype).view(1, 1, rank, rank)
-    system = eye.to(solve_dtype) + effective_alpha * gram
+    effective_beta = effective_alpha.reciprocal()
+    system = gram + effective_beta * eye.to(solve_dtype)
     compact = _solve_no_check(
         system.reshape(B * H, rank, rank),
         cross.reshape(B * H, rank, width),
     )
     output_dtype = C.dtype if U.dtype == C.dtype else torch.promote_types(U.dtype, C.dtype)
     compact = compact.to(U_bh.dtype)
-    scaled_compact = compact * effective_alpha.reshape(B * H, 1, 1).to(compact.dtype)
     output = torch.baddbmm(
-        C_safe.flatten(0, 1), U_bh, scaled_compact, beta=1.0, alpha=-1.0
+        C_safe.flatten(0, 1), U_bh, compact, beta=1.0, alpha=-1.0
     ).view(B, H, N, width)
     output.mul_(gain.expand(B, H, 1, 1).to(output.dtype))
     return (
@@ -1351,10 +1259,13 @@ def _trace_gain_alpha_backward(
     U_native = U.to(matmul_dtype)
     Y_native = Y.to(matmul_dtype)
     P_native = P.to(matmul_dtype)
-    effective_gamma = effective_alpha / gain
+    # Express the direct U derivative in terms of the already gain-scaled
+    # primal/adjoint states Y and P. This introduces alpha/g, but it is not a
+    # separate model parameter.
+    direct_u_scale = effective_alpha / gain
     gain_flat = gain.expand(B, H, 1, 1).reshape(B * H).float().contiguous()
     effective_alpha_flat = effective_alpha.reshape(B * H).float().contiguous()
-    effective_flat = effective_gamma.reshape(B * H).float().contiguous()
+    direct_u_scale_flat = direct_u_scale.reshape(B * H).float().contiguous()
     # Trace normalization always uses the Tensor-Core/cuBLAS dispatcher. The
     # legacy scalar all-in-one kernel cannot fuse the radial derivative and
     # duplicates mask traffic, so it remains available only to the legacy
@@ -1375,13 +1286,13 @@ def _trace_gain_alpha_backward(
         )
         YtU_readout = YtU.to(matmul_dtype).contiguous()
         PtU_readout = PtU.to(matmul_dtype).contiguous()
-        grad_effective_gamma = -(
+        negative_compact_inner = -(
             PtU.to(calc_dtype) * YtU.to(calc_dtype)
         ).sum(dim=(1, 2))
-        grad_effective_alpha = grad_effective_gamma / gain_flat.to(calc_dtype)
+        grad_effective_alpha = negative_compact_inner / gain_flat.to(calc_dtype)
         grad_gain_flat = -(
             grad_mu_flat
-            + effective_alpha_flat.to(calc_dtype) * grad_effective_gamma
+            + effective_alpha_flat.to(calc_dtype) * negative_compact_inner
         ) / gain_flat.to(calc_dtype).square()
         radial_coefficient = (
             -2.0
@@ -1394,7 +1305,7 @@ def _trace_gain_alpha_backward(
             Y_native,
             YtU_readout,
             PtU_readout,
-            -effective_flat,
+            -direct_u_scale_flat,
             radial_u=U_native,
             radial_coefficient=radial_coefficient.float().contiguous(),
             valid_mask=valid_mask,
@@ -1408,10 +1319,10 @@ def _trace_gain_alpha_backward(
             direct_grad = torch.bmm(P_m, YtU_readout)
             direct_grad.baddbmm_(Y_m, PtU_readout)
             direct_grad.mul_(
-                -effective_gamma.to(matmul_dtype).reshape(B * H, 1, 1)
+                -direct_u_scale.to(matmul_dtype).reshape(B * H, 1, 1)
             )
     # d alpha_eff / dU = -2 * alpha_eff * U / denominator. The
-    # low-level compact gradient is with respect to gamma_eff=alpha_eff/g.
+    # compact inner product is represented using the gain-scaled states.
     radial_coefficient = (
         -2.0
         * effective_alpha.reshape(B * H).to(calc_dtype)
@@ -1938,7 +1849,6 @@ class LSSO(nn.Module):
         gain_init: float = DEFAULT_GAIN_INIT,
         alpha_init: float = DEFAULT_ALPHA_INIT,
         solve_parameterization: str = "gain_alpha",
-        alpha_max: float = DEFAULT_ALPHA_MAX,
         no_global: bool = False,
         normalize_u: bool = True,
         basis_normalization: str = "trace",
@@ -1983,10 +1893,7 @@ class LSSO(nn.Module):
             solve_parameterization=solve_parameterization,
             gain_init=gain_init,
             alpha_init=alpha_init,
-            alpha_max=alpha_max,
         )
-        self.register_load_state_dict_pre_hook(_legacy_solve_state_dict_pre_hook)
-        self.register_load_state_dict_post_hook(_sync_alpha_max_after_load)
         _fold_fixed_gain_into_output(
             self,
             groups=num_heads,

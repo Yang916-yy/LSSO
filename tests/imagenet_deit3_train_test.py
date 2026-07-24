@@ -34,7 +34,6 @@ def test_stage_defaults_cover_low_resolution_and_refinement() -> None:
     assert pretrain.augmentation_group_size == 256
     assert pretrain.runtime_augmentation_group_size == 256
     assert pretrain.batch_size // pretrain.augmentation_group_size == 2
-    assert not pretrain.rrlsso_extended_diagnostics
 
     finetune = parse_args(
         [
@@ -58,11 +57,6 @@ def test_large_profile_preserves_physical_batch_with_virtual_groups() -> None:
     assert (args.batch_size, args.grad_accum) == (128, 16)
     assert args.augmentation_group_size == 64
     assert args.batch_size // args.augmentation_group_size == 2
-
-
-def test_extended_solve_diagnostics_are_explicitly_opt_in() -> None:
-    args = parse_args(["--rrlsso-extended-diagnostics"])
-    assert args.rrlsso_extended_diagnostics
 
 
 def test_virtual_group_mixup_draws_once_per_official_local_batch() -> None:
@@ -222,7 +216,7 @@ def test_registered_model_configuration_is_trace_normalized() -> None:
     model = create_training_model(args)
     assert model.rrlsso_config["basis_normalization"] == "trace"
     assert model.rrlsso_config["rank_rotary"] == "ordinary-1d"
-    assert model.rrlsso_config["alpha_init"] == 1.2
+    assert model.rrlsso_config["alpha_init"] == 1.0
     assert model.rrlsso_config["layerscale_init"] == 1e-4
     assert torch.isfinite(model.pos_embed).all()
 
@@ -295,14 +289,14 @@ def test_checkpoint_cli_rejects_ambiguous_initialization() -> None:
         parse_args(["--stage", "pretrain", "--init-checkpoint", "pretrain.pt", "--no-resume"])
 
 
-def test_checkpoint_metadata_preserves_gain_reference_contract() -> None:
+def test_checkpoint_metadata_rejects_obsolete_parameterization_schema() -> None:
     pretrain = parse_args([])
-    metadata = checkpoint_metadata(pretrain, gain_reference_origin="pretrain_zero")
-    checkpoint = {"run_metadata": metadata, "rrlsso_gain_reference": {"x": torch.zeros(1)}}
+    metadata = checkpoint_metadata(pretrain)
+    checkpoint = {"run_metadata": metadata}
     assert validate_resume_checkpoint(checkpoint, pretrain) == metadata
 
-    bad = {**checkpoint, "rrlsso_gain_reference": None}
-    with pytest.raises(RuntimeError, match="persistent gain reference"):
+    bad = {"run_metadata": {**metadata, "schema": metadata["schema"] - 1}}
+    with pytest.raises(RuntimeError, match="checkpoint schema"):
         validate_resume_checkpoint(bad, pretrain)
 
     finetune = parse_args(["--stage", "finetune224"])

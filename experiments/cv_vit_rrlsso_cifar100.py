@@ -39,9 +39,8 @@ class RRLSSOSelfAttention(nn.Module):
         dropout: float,
         bias: bool,
         gain_init: float = 1.0,
-        alpha_init: float = 1.2,
+        alpha_init: float = 1.0,
         solve_parameterization: str = "gain_alpha",
-        alpha_max: float = 3.0,
         basis_normalization: str = "trace",
         relation_groups: int | None = None,
         length_normalize: bool = True,
@@ -60,7 +59,6 @@ class RRLSSOSelfAttention(nn.Module):
                 gain_init=gain_init,
                 alpha_init=alpha_init,
                 solve_parameterization=solve_parameterization,
-                alpha_max=alpha_max,
                 basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
@@ -76,7 +74,6 @@ class RRLSSOSelfAttention(nn.Module):
                 gain_init=gain_init,
                 alpha_init=alpha_init,
                 solve_parameterization=solve_parameterization,
-                alpha_max=alpha_max,
                 basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
@@ -100,9 +97,8 @@ def replace_vit_attention_with_rrlsso(
     *,
     rank: int,
     gain_init: float = 1.0,
-    alpha_init: float = 1.2,
+    alpha_init: float = 1.0,
     solve_parameterization: str = "gain_alpha",
-    alpha_max: float = 3.0,
     basis_normalization: str = "trace",
     relation_groups: int | None = None,
     length_normalize: bool = True,
@@ -120,7 +116,6 @@ def replace_vit_attention_with_rrlsso(
             gain_init=gain_init,
             alpha_init=alpha_init,
             solve_parameterization=solve_parameterization,
-            alpha_max=alpha_max,
             basis_normalization=basis_normalization,
             relation_groups=relation_groups,
             length_normalize=length_normalize,
@@ -139,9 +134,8 @@ def build_model(
     image_size: int,
     patch_size: int,
     gain_init: float = 1.0,
-    alpha_init: float = 1.2,
+    alpha_init: float = 1.0,
     solve_parameterization: str = "gain_alpha",
-    alpha_max: float = 3.0,
     basis_normalization: str = "trace",
     relation_groups: int = 4,
     length_normalize: bool = True,
@@ -164,7 +158,6 @@ def build_model(
                 gain_init=gain_init,
                 alpha_init=alpha_init,
                 solve_parameterization=solve_parameterization,
-                alpha_max=alpha_max,
                 basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
@@ -195,7 +188,6 @@ def build_model(
             gain_init=gain_init,
             alpha_init=alpha_init,
             solve_parameterization=solve_parameterization,
-            alpha_max=alpha_max,
             basis_normalization=basis_normalization,
             length_normalize=length_normalize,
             length_reference=length_reference,
@@ -208,7 +200,6 @@ def build_model(
             gain_init=gain_init,
             alpha_init=alpha_init,
             solve_parameterization=solve_parameterization,
-            alpha_max=alpha_max,
             basis_normalization=basis_normalization,
             relation_groups=relation_groups,
             length_normalize=length_normalize,
@@ -402,7 +393,6 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
         gain_init=args.gain_init,
         alpha_init=args.alpha_init,
         solve_parameterization=args.solve_parameterization,
-        alpha_max=args.alpha_max,
         basis_normalization=args.basis_normalization,
         relation_groups=args.relation_groups,
         length_normalize=args.length_normalize,
@@ -600,13 +590,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--relation-groups", type=int, default=4)
     parser.add_argument("--gain-init", type=float, default=1.0)
-    parser.add_argument("--alpha-init", type=float, default=1.2)
+    parser.add_argument("--alpha-init", type=float, default=1.0)
     parser.add_argument(
         "--solve-parameterization",
         choices=["gain_alpha", "fixed_gain_alpha"],
         default="gain_alpha",
     )
-    parser.add_argument("--alpha-max", type=float, default=3.0)
     parser.add_argument(
         "--basis-normalization",
         choices=["trace", "token_rms"],
