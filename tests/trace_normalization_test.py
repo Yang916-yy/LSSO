@@ -8,6 +8,42 @@ from lsso import apply_rank_rotary, lsso, lsso_gain_alpha, trace_normalize_basis
 from lsso.modules_v2 import RRLSSO
 
 
+def test_balanced_woodbury_system_matches_direct_form_across_strengths() -> None:
+    import lsso.modules as modules
+
+    torch.manual_seed(3390)
+    gram = torch.randn(4, 3, 3, dtype=torch.float64)
+    gram = gram.transpose(-1, -2) @ gram
+    cross = torch.randn(4, 3, 5, dtype=torch.float64)
+    alpha = torch.tensor(
+        [1e-4, 0.25, 4.0, 1e4], dtype=torch.float64
+    ).view(4, 1, 1)
+    eye = torch.eye(3, dtype=torch.float64)
+    system, rhs = modules._balanced_woodbury_system(
+        gram, cross, alpha, eye
+    )
+    actual = torch.linalg.solve(system, rhs)
+    expected = torch.linalg.solve(
+        gram + alpha.reciprocal() * eye, cross
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-12, atol=2e-12)
+
+
+def test_differentiable_bf16_compact_statistics_accumulate_in_fp32() -> None:
+    import lsso.modules as modules
+
+    torch.manual_seed(3391)
+    left = torch.randn(2, 3, 7, dtype=torch.bfloat16).requires_grad_()
+    right = torch.randn(2, 7, 5, dtype=torch.bfloat16).requires_grad_()
+    result = modules._bmm_accumulate(left, right, dtype=torch.float32)
+    assert result.dtype == torch.float32
+    expected = torch.bmm(left.float(), right.float())
+    torch.testing.assert_close(result, expected)
+    result.square().sum().backward()
+    assert left.grad is not None and torch.isfinite(left.grad).all()
+    assert right.grad is not None and torch.isfinite(right.grad).all()
+
+
 @pytest.mark.parametrize(
     ("capability", "sequence", "padding", "expected", "chunk"),
     [
@@ -70,6 +106,13 @@ def test_masked_trace_split_n_dispatch_matches_reference_and_blocks_nan(
         modules, "_masked_trace_forward_strategy",
         lambda *args, **kwargs: ("split_n", 8),
     )
+    monkeypatch.setattr(
+        modules.F,
+        "pad",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("split-N must not pad token-sized activations")
+        ),
+    )
     backend.reset_mathdx_path_counters()
     torch.manual_seed(3450)
     B, H, N, rank, width = 2, 1, 19, 16, 16
@@ -106,6 +149,101 @@ def test_masked_trace_split_n_dispatch_matches_reference_and_blocks_nan(
     assert backend.get_mathdx_path_counters()[
         "forward.trace_masked_split_n"
     ] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("masked", [False, True])
+def test_cuda_trace_high_alpha_backward_is_stable_and_mask_safe(
+    masked: bool, request: pytest.FixtureRequest,
+) -> None:
+    """The saved-q/adjoint-r derivative stays accurate near projection mode."""
+
+    previous_precision = torch.get_float32_matmul_precision()
+    request.addfinalizer(
+        lambda: torch.set_float32_matmul_precision(previous_precision)
+    )
+    # Other training tests intentionally select TF32 globally. This guard is
+    # a numerical reference and must keep its explicit FP32 branch at IEEE
+    # precision, independent of test order.
+    torch.set_float32_matmul_precision("highest")
+    torch.manual_seed(3460 + int(masked))
+    B, H, N, rank, width = 2, 2, 33, 16, 32
+    u_source = 0.1 * torch.randn(B, H, N, rank, device="cuda")
+    c_source = torch.randn(B, H, N, width, device="cuda")
+    mask = None
+    if masked:
+        mask = torch.arange(N, device="cuda")[None] < torch.tensor(
+            [N, 9], device="cuda"
+        )[:, None]
+    active = (
+        torch.ones(B, 1, N, 1, device="cuda", dtype=torch.bool)
+        if mask is None else mask[:, None, :, None]
+    )
+    u = torch.where(
+        active,
+        u_source.to(torch.bfloat16),
+        torch.full_like(u_source.to(torch.bfloat16), float("nan")),
+    ).detach().requires_grad_()
+    c = torch.where(
+        active,
+        c_source.to(torch.bfloat16),
+        torch.full_like(c_source.to(torch.bfloat16), float("nan")),
+    ).detach().requires_grad_()
+    gain = torch.ones(1, H, 1, 1, device="cuda", requires_grad=True)
+    alpha = torch.full(
+        (1, H, 1, 1), 100.0, device="cuda", requires_grad=True
+    )
+    probe = torch.where(
+        active,
+        torch.randn(B, H, N, width, device="cuda"),
+        torch.zeros((), device="cuda"),
+    )
+
+    actual = lsso_gain_alpha(
+        u, c, gain, alpha, trace_normalize=True,
+        length_normalize=False, valid_mask=mask,
+    )
+    actual_gradients = torch.autograd.grad(
+        (actual.float() * probe).sum(), (u, c, gain, alpha)
+    )
+
+    u_ref = u_source.detach().requires_grad_()
+    c_ref = c_source.detach().requires_grad_()
+    gain_ref = gain.detach().clone().requires_grad_()
+    alpha_ref = alpha.detach().clone().requires_grad_()
+    normalized = trace_normalize_basis(
+        u_ref, mask, eps=1e-5, length_normalize=False
+    )
+    reference = lsso_gain_alpha(
+        normalized, c_ref, gain_ref, alpha_ref,
+        trace_normalize=False, length_normalize=False, valid_mask=mask,
+    )
+    reference_gradients = torch.autograd.grad(
+        (reference * probe).sum(), (u_ref, c_ref, gain_ref, alpha_ref)
+    )
+
+    output_relative_error = (
+        (actual.float() - reference).norm() / reference.norm().clamp_min(1e-8)
+    )
+    assert output_relative_error < 1.5e-2
+    for name, actual_gradient, reference_gradient in zip(
+        ("U", "C", "gain", "alpha"),
+        actual_gradients,
+        reference_gradients,
+        strict=True,
+    ):
+        assert torch.isfinite(actual_gradient).all()
+        relative_error = (
+            (actual_gradient.float() - reference_gradient).norm()
+            / reference_gradient.norm().clamp_min(1e-8)
+        )
+        assert relative_error < 2.5e-2, (
+            f"{name} relative error: {relative_error.item():.6g}"
+        )
+    if masked:
+        assert torch.count_nonzero(
+            actual_gradients[0].masked_select((~active).expand_as(u))
+        ) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

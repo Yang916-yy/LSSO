@@ -192,7 +192,7 @@ def try_masked_stats_solve_readout(
     max_sequence: int | None = None,
     padding_ratio_hint: float | None = None,
     native_padding_threshold: float = 0.75,
-) -> torch.Tensor | None:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Fused masked statistics, solve, and padding-safe Woodbury readout."""
     if padding_ratio_hint is not None:
         if not 0.0 <= padding_ratio_hint <= 1.0:
@@ -238,7 +238,7 @@ def try_masked_stats_solve_readout(
     )
     if not eligible or not load_mathdx_backend():
         return None
-    output, _info = torch.ops.lsso_mathdx.masked_stats_solve_readout(
+    output, _info, compact = torch.ops.lsso_mathdx.masked_stats_solve_readout(
         u.contiguous(),
         c,
         valid_mask.contiguous(),
@@ -248,7 +248,8 @@ def try_masked_stats_solve_readout(
     )
     _check_mathdx_info(_info, "masked_stats_solve_readout")
     record_mathdx_path("forward.masked_stats_solve_readout")
-    return output
+    B, H = u.shape[:2]
+    return output, compact.view(B, H, u.shape[3], c.shape[3])
 
 
 def try_effective_stats_solve_readout(
@@ -256,7 +257,7 @@ def try_effective_stats_solve_readout(
     c: torch.Tensor,
     alpha: torch.Tensor,
     gain: torch.Tensor,
-) -> torch.Tensor | None:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Fuse an unmasked solve/readout with an already effective strength.
 
     This is primarily the Trace backward adjoint path. Reusing the mask-aware
@@ -286,13 +287,13 @@ def try_effective_stats_solve_readout(
         return None
     empty_mask = torch.empty(0, device=u.device, dtype=torch.bool)
     empty_scale = torch.empty(0, device=u.device, dtype=torch.float32)
-    output, _info = torch.ops.lsso_mathdx.masked_stats_solve_readout(
+    output, _info, compact = torch.ops.lsso_mathdx.masked_stats_solve_readout(
         u.contiguous(), c, empty_mask, empty_scale,
         alpha.contiguous(), gain.contiguous()
     )
     _check_mathdx_info(_info, "effective_stats_solve_readout")
     record_mathdx_path("backward.adjoint_native")
-    return output
+    return output, compact
 
 
 def try_masked_trace_stats_solve_readout(
@@ -306,7 +307,9 @@ def try_masked_trace_stats_solve_readout(
     length_reference: float,
     length_normalize: bool,
     padding_ratio_hint: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+] | None:
     """Skip padding while deriving trace strength, solving, and reading out."""
 
     mode = os.environ.get("LSSO_MATHDX_MASKED_TRACE", "auto").lower()
@@ -341,7 +344,7 @@ def try_masked_trace_stats_solve_readout(
     )
     if not eligible or not load_mathdx_backend():
         return None
-    output, _info, effective, denominator, scale_squared = (
+    output, _info, effective, denominator, scale_squared, compact = (
         torch.ops.lsso_mathdx.masked_trace_stats_solve_readout(
             u.contiguous(),
             c,
@@ -362,6 +365,7 @@ def try_masked_trace_stats_solve_readout(
         effective.view(compact_shape),
         denominator.view(compact_shape),
         scale_squared.view(compact_shape),
+        compact.view(B, H, u.shape[3], c.shape[3]),
     )
 
 
@@ -374,7 +378,9 @@ def try_trace_stats_solve_readout(
     normalization_eps: float,
     length_reference: float,
     length_normalize: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+] | None:
     """Fuse unmasked trace statistics, solve, and Woodbury readout.
 
     The CUDA entry point shares the masked kernel implementation but receives
@@ -408,7 +414,7 @@ def try_trace_stats_solve_readout(
         return None
     empty_mask = torch.empty(0, device=u.device, dtype=torch.bool)
     empty_scale = torch.empty(0, device=u.device, dtype=torch.float32)
-    output, _info, effective, denominator, scale_squared = (
+    output, _info, effective, denominator, scale_squared, compact = (
         torch.ops.lsso_mathdx.masked_trace_stats_solve_readout(
             u.contiguous(),
             c,
@@ -429,6 +435,7 @@ def try_trace_stats_solve_readout(
         effective.view(compact_shape),
         denominator.view(compact_shape),
         scale_squared.view(compact_shape),
+        compact.view(B, H, u.shape[3], c.shape[3]),
     )
 
 

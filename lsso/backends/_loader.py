@@ -15,7 +15,7 @@ _error: Exception | None = None
 
 # Increment only when an operator schema, tensor contract, or numerical
 # contract changes incompatibly. Kernel-internal scheduling is not ABI.
-MATHDX_BACKEND_ABI = 1
+MATHDX_BACKEND_ABI = 2
 
 
 def default_library_path() -> Path:

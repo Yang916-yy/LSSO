@@ -152,7 +152,9 @@ __device__ __forceinline__ float load_relation_value(
     return static_cast<float>(u[base + rank * stride_r]);
 }
 
-template <typename scalar_t, int Rank, int RhsTile, int KTile, int Arch>
+template <
+    typename scalar_t, int Rank, int RhsTile, int KTile, int Arch,
+    bool HasMask>
 __global__ void masked_trace_solve_readout_kernel(
     const scalar_t* __restrict__ u,
     const scalar_t* __restrict__ c,
@@ -161,6 +163,7 @@ __global__ void masked_trace_solve_readout_kernel(
     const float* __restrict__ alpha,
     const float* __restrict__ gain,
     scalar_t* __restrict__ output,
+    scalar_t* __restrict__ compact_output,
     int* __restrict__ info,
     bool trace_normalize,
     float normalization_eps,
@@ -234,15 +237,18 @@ __global__ void masked_trace_solve_readout_kernel(
 
     const int64_t sample = batch / heads;
     const int64_t head = batch - sample * heads;
-    const bool* mask_batch = valid_mask == nullptr
-        ? nullptr : valid_mask + sample * sequence;
+    const bool* mask_batch = HasMask
+        ? valid_mask + sample * sequence : nullptr;
     const float scale = trace_normalize || length_scale == nullptr
         ? 1.0f : length_scale[sample];
     static_assert(KTile == 32, "masked tile ballot assumes one warp per token tile");
     __shared__ unsigned int tile_valid_bits;
     __shared__ int valid_count;
     __shared__ float effective_alpha_shared;
-    if (threadIdx.x == 0) valid_count = 0;
+    __shared__ float reciprocal_alpha_shared;
+    if (threadIdx.x == 0) {
+        valid_count = HasMask ? 0 : static_cast<int>(sequence);
+    }
     __syncthreads();
 
     for (int linear = threadIdx.x; linear < Rank * Rank; linear += blockDim.x) {
@@ -250,16 +256,24 @@ __global__ void masked_trace_solve_readout_kernel(
     }
     __syncthreads();
     for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
-        if (threadIdx.x < KTile) {
-            const int64_t token = sequence_start + threadIdx.x;
-            const bool valid = token < sequence &&
-                (mask_batch == nullptr || mask_batch[token]);
-            const unsigned int bits = __ballot_sync(0xffffffffu, valid);
-            if (threadIdx.x == 0) tile_valid_bits = bits;
+        unsigned int valid_bits;
+        if constexpr (HasMask) {
+            if (threadIdx.x < KTile) {
+                const int64_t token = sequence_start + threadIdx.x;
+                const bool valid = token < sequence && mask_batch[token];
+                const unsigned int bits = __ballot_sync(0xffffffffu, valid);
+                if (threadIdx.x == 0) tile_valid_bits = bits;
+            }
+            __syncthreads();
+            valid_bits = tile_valid_bits;
+            if (threadIdx.x == 0) valid_count += __popc(valid_bits);
+        } else {
+            const int remaining = static_cast<int>(
+                sequence - sequence_start < KTile
+                    ? sequence - sequence_start : KTile);
+            valid_bits = remaining == KTile
+                ? 0xffffffffu : ((1u << remaining) - 1u);
         }
-        __syncthreads();
-        const unsigned int valid_bits = tile_valid_bits;
-        if (threadIdx.x == 0) valid_count += __popc(valid_bits);
         if (valid_bits == 0) continue;
         const bool full_tile = valid_bits == 0xffffffffu;
         for (int linear = threadIdx.x; linear < Rank * KTile; linear += blockDim.x) {
@@ -296,6 +310,8 @@ __global__ void masked_trace_solve_readout_kernel(
             scale_squared = target / fmaxf(denominator, FLT_MIN);
         }
         effective_alpha_shared = alpha[batch] * scale_squared;
+        reciprocal_alpha_shared = effective_alpha_shared >= 1.0f
+            ? 1.0f / effective_alpha_shared : 1.0f;
         if (effective_alpha_output != nullptr) {
             effective_alpha_output[batch] = effective_alpha_shared;
             denominator_output[batch] = denominator;
@@ -304,17 +320,18 @@ __global__ void masked_trace_solve_readout_kernel(
     }
     __syncthreads();
     const float alpha_batch = effective_alpha_shared;
-    const float beta_batch = 1.0f / alpha_batch;
+    const bool reciprocal_form = alpha_batch >= 1.0f;
     for (int linear = threadIdx.x; linear < Rank * Rank; linear += blockDim.x) {
         const int row = linear / Rank;
         const int col = linear - row * Rank;
-        // Reciprocal-strength Woodbury:
-        //   (I + alpha U U^T)^-1 C
-        //     = C - U (alpha^-1 I + U^T U)^-1 U^T C.
-        // This avoids forming alpha * Gram and removes the matching alpha
-        // multiplication from the readout as alpha grows.
-        a[row * lda + col] =
-            gemm_output[linear] + (row == col ? beta_batch : 0.0f);
+        // Balanced Woodbury keeps both compact-system coefficients <= 1:
+        // alpha >= 1: Gram + alpha^-1 I, rhs = cross;
+        // alpha <  1: alpha Gram + I, rhs = alpha cross.
+        a[row * lda + col] = reciprocal_form
+            ? gemm_output[linear] +
+                (row == col ? reciprocal_alpha_shared : 0.0f)
+            : alpha_batch * gemm_output[linear] +
+                (row == col ? 1.0f : 0.0f);
     }
     __syncthreads();
     Potrf().execute(a, lda, info + batch);
@@ -326,15 +343,23 @@ __global__ void masked_trace_solve_readout_kernel(
         }
         __syncthreads();
         for (int64_t sequence_start = 0; sequence_start < sequence; sequence_start += KTile) {
-            if (threadIdx.x < KTile) {
-                const int64_t token = sequence_start + threadIdx.x;
-                const bool valid = token < sequence &&
-                    (mask_batch == nullptr || mask_batch[token]);
-                const unsigned int bits = __ballot_sync(0xffffffffu, valid);
-                if (threadIdx.x == 0) tile_valid_bits = bits;
+            unsigned int valid_bits;
+            if constexpr (HasMask) {
+                if (threadIdx.x < KTile) {
+                    const int64_t token = sequence_start + threadIdx.x;
+                    const bool valid = token < sequence && mask_batch[token];
+                    const unsigned int bits = __ballot_sync(0xffffffffu, valid);
+                    if (threadIdx.x == 0) tile_valid_bits = bits;
+                }
+                __syncthreads();
+                valid_bits = tile_valid_bits;
+            } else {
+                const int remaining = static_cast<int>(
+                    sequence - sequence_start < KTile
+                        ? sequence - sequence_start : KTile);
+                valid_bits = remaining == KTile
+                    ? 0xffffffffu : ((1u << remaining) - 1u);
             }
-            __syncthreads();
-            const unsigned int valid_bits = tile_valid_bits;
             if (valid_bits == 0) continue;
             const bool full_tile = valid_bits == 0xffffffffu;
             for (int linear = threadIdx.x; linear < Rank * KTile; linear += blockDim.x) {
@@ -367,7 +392,8 @@ __global__ void masked_trace_solve_readout_kernel(
         for (int linear = threadIdx.x; linear < Rank * RhsTile; linear += blockDim.x) {
             const int row = linear / RhsTile;
             const int col = linear - row * RhsTile;
-            b[row * ldb + col] = gemm_output[linear];
+            b[row * ldb + col] = reciprocal_form
+                ? gemm_output[linear] : alpha_batch * gemm_output[linear];
         }
         __syncthreads();
         Potrs().execute(a, lda, b, ldb);
@@ -377,7 +403,15 @@ __global__ void masked_trace_solve_readout_kernel(
             const int col = linear - row * RhsTile;
             // Match the fallback contract exactly: the FP32 compact solve is
             // rounded once to the activation dtype before Tensor-Core readout.
-            readout_b(row, col) = static_cast<Input>(b[row * ldb + col]);
+            const Input compact_value =
+                static_cast<Input>(b[row * ldb + col]);
+            readout_b(row, col) = compact_value;
+            const int64_t global_col = rhs_start + col;
+            if (compact_output != nullptr && global_col < rhs_width) {
+                compact_output[
+                    (batch * Rank + row) * rhs_width + global_col] =
+                    static_cast<scalar_t>(compact_value);
+            }
         }
         __syncthreads();
         for (int64_t token_start = 0; token_start < sequence; token_start += KTile) {
@@ -385,8 +419,10 @@ __global__ void masked_trace_solve_readout_kernel(
                     const int row = linear / Rank;
                     const int col = linear - row * Rank;
                     const int64_t token = token_start + row;
-                    const bool valid = token < sequence &&
-                        (mask_batch == nullptr || mask_batch[token]);
+                    bool valid = token < sequence;
+                    if constexpr (HasMask) {
+                        valid = valid && mask_batch[token];
+                    }
                     // Mask is checked before the global load: padding values
                     // cannot enter either statistics or the readout.
                     readout_a(row, col) = valid
@@ -408,7 +444,11 @@ __global__ void masked_trace_solve_readout_kernel(
                     const int64_t token = token_start + row;
                     const int64_t global_col = rhs_start + col;
                     if (token < sequence && global_col < rhs_width) {
-                        if (mask_batch == nullptr || mask_batch[token]) {
+                        bool valid = true;
+                        if constexpr (HasMask) {
+                            valid = mask_batch[token];
+                        }
+                        if (valid) {
                             const float local = static_cast<float>(c[
                                 sample * c_stride_b + head * c_stride_h +
                                 token * c_stride_n + global_col * c_stride_w]);
@@ -431,7 +471,7 @@ __global__ void masked_trace_solve_readout_kernel(
     }
 }
 
-template <typename scalar_t, int Rank, int Arch>
+template <typename scalar_t, int Rank, int Arch, bool HasMask>
 void launch_masked_trace_solve_typed(
     const at::Tensor& u,
     const at::Tensor& c,
@@ -440,6 +480,7 @@ void launch_masked_trace_solve_typed(
     const at::Tensor& alpha,
     const at::Tensor& gain,
     at::Tensor& output,
+    at::Tensor& compact_output,
     at::Tensor& info,
     bool trace_normalize,
     float normalization_eps,
@@ -473,7 +514,7 @@ void launch_masked_trace_solve_typed(
                   cublasdx::cosize(Readout::get_layout_smem_a()));
 
     auto kernel = masked_trace_solve_readout_kernel<
-        scalar_t, Rank, rhs_tile, k_tile, Arch>;
+        scalar_t, Rank, rhs_tile, k_tile, Arch, HasMask>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(smem_bytes)));
@@ -486,7 +527,10 @@ void launch_masked_trace_solve_typed(
         valid_mask.numel() == 0 ? nullptr : valid_mask.const_data_ptr<bool>(),
         length_scale.numel() == 0 ? nullptr : length_scale.const_data_ptr<float>(),
         alpha.const_data_ptr<float>(), gain.const_data_ptr<float>(),
-        output.mutable_data_ptr<scalar_t>(), info.mutable_data_ptr<int>(),
+        output.mutable_data_ptr<scalar_t>(),
+        compact_output.numel() == 0
+            ? nullptr : compact_output.mutable_data_ptr<scalar_t>(),
+        info.mutable_data_ptr<int>(),
         trace_normalize, normalization_eps, length_reference, length_normalize,
         effective_alpha_output.numel() == 0
             ? nullptr : effective_alpha_output.mutable_data_ptr<float>(),
@@ -510,6 +554,7 @@ void dispatch_masked_trace_solve_rank(
     const at::Tensor& alpha,
     const at::Tensor& gain,
     at::Tensor& output,
+    at::Tensor& compact_output,
     at::Tensor& info,
     bool trace_normalize,
     float normalization_eps,
@@ -524,11 +569,23 @@ void dispatch_masked_trace_solve_rank(
         AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
             auto launch = [&](auto rank_tag) {
                 constexpr int rank = decltype(rank_tag)::value;
-                launch_masked_trace_solve_typed<scalar_t, rank, Arch>(
-                    u, c, valid_mask, length_scale, alpha, gain, output, info,
-                    trace_normalize, normalization_eps, length_reference,
-                    length_normalize, effective_alpha_output,
-                    denominator_output, scale_squared_output, stream);
+                if (valid_mask.numel() == 0) {
+                    launch_masked_trace_solve_typed<
+                        scalar_t, rank, Arch, false>(
+                        u, c, valid_mask, length_scale, alpha, gain,
+                        output, compact_output, info, trace_normalize,
+                        normalization_eps, length_reference, length_normalize,
+                        effective_alpha_output, denominator_output,
+                        scale_squared_output, stream);
+                } else {
+                    launch_masked_trace_solve_typed<
+                        scalar_t, rank, Arch, true>(
+                        u, c, valid_mask, length_scale, alpha, gain,
+                        output, compact_output, info, trace_normalize,
+                        normalization_eps, length_reference, length_normalize,
+                        effective_alpha_output, denominator_output,
+                        scale_squared_output, stream);
+                }
             };
             if (u.size(3) == 16) launch(std::integral_constant<int, 16>{});
             else if (u.size(3) == 32) launch(std::integral_constant<int, 32>{});
@@ -539,11 +596,23 @@ void dispatch_masked_trace_solve_rank(
         AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
             auto launch = [&](auto rank_tag) {
                 constexpr int rank = decltype(rank_tag)::value;
-                launch_masked_trace_solve_typed<scalar_t, rank, Arch>(
-                    u, c, valid_mask, length_scale, alpha, gain, output, info,
-                    trace_normalize, normalization_eps, length_reference,
-                    length_normalize, effective_alpha_output,
-                    denominator_output, scale_squared_output, stream);
+                if (valid_mask.numel() == 0) {
+                    launch_masked_trace_solve_typed<
+                        scalar_t, rank, Arch, false>(
+                        u, c, valid_mask, length_scale, alpha, gain,
+                        output, compact_output, info, trace_normalize,
+                        normalization_eps, length_reference, length_normalize,
+                        effective_alpha_output, denominator_output,
+                        scale_squared_output, stream);
+                } else {
+                    launch_masked_trace_solve_typed<
+                        scalar_t, rank, Arch, true>(
+                        u, c, valid_mask, length_scale, alpha, gain,
+                        output, compact_output, info, trace_normalize,
+                        normalization_eps, length_reference, length_normalize,
+                        effective_alpha_output, denominator_output,
+                        scale_squared_output, stream);
+                }
             };
             if (u.size(3) == 16) launch(std::integral_constant<int, 16>{});
             else if (u.size(3) == 32) launch(std::integral_constant<int, 32>{});
@@ -1291,7 +1360,9 @@ std::tuple<at::Tensor, at::Tensor> solve_spd_cuda(
     return solve_spd_impl(gram, rhs);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<
+    at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor, at::Tensor, at::Tensor>
 masked_readout_impl(
     const at::Tensor& u,
     const at::Tensor& c,
@@ -1365,6 +1436,11 @@ masked_readout_impl(
         {u.size(0), u.size(2), u.size(1), c.size(3)}, c.options()
     ).transpose(1, 2);
     auto info = at::zeros({systems}, u.options().dtype(at::kInt));
+    // The compact solution is reused by the stable adjoint backward. Keeping
+    // it in activation precision matches the Tensor-Core readout contract and
+    // costs only B*H*r*d elements.
+    auto compact_output = at::empty(
+        {systems, u.size(3), c.size(3)}, c.options());
     auto trace_options = u.options().dtype(at::kFloat);
     auto effective_alpha_output = trace_normalize
         ? at::empty({systems}, trace_options) : at::empty({0}, trace_options);
@@ -1378,7 +1454,7 @@ masked_readout_impl(
 
 #define DISPATCH_MASKED_TRACE(ARCH) \
     dispatch_masked_trace_solve_rank<ARCH>( \
-        u, c, valid_mask, length_scale, alpha, gain, output, info, \
+        u, c, valid_mask, length_scale, alpha, gain, output, compact_output, info, \
         trace_normalize, static_cast<float>(normalization_eps), \
         static_cast<float>(length_reference), length_normalize, \
         effective_alpha_output, denominator_output, scale_squared_output, stream)
@@ -1400,10 +1476,11 @@ masked_readout_impl(
 #undef DISPATCH_MASKED_TRACE
     return {
         output, info, effective_alpha_output,
-        denominator_output, scale_squared_output,
+        denominator_output, scale_squared_output, compact_output,
     };
 }
-std::tuple<at::Tensor, at::Tensor> masked_stats_solve_readout_cuda(
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+masked_stats_solve_readout_cuda(
     const at::Tensor& u,
     const at::Tensor& c,
     const at::Tensor& valid_mask,
@@ -1413,10 +1490,12 @@ std::tuple<at::Tensor, at::Tensor> masked_stats_solve_readout_cuda(
     auto result = masked_readout_impl(
         u, c, valid_mask, length_scale, alpha, gain,
         false, 0.0, 1.0, false);
-    return {std::get<0>(result), std::get<1>(result)};
+    return {std::get<0>(result), std::get<1>(result), std::get<5>(result)};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<
+    at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor, at::Tensor, at::Tensor>
 masked_trace_stats_solve_readout_cuda(
     const at::Tensor& u,
     const at::Tensor& c,
@@ -1505,10 +1584,10 @@ at::Tensor rank_rotary_cuda(
 }  // namespace
 
 TORCH_LIBRARY(lsso_mathdx, m) {
-    m.def("backend_abi() -> int", []() -> int64_t { return 1; });
+    m.def("backend_abi() -> int", []() -> int64_t { return 2; });
     m.def("solve_spd(Tensor gram, Tensor rhs) -> (Tensor solution, Tensor info)");
-    m.def("masked_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor length_scale, Tensor alpha, Tensor gain) -> (Tensor output, Tensor info)");
-    m.def("masked_trace_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor alpha, Tensor gain, float normalization_eps, float length_reference, bool length_normalize) -> (Tensor output, Tensor info, Tensor effective_alpha, Tensor denominator, Tensor scale_squared)");
+    m.def("masked_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor length_scale, Tensor alpha, Tensor gain) -> (Tensor output, Tensor info, Tensor compact)");
+    m.def("masked_trace_stats_solve_readout(Tensor u, Tensor c, Tensor valid_mask, Tensor alpha, Tensor gain, float normalization_eps, float length_reference, bool length_normalize) -> (Tensor output, Tensor info, Tensor effective_alpha, Tensor denominator, Tensor scale_squared, Tensor compact)");
     m.def("dual_backward_statistics_tensorcore(Tensor u, Tensor y, Tensor p, Tensor valid_mask, int heads) -> (Tensor ytu, Tensor ptu, Tensor grad_mu)");
     m.def("dual_grad_u_tensorcore(Tensor p, Tensor y, Tensor ytu, Tensor ptu, Tensor coefficient, Tensor radial_u, Tensor radial_coefficient, Tensor valid_mask, int heads) -> Tensor");
     m.def("rank_rotary(Tensor input, Tensor cos, Tensor sin, bool inverse=False) -> Tensor");

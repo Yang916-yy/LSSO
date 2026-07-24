@@ -43,7 +43,9 @@ def _trace_reference(
     gain: torch.Tensor,
     mask: torch.Tensor | None,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     B, H, N, rank = u.shape
     active = (
         torch.ones(B, N, device=u.device, dtype=torch.bool)
@@ -76,6 +78,7 @@ def _trace_reference(
         effective.view(shape),
         denominator.view(shape),
         scale2.view(shape),
+        compact.view(B, H, rank, c.shape[-1]),
     )
 
 

@@ -253,13 +253,15 @@ def _bmm_accumulate(
         return torch.bmm(left.to(torch.float64), right.to(torch.float64))
     if (
         dtype == torch.float32
-        and left.is_cuda
-        and right.is_cuda
         and left.dtype == right.dtype
         and left.dtype in (torch.float16, torch.bfloat16)
-        and not torch.is_grad_enabled()
     ):
-        return torch.bmm(left, right, out_dtype=torch.float32)
+        if left.is_cuda and right.is_cuda and not torch.is_grad_enabled():
+            return torch.bmm(left, right, out_dtype=torch.float32)
+        # ``out_dtype`` is intentionally unavailable to differentiable bmm.
+        # Cast explicitly so the portable/create_graph path still honors the
+        # FP32 compact-statistics contract.
+        return torch.bmm(left.float(), right.float())
     if left.dtype == right.dtype:
         return torch.bmm(left, right)
     return torch.bmm(left.to(torch.float32), right.to(torch.float32))
@@ -269,6 +271,31 @@ def _solve_no_check(G: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Solve batched small systems without synchronization-heavy error checks."""
     with torch.amp.autocast(device_type=G.device.type, enabled=False):
         return solve_spd_autograd(G, rhs)
+
+
+def _balanced_woodbury_system(
+    gram: torch.Tensor,
+    cross: torch.Tensor,
+    alpha: torch.Tensor,
+    eye: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scale the compact Woodbury system without extreme coefficients.
+
+    For alpha >= 1 this is the reciprocal form
+    ``Gram + alpha^-1 I``. For alpha < 1 it is the direct normalized form
+    ``alpha Gram + I`` with ``alpha cross`` on the right. Both branches
+    represent exactly the same compact correction while keeping every
+    coefficient in [0, 1].
+    """
+
+    one = torch.ones((), device=alpha.device, dtype=alpha.dtype)
+    strong = alpha >= one
+    gram_scale = torch.where(strong, one, alpha)
+    diagonal_scale = torch.where(strong, alpha.reciprocal(), one)
+    return (
+        gram_scale * gram + diagonal_scale * eye,
+        gram_scale * cross,
+    )
 
 
 # On SM120, a single cuBLAS GEMM remains faster through ordinary ViT-B/4 and
@@ -357,21 +384,36 @@ def _compact_statistics(
 
     systems, sequence, rank = U.shape
     rhs_width = C.shape[2]
-    chunks = (sequence + chunk_size - 1) // chunk_size
-    padded_sequence = chunks * chunk_size
-    if padded_sequence != sequence:
-        U = F.pad(U, (0, 0, 0, padded_sequence - sequence))
-        C = F.pad(C, (0, 0, 0, padded_sequence - sequence))
-    # [systems, chunks, K, width] -> [systems * chunks, K, width]
-    U_chunks = U.view(systems, chunks, chunk_size, rank).flatten(0, 1)
-    C_chunks = C.view(systems, chunks, chunk_size, rhs_width).flatten(0, 1)
-    Ut_chunks = U_chunks.transpose(1, 2)
-    gram = _bmm_accumulate(Ut_chunks, U_chunks, dtype=solve_dtype)
-    cross = _bmm_accumulate(Ut_chunks, C_chunks, dtype=solve_dtype)
-    return (
-        gram.view(systems, chunks, rank, rank).sum(dim=1),
-        cross.view(systems, chunks, rank, rhs_width).sum(dim=1),
-    )
+    full_chunks = sequence // chunk_size
+    full_length = full_chunks * chunk_size
+    gram = cross = None
+    if full_chunks:
+        # [systems, chunks, K, width] -> [systems * chunks, K, width].
+        # Do not pad the complete activation: a short tail is cheaper to
+        # evaluate as one additional compact GEMM.
+        U_chunks = U[:, :full_length].reshape(
+            systems * full_chunks, chunk_size, rank
+        )
+        C_chunks = C[:, :full_length].reshape(
+            systems * full_chunks, chunk_size, rhs_width
+        )
+        Ut_chunks = U_chunks.transpose(1, 2)
+        gram = _bmm_accumulate(
+            Ut_chunks, U_chunks, dtype=solve_dtype
+        ).view(systems, full_chunks, rank, rank).sum(dim=1)
+        cross = _bmm_accumulate(
+            Ut_chunks, C_chunks, dtype=solve_dtype
+        ).view(systems, full_chunks, rank, rhs_width).sum(dim=1)
+    if full_length < sequence:
+        U_tail = U[:, full_length:]
+        C_tail = C[:, full_length:]
+        Ut_tail = U_tail.transpose(1, 2)
+        gram_tail = _bmm_accumulate(Ut_tail, U_tail, dtype=solve_dtype)
+        cross_tail = _bmm_accumulate(Ut_tail, C_tail, dtype=solve_dtype)
+        gram = gram_tail if gram is None else gram + gram_tail
+        cross = cross_tail if cross is None else cross + cross_tail
+    assert gram is not None and cross is not None
+    return gram, cross
 
 
 def _backward_compact_statistics(
@@ -426,30 +468,52 @@ def _backward_compact_statistics(
         P = torch.where(active, P, torch.zeros((), device=P.device, dtype=P.dtype))
     systems, sequence, rank = U.shape
     width = Y.shape[2]
-    chunks = (sequence + chunk_size - 1) // chunk_size
-    padded_sequence = chunks * chunk_size
-    if padded_sequence != sequence:
-        amount = padded_sequence - sequence
-        U = F.pad(U, (0, 0, 0, amount))
-        Y = F.pad(Y, (0, 0, 0, amount))
-        P = F.pad(P, (0, 0, 0, amount))
-    U_chunks = U.view(systems, chunks, chunk_size, rank).flatten(0, 1)
-    Y_chunks = Y.view(systems, chunks, chunk_size, width).flatten(0, 1)
-    P_chunks = P.view(systems, chunks, chunk_size, width).flatten(0, 1)
-    YtU = _bmm_accumulate(
-        Y_chunks.transpose(1, 2), U_chunks, dtype=compact_dtype
-    )
-    PtU = _bmm_accumulate(
-        P_chunks.transpose(1, 2), U_chunks, dtype=compact_dtype
-    )
-    grad_mu = -(P_chunks * Y_chunks).sum(
-        dim=(1, 2), dtype=_solve_dtype(P, Y)
-    )
-    return (
-        YtU.view(systems, chunks, width, rank).sum(dim=1, dtype=compact_dtype),
-        PtU.view(systems, chunks, width, rank).sum(dim=1, dtype=compact_dtype),
-        grad_mu.view(systems, chunks).sum(dim=1),
-    )
+    full_chunks = sequence // chunk_size
+    full_length = full_chunks * chunk_size
+    YtU = PtU = grad_mu = None
+    if full_chunks:
+        U_chunks = U[:, :full_length].reshape(
+            systems * full_chunks, chunk_size, rank
+        )
+        Y_chunks = Y[:, :full_length].reshape(
+            systems * full_chunks, chunk_size, width
+        )
+        P_chunks = P[:, :full_length].reshape(
+            systems * full_chunks, chunk_size, width
+        )
+        YtU = _bmm_accumulate(
+            Y_chunks.transpose(1, 2), U_chunks, dtype=compact_dtype
+        ).view(systems, full_chunks, width, rank).sum(
+            dim=1, dtype=compact_dtype
+        )
+        PtU = _bmm_accumulate(
+            P_chunks.transpose(1, 2), U_chunks, dtype=compact_dtype
+        ).view(systems, full_chunks, width, rank).sum(
+            dim=1, dtype=compact_dtype
+        )
+        grad_mu = -(P_chunks * Y_chunks).sum(
+            dim=(1, 2), dtype=_solve_dtype(P, Y)
+        ).view(systems, full_chunks).sum(dim=1)
+    if full_length < sequence:
+        U_tail = U[:, full_length:]
+        Y_tail = Y[:, full_length:]
+        P_tail = P[:, full_length:]
+        YtU_tail = _bmm_accumulate(
+            Y_tail.transpose(1, 2), U_tail, dtype=compact_dtype
+        )
+        PtU_tail = _bmm_accumulate(
+            P_tail.transpose(1, 2), U_tail, dtype=compact_dtype
+        )
+        grad_mu_tail = -(P_tail * Y_tail).sum(
+            dim=(1, 2), dtype=_solve_dtype(P, Y)
+        )
+        YtU = YtU_tail if YtU is None else YtU + YtU_tail
+        PtU = PtU_tail if PtU is None else PtU + PtU_tail
+        grad_mu = (
+            grad_mu_tail if grad_mu is None else grad_mu + grad_mu_tail
+        )
+    assert YtU is not None and PtU is not None and grad_mu is not None
+    return YtU, PtU, grad_mu
 
 
 def make_solve_state(
@@ -1011,8 +1075,8 @@ def _trace_gain_alpha_forward(
     eye: torch.Tensor | None,
     valid_mask: torch.Tensor | None,
     padding_ratio_hint: float | None,
-) -> torch.Tensor:
-    """Evaluate a solve with an already normalized effective strength."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate a solve and retain its compact Woodbury correction."""
 
     B, H, N, rank = U.shape
     width = C.shape[-1]
@@ -1066,20 +1130,22 @@ def _trace_gain_alpha_forward(
     )
     if eye is None:
         eye = torch.eye(rank, device=U.device, dtype=solve_dtype).view(1, 1, rank, rank)
-    effective_beta = effective_alpha.expand(B, H, 1, 1).to(solve_dtype).reciprocal()
-    system = (
-        gram_bh.view(B, H, rank, rank)
-        + effective_beta * eye.to(solve_dtype)
+    effective = effective_alpha.expand(B, H, 1, 1).to(solve_dtype)
+    system, balanced_cross = _balanced_woodbury_system(
+        gram_bh.view(B, H, rank, rank),
+        cross_bh.view(B, H, rank, width),
+        effective,
+        eye.to(solve_dtype),
     )
     compact = _solve_no_check(
         system.reshape(B * H, rank, rank),
-        cross_bh.reshape(B * H, rank, width),
+        balanced_cross.reshape(B * H, rank, width),
     ).to(U_bh.dtype)
     output = torch.baddbmm(
         C_safe.flatten(0, 1), U_bh, compact, beta=1.0, alpha=-1.0
     ).view(B, H, N, width)
     output.mul_(gain.expand(B, H, 1, 1).to(output.dtype))
-    return output
+    return output, compact.view(B, H, rank, width)
 
 
 def _trace_statistics_forward(
@@ -1094,7 +1160,9 @@ def _trace_statistics_forward(
     length_normalize: bool,
     length_reference: float,
     padding_ratio_hint: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     """Statistics-first trace-normalized forward.
 
     ``trace(U.T @ U)`` is the relation-basis energy, so normalization is
@@ -1190,11 +1258,12 @@ def _trace_statistics_forward(
 
     if eye is None:
         eye = torch.eye(rank, device=U.device, dtype=solve_dtype).view(1, 1, rank, rank)
-    effective_beta = effective_alpha.reciprocal()
-    system = gram + effective_beta * eye.to(solve_dtype)
+    system, balanced_cross = _balanced_woodbury_system(
+        gram, cross, effective_alpha, eye.to(solve_dtype)
+    )
     compact = _solve_no_check(
         system.reshape(B * H, rank, rank),
-        cross.reshape(B * H, rank, width),
+        balanced_cross.reshape(B * H, rank, width),
     )
     output_dtype = C.dtype if U.dtype == C.dtype else torch.promote_types(U.dtype, C.dtype)
     compact = compact.to(U_bh.dtype)
@@ -1207,6 +1276,7 @@ def _trace_statistics_forward(
         effective_alpha,
         denominator,
         scale_squared,
+        compact.view(B, H, rank, width),
     )
 
 
@@ -1219,6 +1289,7 @@ def _trace_gain_alpha_backward(
     effective_alpha: torch.Tensor,
     scale_squared: torch.Tensor,
     denominator: torch.Tensor,
+    forward_compact: torch.Tensor,
     valid_mask: torch.Tensor | None,
     padding_ratio_hint: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1241,7 +1312,7 @@ def _trace_gain_alpha_backward(
         # output-sized torch.where tensors before dispatch.
         grad = grad_output
 
-    P = _trace_gain_alpha_forward(
+    P, adjoint_compact = _trace_gain_alpha_forward(
         U,
         grad,
         gain,
@@ -1259,41 +1330,38 @@ def _trace_gain_alpha_backward(
     U_native = U.to(matmul_dtype)
     Y_native = Y.to(matmul_dtype)
     P_native = P.to(matmul_dtype)
-    # Express the direct U derivative in terms of the already gain-scaled
-    # primal/adjoint states Y and P. This introduces alpha/g, but it is not a
-    # separate model parameter.
-    direct_u_scale = effective_alpha / gain
     gain_flat = gain.expand(B, H, 1, 1).reshape(B * H).float().contiguous()
     effective_alpha_flat = effective_alpha.reshape(B * H).float().contiguous()
-    direct_u_scale_flat = direct_u_scale.reshape(B * H).float().contiguous()
-    # Trace normalization always uses the Tensor-Core/cuBLAS dispatcher. The
-    # legacy scalar all-in-one kernel cannot fuse the radial derivative and
-    # duplicates mask traffic, so it remains available only to the legacy
-    # non-trace parameterization.
-    split_n = (
-        N >= _SPLIT_BACKWARD_MIN_SEQUENCE
-        and B * H <= _SPLIT_BACKWARD_MAX_SYSTEMS
-    )
+    compact_q = forward_compact.reshape(B * H, rank, -1).to(matmul_dtype)
+    compact_r = adjoint_compact.reshape(B * H, rank, -1).to(matmul_dtype)
     with torch.autocast(device_type=U.device.type, enabled=False):
-        YtU, PtU, grad_mu_flat = _backward_compact_statistics(
-            U_native,
-            Y_native,
-            P_native,
-            split_n=split_n,
-            chunk_size=_SPLIT_BACKWARD_CHUNK_SIZE,
-            valid_mask=valid_mask,
-            heads=H,
-        )
-        YtU_readout = YtU.to(matmul_dtype).contiguous()
-        PtU_readout = PtU.to(matmul_dtype).contiguous()
-        negative_compact_inner = -(
-            PtU.to(calc_dtype) * YtU.to(calc_dtype)
+        # q=(G+beta I)^-1 U^T C and r=(G+beta I)^-1 U^T dY
+        # expose a cancellation-free derivative:
+        #   dU_direct = -(P q^T + Y r^T)
+        #   d alpha_eff = -g beta^2 <r,q>.
+        # Unlike the historical alpha*(Y^T U/P^T U) form, neither expression
+        # subtracts nearly equal high-alpha quantities.
+        beta = effective_alpha_flat.to(calc_dtype).reciprocal()
+        compact_inner = (
+            compact_q.to(calc_dtype) * compact_r.to(calc_dtype)
         ).sum(dim=(1, 2))
-        grad_effective_alpha = negative_compact_inner / gain_flat.to(calc_dtype)
-        grad_gain_flat = -(
-            grad_mu_flat
-            + effective_alpha_flat.to(calc_dtype) * negative_compact_inner
-        ) / gain_flat.to(calc_dtype).square()
+        grad_effective_alpha = (
+            -gain_flat.to(calc_dtype) * beta.square() * compact_inner
+        )
+        if mask is None:
+            gain_inner = (grad_output.to(calc_dtype) * Y.to(calc_dtype)).sum(
+                dim=(2, 3)
+            )
+        else:
+            safe_product = torch.where(
+                mask,
+                grad_output.to(calc_dtype) * Y.to(calc_dtype),
+                torch.zeros((), device=U.device, dtype=calc_dtype),
+            )
+            gain_inner = safe_product.sum(dim=(2, 3))
+        grad_gain_flat = (
+            gain_inner.reshape(B * H) / gain_flat.to(calc_dtype)
+        )
         radial_coefficient = (
             -2.0
             * effective_alpha_flat.to(calc_dtype)
@@ -1303,9 +1371,9 @@ def _trace_gain_alpha_backward(
         direct_grad = try_dual_grad_u_tensorcore(
             P_native,
             Y_native,
-            YtU_readout,
-            PtU_readout,
-            -direct_u_scale_flat,
+            compact_q.transpose(1, 2).contiguous(),
+            compact_r.transpose(1, 2).contiguous(),
+            -torch.ones_like(effective_alpha_flat),
             radial_u=U_native,
             radial_coefficient=radial_coefficient.float().contiguous(),
             valid_mask=valid_mask,
@@ -1316,11 +1384,13 @@ def _trace_gain_alpha_backward(
             U_m = U_native.flatten(0, 1).contiguous()
             Y_m = Y_native.flatten(0, 1).contiguous()
             P_m = P_native.flatten(0, 1).contiguous()
-            direct_grad = torch.bmm(P_m, YtU_readout)
-            direct_grad.baddbmm_(Y_m, PtU_readout)
-            direct_grad.mul_(
-                -direct_u_scale.to(matmul_dtype).reshape(B * H, 1, 1)
+            direct_grad = torch.bmm(
+                P_m, compact_q.transpose(1, 2).contiguous()
             )
+            direct_grad.baddbmm_(
+                Y_m, compact_r.transpose(1, 2).contiguous()
+            )
+            direct_grad.neg_()
     # d alpha_eff / dU = -2 * alpha_eff * U / denominator. The
     # compact inner product is represented using the gain-scaled states.
     radial_coefficient = (
@@ -1378,7 +1448,13 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
         length_reference,
         padding_ratio_hint,
     ):
-        Y, effective_alpha, denominator, scale_squared = _trace_statistics_forward(
+        (
+            Y,
+            effective_alpha,
+            denominator,
+            scale_squared,
+            forward_compact,
+        ) = _trace_statistics_forward(
             U,
             C,
             gain,
@@ -1418,6 +1494,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
             effective_alpha,
             scale_squared,
             denominator,
+            forward_compact,
             mask_tensor,
             eye_tensor,
         )
@@ -1441,6 +1518,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
             effective_alpha,
             scale_squared,
             denominator,
+            forward_compact,
             mask_tensor,
             eye_tensor,
         ) = ctx.saved_tensors
@@ -1458,7 +1536,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
                 )
             eye = eye_tensor if ctx.has_eye else None
             with torch.enable_grad():
-                reference, _, _, _ = _trace_statistics_forward(
+                reference, _, _, _, _ = _trace_statistics_forward(
                     U,
                     C,
                     gain,
@@ -1500,6 +1578,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
             effective_alpha,
             scale_squared,
             denominator,
+            forward_compact,
             valid_mask,
             ctx.padding_ratio_hint,
         )
@@ -1795,7 +1874,13 @@ def lsso_gain_alpha(
                 length_reference,
                 padding_ratio_hint,
             )
-        output, _effective_alpha, _denominator, _scale_squared = _trace_statistics_forward(
+        (
+            output,
+            _effective_alpha,
+            _denominator,
+            _scale_squared,
+            _compact,
+        ) = _trace_statistics_forward(
             U,
             C,
             gain,
