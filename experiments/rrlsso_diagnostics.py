@@ -28,11 +28,24 @@ def rrlsso_parameter_diagnostics(
         "gain_log_mean": gains.mean(),
         "gain_log_std": gains.std(unbiased=False),
         "alpha_mean": strengths.mean(),
-        "alpha_std": strengths.std(unbiased=False),
         "alpha_observed_min": strengths.min(),
         "alpha_observed_max": strengths.max(),
         "beta_mean": beta.mean(),
     }
 
 
-__all__ = ["rrlsso_parameter_diagnostics"]
+def scalar_diagnostics_to_floats(
+    diagnostics: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """Transfer scalar diagnostics to the host with one device synchronization."""
+
+    if not diagnostics:
+        return {}
+    names = tuple(diagnostics)
+    values = torch.stack(
+        tuple(diagnostics[name].detach().float() for name in names)
+    ).cpu().tolist()
+    return dict(zip(names, values, strict=True))
+
+
+__all__ = ["rrlsso_parameter_diagnostics", "scalar_diagnostics_to_floats"]

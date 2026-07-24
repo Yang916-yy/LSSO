@@ -48,7 +48,10 @@ from experiments.deit3_official_recipe import (  # noqa: E402
     validation_transform,
     virtual_group_repeated_samples,
 )
-from experiments.rrlsso_diagnostics import rrlsso_parameter_diagnostics  # noqa: E402
+from experiments.rrlsso_diagnostics import (  # noqa: E402
+    rrlsso_parameter_diagnostics,
+    scalar_diagnostics_to_floats,
+)
 from lsso.mathdx_backend import is_mathdx_available, mathdx_load_error  # noqa: E402
 
 TRAIN_SAMPLES = 1_281_167
@@ -127,7 +130,7 @@ def complete_hf_split_cache(
     ]
     if not missing:
         print(
-            f"hf_cache_barrier split={split} "
+            f"hf_cache_ready split={split} "
             f"complete={len(filenames)}/{len(filenames)}",
             flush=True,
         )
@@ -135,8 +138,9 @@ def complete_hf_split_cache(
 
     helper = ROOT / "tools" / "hf_wds_stream.py"
     cache_workers = min(max(1, workers), len(missing))
+    barrier_started = time.monotonic()
     print(
-        f"hf_cache_barrier split={split} complete={len(filenames) - len(missing)}/"
+        f"hf_cache_fill split={split} complete={len(filenames) - len(missing)}/"
         f"{len(filenames)} missing={len(missing)} workers={cache_workers}",
         flush=True,
     )
@@ -171,16 +175,27 @@ def complete_hf_split_cache(
         )
 
     completed = len(filenames) - len(missing)
+    milestones = iter(
+        threshold
+        for threshold in sorted({
+            math.ceil(len(filenames) * fraction)
+            for fraction in (0.25, 0.5, 0.75)
+        })
+        if completed < threshold < len(filenames)
+    )
+    next_milestone = next(milestones, None)
     with concurrent.futures.ThreadPoolExecutor(max_workers=cache_workers) as executor:
         futures = [executor.submit(download, filename) for filename in missing]
         for future in concurrent.futures.as_completed(futures):
             future.result()
             completed += 1
-            if completed == len(filenames) or completed % 32 == 0:
+            if next_milestone is not None and completed >= next_milestone:
                 print(
-                    f"hf_cache_barrier split={split} complete={completed}/{len(filenames)}",
+                    f"hf_cache_progress split={split} "
+                    f"complete={completed}/{len(filenames)}",
                     flush=True,
                 )
+                next_milestone = next(milestones, None)
 
     partials = [
         cache_dir / f"{filename}.partial"
@@ -191,6 +206,11 @@ def complete_hf_split_cache(
         raise RuntimeError(
             f"HF {split} cache barrier left {len(partials)} partial shards"
         )
+    print(
+        f"hf_cache_complete split={split} complete={len(filenames)}/{len(filenames)} "
+        f"seconds={time.monotonic() - barrier_started:.1f}",
+        flush=True,
+    )
 
 
 def local_webdataset(
@@ -375,8 +395,6 @@ def create_training_model(args: argparse.Namespace) -> torch.nn.Module:
         kwargs.update(
             rank=args.rank,
             gain_init=args.gain_init,
-            alpha_init=args.alpha_init,
-            basis_normalization="trace",
             length_normalize=True,
             length_reference=1.0,
         )
@@ -389,6 +407,35 @@ def atomic_save(state: dict[str, Any], destination: Path) -> None:
     os.replace(temporary, destination)
 
 
+def migrate_metrics_without_alpha_std(
+    metrics: Path,
+    fields: tuple[str, ...],
+) -> None:
+    """Atomically remove the one retired diagnostic column before appending."""
+
+    if not metrics.is_file():
+        return
+    with metrics.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        existing = tuple(reader.fieldnames or ())
+        if existing == fields:
+            return
+        legacy = list(fields)
+        legacy.insert(legacy.index("alpha_observed_min"), "alpha_std")
+        if existing != tuple(legacy):
+            raise RuntimeError(
+                f"unsupported metrics schema in {metrics}: {existing}"
+            )
+        rows = list(reader)
+    temporary = metrics.with_suffix(metrics.suffix + ".tmp")
+    with temporary.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temporary, metrics)
+    print(f"metrics_schema_migrated removed=alpha_std path={metrics}", flush=True)
+
+
 @torch.inference_mode()
 def evaluate(
     model: torch.nn.Module,
@@ -398,7 +445,9 @@ def evaluate(
     max_steps: int = 0,
 ) -> tuple[float, float]:
     model.eval()
-    loss_sum = correct = total = 0.0
+    loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    correct = torch.zeros((), device=device, dtype=torch.int64)
+    total = 0
     for step, (images, labels) in enumerate(loader):
         if max_steps and step >= max_steps:
             break
@@ -408,13 +457,16 @@ def evaluate(
             logits = model(images)
             loss = F.cross_entropy(logits, labels)
         count = labels.numel()
-        loss_sum += loss.item() * count
-        correct += (logits.argmax(-1) == labels).sum().item()
+        loss_sum.add_(loss.detach().float(), alpha=count)
+        correct.add_((logits.argmax(-1) == labels).sum())
         total += count
     model.train()
     if not total:
         raise RuntimeError("ImageNet validation stream produced no batches")
-    return loss_sum / total, correct / total
+    loss_value, correct_value = torch.stack(
+        (loss_sum, correct.to(torch.float32))
+    ).cpu().tolist()
+    return loss_value / total, correct_value / total
 
 
 def create_official_optimizer(
@@ -722,11 +774,13 @@ def train(args: argparse.Namespace) -> None:
     mode = "a" if start_epoch and metrics.exists() else "w"
     fields = (
         "epoch", "train_loss", "lr", "gain_log_mean", "gain_log_std",
-        "alpha_mean", "alpha_std", "alpha_observed_min",
+        "alpha_mean", "alpha_observed_min",
         "alpha_observed_max", "beta_mean",
         "global_update", "val_loss", "val_acc",
         "seconds", "peak_gb",
     )
+    if mode == "a":
+        migrate_metrics_without_alpha_std(metrics, fields)
     with metrics.open(mode, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         if mode == "w":
@@ -739,7 +793,7 @@ def train(args: argparse.Namespace) -> None:
             model.zero_grad(set_to_none=True)
             started = time.time()
             torch.cuda.reset_peak_memory_stats()
-            loss_sum = 0.0
+            loss_sum = torch.zeros((), device=device, dtype=torch.float32)
             observed_steps = 0
             for step, (images, labels) in enumerate(train_loader):
                 if step >= steps_per_epoch:
@@ -759,7 +813,7 @@ def train(args: argparse.Namespace) -> None:
                     data_loss = criterion(model(images), labels)
                     loss = data_loss / args.grad_accum
                 scaler.scale(loss).backward()
-                loss_sum += data_loss.detach().item()
+                loss_sum.add_(data_loss.detach().float())
                 if (step + 1) % args.grad_accum == 0:
                     if args.clip_grad:
                         scaler.unscale_(optimizer)
@@ -772,9 +826,10 @@ def train(args: argparse.Namespace) -> None:
                     if model_ema is not None:
                         model_ema.update(model)
                 if (step + 1) % args.log_interval == 0:
+                    logged_loss = float(loss_sum.item()) / (step + 1)
                     print(
                         f"epoch={epoch + 1} step={step + 1}/{steps_per_epoch} "
-                        f"loss={loss_sum / (step + 1):.4f}",
+                        f"loss={logged_loss:.4f}",
                         flush=True,
                     )
             if observed_steps == 0:
@@ -821,13 +876,12 @@ def train(args: argparse.Namespace) -> None:
                 model, val_loader, device, amp_dtype, args.max_val_steps
             )
             parameter_diagnostics = rrlsso_parameter_diagnostics(model)
-            diagnostic_values = {
-                key: float(value.item()) for key, value in parameter_diagnostics.items()
-            }
+            diagnostic_values = scalar_diagnostics_to_floats(parameter_diagnostics)
+            train_loss_value = float(loss_sum.item()) / observed_steps
             current_lr = float(optimizer.param_groups[0]["lr"])
             row = {
                 "epoch": epoch + 1,
-                "train_loss": loss_sum / observed_steps,
+                "train_loss": train_loss_value,
                 "lr": current_lr,
                 **diagnostic_values,
                 "global_update": global_update,
@@ -920,7 +974,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--gain-init", type=float, default=1.0)
-    parser.add_argument("--alpha-init", type=float, default=1.0)
     parser.add_argument("--hf-repo", default="timm/imagenet-1k-wds")
     parser.add_argument("--cache-dir", default="/local_nvme/imagenet-wds")
     parser.add_argument("--local-wds-dir", default="")

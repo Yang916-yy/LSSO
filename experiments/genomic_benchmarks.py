@@ -246,7 +246,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--gain-init", type=float, default=1.0)
-    parser.add_argument("--alpha-init", type=float, default=1.0)
     parser.add_argument("--position-rank", type=int, default=0)
     parser.add_argument(
         "--local-motif-kernel",
@@ -400,7 +399,6 @@ def main() -> None:
         local_motif_dilations=tuple(args.local_motif_dilations),
         local_motif_layer_scale=args.local_motif_layer_scale,
         gain_init=args.gain_init,
-        alpha_init=args.alpha_init,
     )
     model = ReverseComplementSequenceClassifier(
         encoder,
@@ -478,7 +476,6 @@ def main() -> None:
             "mixer": args.mixer,
             "rank": args.rank,
             "gain_init": args.gain_init,
-            "alpha_init": args.alpha_init,
             "dim": args.dim,
             "depth": args.depth,
             "heads": args.heads,

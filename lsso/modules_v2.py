@@ -8,11 +8,10 @@ from .mathdx_backend import (
     try_rank_rotary,
 )
 from .modules import (
-    DEFAULT_ALPHA_INIT,
     DEFAULT_GAIN_INIT,
     LSSODiagnostics,
     _initialize_solve_parameters,
-    _fold_fixed_gain_into_output,
+    _solve_log_parameters,
     _solve_parameters,
     lsso_gain_alpha,
 )
@@ -105,11 +104,8 @@ class RRLSSO(nn.Module):
         dropout: float = 0.0,
         eps: float = 1e-5,
         gain_init: float = DEFAULT_GAIN_INIT,
-        alpha_init: float = DEFAULT_ALPHA_INIT,
-        solve_parameterization: str = "gain_alpha",
         no_global: bool = False,
         normalize_u: bool = True,
-        basis_normalization: str = "trace",
         length_normalize: bool = True,
         length_reference: float = 1.0,
         rotary_base: float = 10000.0,
@@ -129,12 +125,6 @@ class RRLSSO(nn.Module):
         self.eps = eps
         self.no_global = no_global
         self.normalize_u = normalize_u
-        if basis_normalization not in {"trace", "token_rms"}:
-            raise ValueError(
-                "basis_normalization must be 'trace' or 'token_rms', "
-                f"got {basis_normalization!r}"
-            )
-        self.basis_normalization = basis_normalization
         self.length_normalize = length_normalize
         if length_reference <= 0:
             raise ValueError(f"length_reference must be positive, got {length_reference}")
@@ -156,14 +146,7 @@ class RRLSSO(nn.Module):
         _initialize_solve_parameters(
             self,
             num_heads,
-            solve_parameterization=solve_parameterization,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-        )
-        _fold_fixed_gain_into_output(
-            self,
-            groups=num_heads,
-            group_width=self.head_dim,
         )
 
         self.dropout_p = dropout
@@ -175,14 +158,6 @@ class RRLSSO(nn.Module):
         """Return the positive output gain and relative solve strength."""
 
         return _solve_parameters(self)
-
-    def fold_fixed_gain_into_output(self, *, force: bool = False) -> None:
-        _fold_fixed_gain_into_output(
-            self,
-            groups=self.num_heads,
-            group_width=self.head_dim,
-            force=force,
-        )
 
     def forward(
         self,
@@ -205,8 +180,7 @@ class RRLSSO(nn.Module):
         C = C.view(B, N, H, dh).transpose(1, 2)
 
         pruning_active = self.prune_rank_keep is not None and 0 < self.prune_rank_keep < r
-        token_rms = self.normalize_u and self.basis_normalization == "token_rms"
-        trace_basis = self.normalize_u and self.basis_normalization == "trace"
+        trace_basis = self.normalize_u
         if position_ids is None:
             expected_shape = (1, 1, N, r // 2)
             cache_valid = (
@@ -230,12 +204,6 @@ class RRLSSO(nn.Module):
                 self._rotary_sin_cache = angles.sin().to(U.dtype).view(expected_shape)
             cos = self._rotary_cos_cache
             sin = self._rotary_sin_cache
-            # Token-RMS is a PyTorch-only ablation. The maintained native
-            # preprocessing path contains only the orthogonal rank rotation.
-            if token_rms:
-                U = U * torch.rsqrt(
-                    torch.mean(U * U, dim=-1, keepdim=True) + self.eps
-                )
             rotated = try_rank_rotary(U, cos, sin)
             if rotated is None:
                 even = U[..., 0::2]
@@ -245,10 +213,6 @@ class RRLSSO(nn.Module):
                 rotated[..., 1::2] = even * sin + odd * cos
             U = rotated
         else:
-            if token_rms:
-                U = U * torch.rsqrt(
-                    torch.mean(U * U, dim=-1, keepdim=True) + self.eps
-                )
             U = apply_rank_rotary(
                 U,
                 position_ids,
@@ -273,16 +237,16 @@ class RRLSSO(nn.Module):
             U = U.gather(-1, indices[:, :, None, :].expand(B, H, N, keep))
             solve_eye = None
 
-        gain, alpha = _solve_parameters(self)
+        gain, theta_alpha = _solve_log_parameters(self)
 
         gain = gain.view(1, H, 1, 1)
-        alpha = alpha.view(1, H, 1, 1)
+        theta_alpha = theta_alpha.view(1, H, 1, 1)
         if self.record_diagnostics:
             Y, aux = lsso_gain_alpha(
                 U,
                 C,
                 gain,
-                alpha,
+                torch.exp(theta_alpha),
                 eye=solve_eye,
                 no_global=self._global_disabled,
                 return_aux=True,
@@ -298,7 +262,7 @@ class RRLSSO(nn.Module):
                 U,
                 C,
                 gain,
-                alpha,
+                theta_alpha,
                 eye=solve_eye,
                 no_global=self._global_disabled,
                 length_normalize=self.length_normalize,
@@ -307,6 +271,7 @@ class RRLSSO(nn.Module):
                 normalization_eps=self.eps,
                 valid_mask=valid_mask,
                 padding_ratio_hint=padding_ratio_hint,
+                _log_alpha=True,
             )
             aux = None
 

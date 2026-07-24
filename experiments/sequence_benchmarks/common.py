@@ -18,7 +18,10 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler
 
-from experiments.rrlsso_diagnostics import rrlsso_parameter_diagnostics
+from experiments.rrlsso_diagnostics import (
+    rrlsso_parameter_diagnostics,
+    scalar_diagnostics_to_floats,
+)
 
 
 @dataclass
@@ -445,7 +448,8 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
     predictions, targets = [], []
-    loss_sum, examples = 0.0, 0
+    loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    examples = 0
     for index, raw_batch in enumerate(loader):
         if max_batches and index >= max_batches:
             break
@@ -454,12 +458,12 @@ def evaluate(
             logits = _forward(model, batch)
             loss = F.cross_entropy(logits, batch["labels"])
         batch_size = batch["labels"].numel()
-        loss_sum += float(loss) * batch_size
+        loss_sum.add_(loss.detach().float(), alpha=batch_size)
         examples += batch_size
         predictions.extend(logits.argmax(dim=-1).cpu().tolist())
         targets.extend(batch["labels"].cpu().tolist())
     metrics = _classification_metrics(predictions, targets, num_classes)
-    metrics["loss"] = loss_sum / max(examples, 1)
+    metrics["loss"] = float(loss_sum.item()) / max(examples, 1)
     metrics["examples"] = float(examples)
     return metrics
 
@@ -593,7 +597,8 @@ def train_classifier(
         if hasattr(model, "set_augmentation_epoch"):
             model.set_augmentation_epoch(epoch)
         model.train()
-        train_loss, examples = 0.0, 0
+        train_loss = torch.zeros((), device=device, dtype=torch.float32)
+        examples = 0
         accumulated_examples = 0
         optimizer.zero_grad(set_to_none=True)
         for batch_index, raw_batch in enumerate(train_loader):
@@ -625,7 +630,7 @@ def train_classifier(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_examples = 0
-            train_loss += float(loss.detach()) * batch_size
+            train_loss.add_(loss.detach().float(), alpha=batch_size)
             examples += batch_size
         train_finished = time.perf_counter()
         validation = evaluate(
@@ -636,10 +641,10 @@ def train_classifier(
             config.max_eval_batches,
         )
         score = validation["accuracy"]
-        solve_diagnostics = {
-            key: float(value.item())
-            for key, value in rrlsso_parameter_diagnostics(model).items()
-        }
+        solve_diagnostics = scalar_diagnostics_to_floats(
+            rrlsso_parameter_diagnostics(model)
+        )
+        train_loss_value = float(train_loss.item()) / max(examples, 1)
         improved = (
             config.select_last
             or score > best
@@ -652,7 +657,7 @@ def train_classifier(
             stale_epochs += 1
         metrics = {
             "epoch": epoch,
-            "train_loss": train_loss / max(examples, 1),
+            "train_loss": train_loss_value,
             "val_loss": validation["loss"],
             "val_accuracy": validation["accuracy"],
             "val_macro_f1": validation["macro_f1"],

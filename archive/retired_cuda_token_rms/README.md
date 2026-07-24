@@ -1,8 +1,9 @@
 # Retired CUDA token-RMS preparation path
 
 The active LSSO implementation uses sample/head Gram-trace normalization.
-Per-token RMS normalization remains available only as a portable PyTorch
-ablation through `basis_normalization="token_rms"`.
+The portable formula is preserved in
+`archive/retired_parameterization_ablations/token_rms_reference.py`; it is no
+longer exposed by supported constructors.
 
 The native path retired here consisted of four custom operators:
 

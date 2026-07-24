@@ -31,7 +31,7 @@
 namespace {
 
 #if CUDART_VERSION >= 13000
-constexpr int kThorMathDxArch = 1100;
+[[maybe_unused]] constexpr int kThorMathDxArch = 1100;
 #else
 // CUDA 13 renamed Thor from SM101 to SM110. MathDx descriptors follow the
 // toolkit-specific name even though runtime compute capability reports 11.0.
@@ -160,7 +160,7 @@ __global__ void masked_trace_solve_readout_kernel(
     const scalar_t* __restrict__ c,
     const bool* __restrict__ valid_mask,
     const float* __restrict__ length_scale,
-    const float* __restrict__ alpha,
+    const float* __restrict__ log_alpha,
     const float* __restrict__ gain,
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ compact_output,
@@ -309,9 +309,22 @@ __global__ void masked_trace_solve_readout_kernel(
                 : element_count;
             scale_squared = target / fmaxf(denominator, FLT_MIN);
         }
-        effective_alpha_shared = alpha[batch] * scale_squared;
-        reciprocal_alpha_shared = effective_alpha_shared >= 1.0f
-            ? 1.0f / effective_alpha_shared : 1.0f;
+        // The Trace entry point receives theta_alpha directly.  Select the
+        // balanced side in log space so an unbounded learnable strength never
+        // needs exp(theta_alpha) on the large-alpha side.
+        const float log_effective = (
+            trace_normalize
+                ? log_alpha[batch]
+                : logf(fmaxf(log_alpha[batch], FLT_MIN))
+        ) + logf(fmaxf(scale_squared, FLT_MIN));
+        if (log_effective >= 0.0f) {
+            reciprocal_alpha_shared = expf(-log_effective);
+            effective_alpha_shared = expf(
+                fminf(log_effective, logf(FLT_MAX)));
+        } else {
+            effective_alpha_shared = expf(log_effective);
+            reciprocal_alpha_shared = 1.0f;
+        }
         if (effective_alpha_output != nullptr) {
             effective_alpha_output[batch] = effective_alpha_shared;
             denominator_output[batch] = denominator;
@@ -1318,7 +1331,7 @@ std::tuple<at::Tensor, at::Tensor> solve_spd_impl(
         {gram.size(0)},
         gram.options().dtype(at::kInt));
     const auto* props = at::cuda::getCurrentDeviceProperties();
-    const int cc = props->major * 10 + props->minor;
+    [[maybe_unused]] const int cc = props->major * 10 + props->minor;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(gram.get_device()).stream();
 
     // MathDx descriptors are architecture-specific. Minor revisions without a
@@ -1449,7 +1462,7 @@ masked_readout_impl(
     auto scale_squared_output = trace_normalize
         ? at::empty({systems}, trace_options) : at::empty({0}, trace_options);
     const auto* props = at::cuda::getCurrentDeviceProperties();
-    const int cc = props->major * 10 + props->minor;
+    [[maybe_unused]] const int cc = props->major * 10 + props->minor;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(u.get_device()).stream();
 
 #define DISPATCH_MASKED_TRACE(ARCH) \

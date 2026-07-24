@@ -39,9 +39,6 @@ class RRLSSOSelfAttention(nn.Module):
         dropout: float,
         bias: bool,
         gain_init: float = 1.0,
-        alpha_init: float = 1.0,
-        solve_parameterization: str = "gain_alpha",
-        basis_normalization: str = "trace",
         relation_groups: int | None = None,
         length_normalize: bool = True,
         length_reference: float = 1.0,
@@ -57,9 +54,6 @@ class RRLSSOSelfAttention(nn.Module):
                 dropout=dropout,
                 bias=bias,
                 gain_init=gain_init,
-                alpha_init=alpha_init,
-                solve_parameterization=solve_parameterization,
-                basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
             )
@@ -72,9 +66,6 @@ class RRLSSOSelfAttention(nn.Module):
                 dropout=dropout,
                 bias=bias,
                 gain_init=gain_init,
-                alpha_init=alpha_init,
-                solve_parameterization=solve_parameterization,
-                basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
             )
@@ -97,9 +88,6 @@ def replace_vit_attention_with_rrlsso(
     *,
     rank: int,
     gain_init: float = 1.0,
-    alpha_init: float = 1.0,
-    solve_parameterization: str = "gain_alpha",
-    basis_normalization: str = "trace",
     relation_groups: int | None = None,
     length_normalize: bool = True,
     length_reference: float = 1.0,
@@ -114,9 +102,6 @@ def replace_vit_attention_with_rrlsso(
             dropout=float(old.dropout),
             bias=old.in_proj_bias is not None,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-            solve_parameterization=solve_parameterization,
-            basis_normalization=basis_normalization,
             relation_groups=relation_groups,
             length_normalize=length_normalize,
             length_reference=length_reference,
@@ -134,9 +119,6 @@ def build_model(
     image_size: int,
     patch_size: int,
     gain_init: float = 1.0,
-    alpha_init: float = 1.0,
-    solve_parameterization: str = "gain_alpha",
-    basis_normalization: str = "trace",
     relation_groups: int = 4,
     length_normalize: bool = True,
     length_reference: float = 1.0,
@@ -156,9 +138,6 @@ def build_model(
                 model,
                 rank=rank,
                 gain_init=gain_init,
-                alpha_init=alpha_init,
-                solve_parameterization=solve_parameterization,
-                basis_normalization=basis_normalization,
                 length_normalize=length_normalize,
                 length_reference=length_reference,
             )
@@ -186,9 +165,6 @@ def build_model(
             model,
             rank=rank,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-            solve_parameterization=solve_parameterization,
-            basis_normalization=basis_normalization,
             length_normalize=length_normalize,
             length_reference=length_reference,
         )
@@ -198,9 +174,6 @@ def build_model(
             model,
             rank=rank,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-            solve_parameterization=solve_parameterization,
-            basis_normalization=basis_normalization,
             relation_groups=relation_groups,
             length_normalize=length_normalize,
             length_reference=length_reference,
@@ -391,9 +364,6 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
         image_size=args.image_size,
         patch_size=args.patch_size,
         gain_init=args.gain_init,
-        alpha_init=args.alpha_init,
-        solve_parameterization=args.solve_parameterization,
-        basis_normalization=args.basis_normalization,
         relation_groups=args.relation_groups,
         length_normalize=args.length_normalize,
         length_reference=resolved_length_reference,
@@ -405,8 +375,6 @@ def train_one(args: argparse.Namespace, kind: str) -> None:
         f"params={n_params:,} device={device} dtype={dtype} "
         f"length_normalize={args.length_normalize} "
         f"length_reference={resolved_length_reference} "
-        f"solve_parameterization={args.solve_parameterization} "
-        f"basis_normalization={args.basis_normalization} "
         "rank_rotary=ordinary"
     )
     strength_mean, strength_min, strength_max = global_strength_stats(model)
@@ -590,18 +558,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--relation-groups", type=int, default=4)
     parser.add_argument("--gain-init", type=float, default=1.0)
-    parser.add_argument("--alpha-init", type=float, default=1.0)
-    parser.add_argument(
-        "--solve-parameterization",
-        choices=["gain_alpha", "fixed_gain_alpha"],
-        default="gain_alpha",
-    )
-    parser.add_argument(
-        "--basis-normalization",
-        choices=["trace", "token_rms"],
-        default="trace",
-        help="Relation-basis normalization used by LSSO/RRLSSO mixers.",
-    )
     parser.add_argument(
         "--length-normalize",
         action=argparse.BooleanOptionalAction,

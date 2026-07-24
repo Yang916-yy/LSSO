@@ -44,5 +44,7 @@ jobs:
           tests/deit3_rrlsso_adapter_test.py
           tests/deit3_official_recipe_test.py
           tests/imagenet_deit3_train_test.py
+          tests/frozen_interface_test.py
+          tests/notebook_contract_test.py
       - name: Build wheel and source distribution
         run: python -m build

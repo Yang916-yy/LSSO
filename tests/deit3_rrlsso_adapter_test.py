@@ -18,7 +18,6 @@ def test_timm_rrlsso_attention_uses_ordinary_rank_rotary_and_backpropagates() ->
         dropout=0.0,
         bias=True,
         gain_init=1.4426742274994273,
-        alpha_init=1.0776072417497349,
         length_normalize=True,
         length_reference=1.0,
     )
@@ -39,7 +38,6 @@ def test_timm_rrlsso_attention_rejects_causal_mode() -> None:
         dropout=0.0,
         bias=True,
         gain_init=1.4426742274994273,
-        alpha_init=1.0776072417497349,
         length_normalize=True,
         length_reference=1.0,
     )

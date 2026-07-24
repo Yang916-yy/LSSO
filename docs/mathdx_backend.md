@@ -74,20 +74,23 @@ Path counters (`LSSO_PATH_COUNTERS=1`) and solver-info checks
 - scalar all-in-one backward: blocked Tensor Cores and lost at training shapes;
 - rotary-on-load Trace fusion: repeated rotation and was slower than the
   separate strided Rank Rotary kernel;
-- native token-RMS preparation: retained only as a PyTorch ablation.
+- native token-RMS preparation: retired with the parameterization ablation.
 
 See `archive/retired_cuda_compat/README.md` and
-`archive/retired_cuda_token_rms/README.md`. Retired numerical behavior remains
+`archive/retired_parameterization_ablations/README.md`. Retired numerical behavior remains
 available through PyTorch compact statistics plus `solve_spd`; retired native
 operators are not part of the public extension ABI.
 
 ## Build and verify
 
-The maintained native operator contract is **CUDA backend ABI 1**, introduced
-in LSSO 0.2.0. Operator schemas, logical tensor layouts, dtype behavior, mask
-semantics, and fallback behavior are frozen for this ABI. Kernel-internal
-scheduling may change without incrementing it. The loader verifies the ABI
-reported by the shared library before dispatching an operator.
+The maintained native operator contract is **CUDA backend ABI 2**. Relative to
+ABI 1, fused forward operators return the compact solve state consumed by the
+backward path, and Trace kernels accept log-alpha so the stable reciprocal
+Woodbury system avoids a redundant exponentiation/materialization boundary.
+Operator schemas, logical tensor layouts, dtype behavior, mask semantics, and
+fallback behavior are frozen for this ABI. Kernel-internal scheduling may
+change without incrementing it. The loader verifies the ABI reported by the
+shared library before dispatching an operator.
 
 ```bash
 cd /root/LSSO
@@ -102,7 +105,7 @@ The development build targets the installed GPU. Set
 architecture set. CUDA 12 and CUDA 13 require matching MathDx packages and
 device-LTO objects; the build script rejects mixed major-version artifacts.
 
-Official release assets provide separate Linux x86-64 runtime wheels for
+The v0.3.0 release artifacts provide separate Linux x86-64 runtime wheels for
 PyTorch 2.11 with CUDA 12.8 and CUDA 13.0. The loader validates the exact
 PyTorch and CUDA build before using a packaged runtime; incompatible or absent
 packages retain the portable PyTorch fallback. Source builds remain available
@@ -111,5 +114,5 @@ for other environments.
 The CUDA 12.8 wheel uses MathDx 25.12.1 and is the default recommendation. The
 CUDA 13.0 wheel uses MathDx 26.06. Both contain native SASS for SM80, SM86,
 SM87, SM89, SM90, SM100, and SM120, carry no build-host RUNPATH, and report
-backend ABI 1. Runtime wheels are release assets rather than Git-tracked
+backend ABI 2. Runtime wheels are release assets rather than Git-tracked
 binaries.

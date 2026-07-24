@@ -307,6 +307,7 @@ def try_masked_trace_stats_solve_readout(
     length_reference: float,
     length_normalize: bool,
     padding_ratio_hint: float | None = None,
+    input_is_log: bool = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ] | None:
@@ -349,7 +350,7 @@ def try_masked_trace_stats_solve_readout(
             u.contiguous(),
             c,
             valid_mask.contiguous(),
-            alpha.contiguous(),
+            (alpha if input_is_log else torch.log(alpha)).contiguous(),
             gain.contiguous(),
             float(normalization_eps),
             float(length_reference),
@@ -378,6 +379,7 @@ def try_trace_stats_solve_readout(
     normalization_eps: float,
     length_reference: float,
     length_normalize: bool,
+    input_is_log: bool = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ] | None:
@@ -419,7 +421,7 @@ def try_trace_stats_solve_readout(
             u.contiguous(),
             c,
             empty_mask,
-            alpha.contiguous(),
+            (alpha if input_is_log else torch.log(alpha)).contiguous(),
             gain.contiguous(),
             float(normalization_eps),
             float(length_reference),

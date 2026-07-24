@@ -388,7 +388,6 @@ def freeze_base(
         },
         "solve": {
             "gain_init": 1.0,
-            "alpha_init": 1.0,
         },
         "training": {
             "epochs": 100,

@@ -129,7 +129,7 @@ checkpoint:
 The official path deliberately initializes refinement from the raw model rather
 than EMA. A fresh refinement EMA is then created from exactly those raw weights,
 so its starting state and trained model agree. Checkpoints carry a schema and
-stage/model/resolution/rank/alpha metadata; resume fails loudly on incompatible
+stage/model/resolution/rank metadata; resume fails loudly on incompatible
 or legacy state rather than silently changing parameter semantics. Likewise,
 `--init-checkpoint` together with `--resume` is rejected. `--overwrite-output`
 is required to replace an existing stage checkpoint and is intended only for

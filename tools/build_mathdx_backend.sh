@@ -83,7 +83,8 @@ PY
         # runtime architecture in one translation unit and can require tens of
         # gigabytes of NVCC memory. Release builds intentionally retain the
         # complete architecture dispatcher.
-        cmake_args+=("-DLSSO_MATHDX_NATIVE_ARCH=${torch_config[1]}0")
+        native_arch="${LSSO_MATHDX_NATIVE_ARCH:-${torch_config[1]}0}"
+        cmake_args+=("-DLSSO_MATHDX_NATIVE_ARCH=${native_arch}")
     fi
     if [[ -n "${torch_architectures}" ]]; then
         cmake_args+=("-DTORCH_CUDA_ARCH_LIST=${torch_architectures}")

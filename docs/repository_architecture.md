@@ -66,10 +66,14 @@ raw experiment directories.  A result cited by the paper should have a small
 machine-readable summary plus enough configuration and provenance to recreate
 it; the checkpoint itself belongs in external artifact storage.
 
-## Migration plan
+## Frozen operator interface
 
-The legacy implementation files are intentionally retained while APIs are
-stabilized.  Future moves should be incremental:
+Supported constructors use Trace normalization with learnable log-gain and
+learnable unbounded log-alpha. Alpha starts internally at one and is restored
+from `theta_alpha` in checkpoints; initialization and retired
+parameterization ablations are not public constructor options.
+
+Future internal moves should remain incremental:
 
 1. move solve-state and reference functions behind `lsso.ops`;
 2. move backend loading and dispatch behind `lsso.backends`;

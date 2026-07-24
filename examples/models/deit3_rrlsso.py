@@ -32,9 +32,6 @@ class TimmRRLSSOAttention(nn.Module):
         dropout: float = 0.0,
         bias: bool = True,
         gain_init: float = 1.0,
-        alpha_init: float = 1.0,
-        solve_parameterization: str = "gain_alpha",
-        basis_normalization: str = "trace",
         length_normalize: bool = True,
         length_reference: float = 1.0,
     ) -> None:
@@ -46,9 +43,6 @@ class TimmRRLSSOAttention(nn.Module):
             dropout=dropout,
             bias=bias,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-            solve_parameterization=solve_parameterization,
-            basis_normalization=basis_normalization,
             length_normalize=length_normalize,
             length_reference=length_reference,
         )
@@ -71,9 +65,6 @@ def replace_timm_attention_with_rrlsso(
     *,
     rank: int = 32,
     gain_init: float = 1.0,
-    alpha_init: float = 1.0,
-    solve_parameterization: str = "gain_alpha",
-    basis_normalization: str = "trace",
     length_normalize: bool = True,
     length_reference: float = 1.0,
 ) -> int:
@@ -93,9 +84,6 @@ def replace_timm_attention_with_rrlsso(
             dropout=float(old.attn_drop.p),
             bias=old.qkv.bias is not None,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-            solve_parameterization=solve_parameterization,
-            basis_normalization=basis_normalization,
             length_normalize=length_normalize,
             length_reference=length_reference,
         )
@@ -117,9 +105,6 @@ def _create_deit3_rrlsso(
     rank = int(kwargs.pop("rank", 32))
     mixer_kwargs = {
         "gain_init": float(kwargs.pop("gain_init", 1.0)),
-        "alpha_init": float(kwargs.pop("alpha_init", 1.0)),
-        "solve_parameterization": kwargs.pop("solve_parameterization", "gain_alpha"),
-        "basis_normalization": kwargs.pop("basis_normalization", "trace"),
         "length_normalize": bool(kwargs.pop("length_normalize", True)),
         "length_reference": float(kwargs.pop("length_reference", 1.0)),
     }

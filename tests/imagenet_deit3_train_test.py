@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import csv
 import subprocess
 from unittest.mock import patch
 
@@ -13,7 +15,9 @@ from experiments.imagenet_wds_train import (
     create_model_ema,
     create_official_optimizer,
     create_training_model,
+    evaluate,
     make_loaders,
+    migrate_metrics_without_alpha_std,
     parse_args,
     resolve_run_mode,
     resize_position_embedding,
@@ -21,6 +25,63 @@ from experiments.imagenet_wds_train import (
     validate_initialization_checkpoint,
     validate_resume_checkpoint,
 )
+
+
+def test_evaluate_accumulates_device_statistics_without_changing_metrics() -> None:
+    class IdentityLogits(torch.nn.Module):
+        def forward(self, inputs):
+            return inputs
+
+    model = IdentityLogits()
+    model.train()
+    logits = torch.tensor([[3.0, 0.0], [0.0, 2.0], [1.0, 1.0]])
+    labels = torch.tensor([0, 1, 1])
+    expected_loss = torch.nn.functional.cross_entropy(logits, labels).item()
+    with patch(
+        "experiments.imagenet_wds_train.torch.autocast",
+        return_value=nullcontext(),
+    ):
+        loss, accuracy = evaluate(
+            model,
+            [(logits, labels)],
+            torch.device("cpu"),
+            torch.float32,
+        )
+    assert loss == pytest.approx(expected_loss)
+    assert accuracy == pytest.approx(2 / 3)
+    assert model.training
+
+
+def test_metrics_schema_migration_removes_only_alpha_std(tmp_path) -> None:
+    fields = (
+        "epoch", "alpha_mean", "alpha_observed_min", "alpha_observed_max",
+    )
+    legacy_fields = (
+        "epoch", "alpha_mean", "alpha_std",
+        "alpha_observed_min", "alpha_observed_max",
+    )
+    metrics = tmp_path / "metrics.csv"
+    with metrics.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=legacy_fields)
+        writer.writeheader()
+        writer.writerow({
+            "epoch": 1,
+            "alpha_mean": 1.5,
+            "alpha_std": 0.25,
+            "alpha_observed_min": 1.0,
+            "alpha_observed_max": 2.0,
+        })
+    migrate_metrics_without_alpha_std(metrics, fields)
+    with metrics.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    assert tuple(reader.fieldnames or ()) == fields
+    assert rows == [{
+        "epoch": "1",
+        "alpha_mean": "1.5",
+        "alpha_observed_min": "1.0",
+        "alpha_observed_max": "2.0",
+    }]
 
 
 def test_stage_defaults_cover_low_resolution_and_refinement() -> None:
@@ -189,7 +250,10 @@ def test_hf_cache_barrier_fills_every_missing_shard_before_return(tmp_path) -> N
         assert kwargs["stdout"] is subprocess.DEVNULL
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    with patch("experiments.imagenet_wds_train.subprocess.run", side_effect=fake_run):
+    with (
+        patch("experiments.imagenet_wds_train.subprocess.run", side_effect=fake_run),
+        patch("builtins.print") as print_mock,
+    ):
         complete_hf_split_cache(
             "train",
             tmp_path,
@@ -197,6 +261,10 @@ def test_hf_cache_barrier_fills_every_missing_shard_before_return(tmp_path) -> N
             workers=0,
             shard_limit=3,
         )
+    messages = [str(call.args[0]) for call in print_mock.call_args_list]
+    assert messages[0].startswith("hf_cache_fill ")
+    assert sum(message.startswith("hf_cache_progress ") for message in messages) == 2
+    assert messages[-1].startswith("hf_cache_complete ")
     assert sorted(downloaded) == [
         "imagenet1k-train-0000.tar",
         "imagenet1k-train-0001.tar",
@@ -214,9 +282,8 @@ def test_registered_model_configuration_is_trace_normalized() -> None:
         ]
     )
     model = create_training_model(args)
-    assert model.rrlsso_config["basis_normalization"] == "trace"
     assert model.rrlsso_config["rank_rotary"] == "ordinary-1d"
-    assert model.rrlsso_config["alpha_init"] == 1.0
+    assert "alpha_init" not in model.rrlsso_config
     assert model.rrlsso_config["layerscale_init"] == 1e-4
     assert torch.isfinite(model.pos_embed).all()
 

@@ -74,7 +74,6 @@ def command_for(
         "solve",
         {
             "gain_init": 1.0,
-            "alpha_init": 1.0,
         },
     )
     command = [
@@ -91,7 +90,6 @@ def command_for(
         "--heads", str(size["heads"]),
         "--rank", str(size["rank"]),
         "--gain-init", str(solve["gain_init"]),
-        "--alpha-init", str(solve["alpha_init"]),
         "--max-parameters", str(size["max_parameters"]),
         "--pooling", str(recipe["pooling"]),
         "--reverse-complement-probability",

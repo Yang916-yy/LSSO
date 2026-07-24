@@ -122,19 +122,21 @@ unsupported devices and shapes retain the portable PyTorch path. See
 details. The retained/retired kernel rationale and verification record are in
 [`docs/cuda_path_audit.md`](docs/cuda_path_audit.md).
 
-LSSO 0.2.0 freezes CUDA backend ABI 1. Precompiled Linux x86-64 runtime wheels
-for PyTorch 2.11 + CUDA 12.8 and CUDA 13.0 are published with the GitHub
-release; install the wheel matching `torch.version.cuda` to skip local NVCC and
-MathDx compilation. Other configurations build from source or use the portable
-PyTorch fallback.
+The current main branch uses CUDA backend ABI 2. It adds the compact forward
+state required by the fused backward and the unbounded log-alpha/reciprocal
+Woodbury contract. ABI 1 wheels from LSSO 0.2.0 are deliberately rejected.
+Install the v0.3.0 runtime matching `torch.version.cuda` to skip local NVCC and
+MathDx compilation:
 
 ```bash
-# Check first: python -c "import torch; print(torch.__version__, torch.version.cuda)"
 # PyTorch 2.11 + CUDA 12.8 (recommended)
-pip install 'https://github.com/Yang916-yy/LSSO/releases/download/v0.2.0/lsso_mathdx_runtime-0.2.0%2Btorch2110cu128-py3-none-linux_x86_64.whl'
+pip install 'https://github.com/Yang916-yy/LSSO/releases/download/v0.3.0/lsso_mathdx_runtime-0.3.0%2Btorch2110cu128-py3-none-linux_x86_64.whl'
 
-# PyTorch 2.11 + CUDA 13.0 / MathDx 26.06
-pip install 'https://github.com/Yang916-yy/LSSO/releases/download/v0.2.0/lsso_mathdx_runtime-0.2.0%2Btorch2110cu130-py3-none-linux_x86_64.whl'
+# PyTorch 2.11 + CUDA 13.0
+pip install 'https://github.com/Yang916-yy/LSSO/releases/download/v0.3.0/lsso_mathdx_runtime-0.3.0%2Btorch2110cu130-py3-none-linux_x86_64.whl'
+
+# Other PyTorch/CUDA combinations can build from source.
+bash tools/build_mathdx_backend.sh
 ```
 Experiment checkpoints are disposable local artifacts; the retention and
 directory rules are in
@@ -152,6 +154,11 @@ y = mixer(x)
 
 assert y.shape == x.shape
 ```
+
+The supported constructors intentionally do not expose an alpha initialization
+knob. Learnable `theta_alpha` starts from the dimensionless reference
+`alpha=1` and is restored exactly from checkpoints, preventing accidental
+extreme initialization without restricting the learned solve strength.
 
 Drop it into the token-mixing slot of a pre-norm encoder block:
 

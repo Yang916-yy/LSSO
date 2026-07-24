@@ -4,11 +4,10 @@ import torch
 import torch.nn as nn
 
 from .modules import (
-    DEFAULT_ALPHA_INIT,
     DEFAULT_GAIN_INIT,
     LSSODiagnostics,
     _initialize_solve_parameters,
-    _fold_fixed_gain_into_output,
+    _solve_log_parameters,
     _solve_parameters,
     lsso_gain_alpha,
 )
@@ -36,11 +35,8 @@ class _GroupedLSSOBase(nn.Module):
         dropout: float = 0.0,
         eps: float = 1e-5,
         gain_init: float = DEFAULT_GAIN_INIT,
-        alpha_init: float = DEFAULT_ALPHA_INIT,
-        solve_parameterization: str = "gain_alpha",
         no_global: bool = False,
         normalize_u: bool = True,
-        basis_normalization: str = "trace",
         length_normalize: bool = True,
         length_reference: float = 1.0,
         rotary_base: float = 10000.0,
@@ -74,12 +70,6 @@ class _GroupedLSSOBase(nn.Module):
         self.eps = eps
         self.no_global = no_global
         self.normalize_u = normalize_u
-        if basis_normalization not in {"trace", "token_rms"}:
-            raise ValueError(
-                "basis_normalization must be 'trace' or 'token_rms', "
-                f"got {basis_normalization!r}"
-            )
-        self.basis_normalization = basis_normalization
         self.length_normalize = length_normalize
         if length_reference <= 0:
             raise ValueError(f"length_reference must be positive, got {length_reference}")
@@ -99,14 +89,7 @@ class _GroupedLSSOBase(nn.Module):
         _initialize_solve_parameters(
             self,
             num_relation_groups,
-            solve_parameterization=solve_parameterization,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-        )
-        _fold_fixed_gain_into_output(
-            self,
-            groups=num_relation_groups,
-            group_width=self.group_dim,
         )
 
         self.dropout_p = dropout
@@ -118,14 +101,6 @@ class _GroupedLSSOBase(nn.Module):
         """Return the positive output gain and relative solve strength."""
 
         return _solve_parameters(self)
-
-    def fold_fixed_gain_into_output(self, *, force: bool = False) -> None:
-        _fold_fixed_gain_into_output(
-            self,
-            groups=self.num_relation_groups,
-            group_width=self.group_dim,
-            force=force,
-        )
 
     @property
     def solve_reduction(self) -> float:
@@ -181,10 +156,7 @@ class _GroupedLSSOBase(nn.Module):
         U = U.view(B, N, G, r).transpose(1, 2).contiguous()
         C = C.view(B, N, G, gd).transpose(1, 2).contiguous()
 
-        token_rms = self.normalize_u and self.basis_normalization == "token_rms"
-        trace_basis = self.normalize_u and self.basis_normalization == "trace"
-        if token_rms:
-            U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + self.eps)
+        trace_basis = self.normalize_u
         U = self._prepare_relation_basis(U, position_ids)
 
         solve_eye = self._eye
@@ -195,16 +167,16 @@ class _GroupedLSSOBase(nn.Module):
             U = self._prune_relation_basis(U, keep)
             solve_eye = None
 
-        gain, alpha = _solve_parameters(self)
+        gain, theta_alpha = _solve_log_parameters(self)
 
         gain = gain.view(1, G, 1, 1)
-        alpha = alpha.view(1, G, 1, 1)
+        theta_alpha = theta_alpha.view(1, G, 1, 1)
         if self.record_diagnostics:
             Y, aux = lsso_gain_alpha(
                 U,
                 C,
                 gain,
-                alpha,
+                torch.exp(theta_alpha),
                 eye=solve_eye,
                 no_global=self._global_disabled,
                 return_aux=True,
@@ -219,7 +191,7 @@ class _GroupedLSSOBase(nn.Module):
                 U,
                 C,
                 gain,
-                alpha,
+                theta_alpha,
                 eye=solve_eye,
                 no_global=self._global_disabled,
                 length_normalize=self.length_normalize,
@@ -227,6 +199,7 @@ class _GroupedLSSOBase(nn.Module):
                 trace_normalize=trace_basis,
                 normalization_eps=self.eps,
                 valid_mask=valid_mask,
+                _log_alpha=True,
             )
             aux = None
 

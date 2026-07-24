@@ -15,7 +15,7 @@ import sys
 import zipfile
 
 
-BACKEND_ABI = 1
+BACKEND_ABI = 2
 DIST_NAME = "lsso_mathdx_runtime"
 PACKAGE_NAME = "lsso_mathdx_runtime"
 PLATFORM_TAG = "linux_x86_64"
@@ -34,7 +34,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--version", default="0.2.0")
+    parser.add_argument("--version", default="0.3.0")
     parser.add_argument("--torch-version", required=True)
     parser.add_argument("--cuda-version", choices=("12.8", "13.0"), required=True)
     parser.add_argument("--mathdx-version", required=True)

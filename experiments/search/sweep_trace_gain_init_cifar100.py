@@ -63,7 +63,6 @@ def main() -> None:
         type=float,
         default=[0.75, 1.0, 1.25, 1.4426742274994273, 1.75, 2.0, 2.5],
     )
-    parser.add_argument("--alpha", type=float, default=1.1)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -85,8 +84,6 @@ def main() -> None:
         raise ValueError("every gain must be positive")
     if len(set(args.gains)) != len(args.gains):
         raise ValueError("gain initializations must be unique")
-    if args.alpha <= 0:
-        raise ValueError("alpha must be positive")
 
     output_root = ROOT / args.output_root
     output_root.mkdir(parents=True, exist_ok=True)
@@ -117,9 +114,6 @@ def main() -> None:
                 "--patch-size", "4",
                 "--rank", "32",
                 "--gain-init", str(gain),
-                "--alpha-init", str(args.alpha),
-                "--solve-parameterization", "gain_alpha",
-                "--basis-normalization", "trace",
                 "--length-normalize",
                 "--length-reference", "1.0",
                 "--seed", str(args.seed),
@@ -139,7 +133,6 @@ def main() -> None:
         row: dict[str, float | str] = {
             "run": run_name,
             "gain_init": gain,
-            "alpha_init": args.alpha,
             **result,
         }
         results.append(row)

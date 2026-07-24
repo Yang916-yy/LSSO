@@ -9,7 +9,10 @@ from experiments.deit3_official_recipe import (
     validation_transform,
     virtual_group_repeated_samples,
 )
-from experiments.rrlsso_diagnostics import rrlsso_parameter_diagnostics
+from experiments.rrlsso_diagnostics import (
+    rrlsso_parameter_diagnostics,
+    scalar_diagnostics_to_floats,
+)
 from lsso import RRLSSO
 
 
@@ -68,8 +71,19 @@ def test_rrlsso_diagnostics_report_unbounded_strength_and_knee() -> None:
     with torch.no_grad():
         module.theta_alpha.copy_(torch.log(torch.tensor([0.5, 1.0, 2.0, 4.0])))
     diagnostics = rrlsso_parameter_diagnostics(module)
+    assert "alpha_std" not in diagnostics
     assert diagnostics["alpha_observed_min"].item() == pytest.approx(0.5)
     assert diagnostics["alpha_observed_max"].item() == pytest.approx(4.0)
     assert diagnostics["beta_mean"].item() == pytest.approx(
         torch.tensor([2.0, 1.0, 0.5, 0.25]).mean().item()
     )
+
+
+def test_scalar_diagnostics_are_batched_without_changing_values() -> None:
+    diagnostics = {
+        "first": torch.tensor(1.25),
+        "second": torch.tensor(-0.5),
+        "third": torch.tensor(4.0),
+    }
+    values = scalar_diagnostics_to_floats(diagnostics)
+    assert values == {"first": 1.25, "second": -0.5, "third": 4.0}

@@ -33,7 +33,6 @@ class EncoderBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         gain_init: float = 1.0,
-        alpha_init: float = 1.2,
         normalize_u: bool = True,
     ) -> None:
         super().__init__()
@@ -77,7 +76,6 @@ class EncoderBlock(nn.Module):
                 rank=rank,
                 dropout=dropout,
                 gain_init=gain_init,
-                alpha_init=alpha_init,
                 no_global=mixer == "lsso-no-global",
                 normalize_u=normalize_u,
             )

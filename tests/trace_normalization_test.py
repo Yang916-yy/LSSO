@@ -147,7 +147,7 @@ def test_masked_trace_split_n_dispatch_matches_reference_and_blocks_nan(
         actual.float(), expected.float(), rtol=5e-2, atol=5e-2
     )
     assert backend.get_mathdx_path_counters()[
-        "forward.trace_masked_split_n"
+        "forward.trace_adaptive_mixed"
     ] == 1
 
 
@@ -327,11 +327,11 @@ def test_cuda_trace_training_dispatches_the_radial_backward_epilogue(
     backend.reset_mathdx_path_counters()
     torch.manual_seed(2399)
     u = torch.randn(
-        2, 2, 17, 32, device="cuda", dtype=torch.bfloat16,
+        2, 2, 33, 32, device="cuda", dtype=torch.bfloat16,
         requires_grad=True,
     )
     c = torch.randn(
-        2, 2, 17, 64, device="cuda", dtype=torch.bfloat16,
+        2, 2, 33, 64, device="cuda", dtype=torch.bfloat16,
         requires_grad=True,
     )
     gain = torch.ones(1, 2, 1, 1, device="cuda", requires_grad=True)
@@ -347,6 +347,135 @@ def test_cuda_trace_training_dispatches_the_radial_backward_epilogue(
     assert counters["forward.trace_unmasked_cta"] == 1
     assert counters["backward.adjoint_native"] == 1
     assert counters["backward.dual_grad_u_radial"] == 1
+
+
+@pytest.mark.parametrize("tokens,rank", [(3, 5), (5, 5), (7, 5)])
+def test_adaptive_smaller_side_matches_direct_token_resolvent(
+    tokens: int, rank: int
+) -> None:
+    torch.manual_seed(741 + tokens)
+    dtype = torch.float64
+    u = torch.randn(2, 2, tokens, rank, dtype=dtype)
+    c = torch.randn(2, 2, tokens, 4, dtype=dtype)
+    gain = torch.tensor([1.2, 0.8], dtype=dtype).view(1, 2, 1, 1)
+    alpha = torch.tensor([0.3, 8.0], dtype=dtype).view(1, 2, 1, 1)
+
+    actual = lsso_gain_alpha(
+        u, c, gain, alpha, trace_normalize=True, length_normalize=False
+    )
+    energy = u.square().sum(dim=(-2, -1), keepdim=True)
+    scale2 = float(tokens * rank) / (
+        energy + 1e-5 * float(tokens * rank)
+    )
+    effective = alpha * scale2
+    kernel = torch.matmul(u, u.transpose(-1, -2))
+    eye = torch.eye(tokens, dtype=dtype).view(1, 1, tokens, tokens)
+    expected = gain * torch.linalg.solve(
+        eye + effective * kernel, c
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-11, atol=2e-11)
+
+
+def test_primal_log_alpha_gradcheck_and_gradgradcheck() -> None:
+    torch.manual_seed(778)
+    u = torch.randn(1, 1, 3, 5, dtype=torch.float64, requires_grad=True)
+    c = torch.randn(1, 1, 3, 2, dtype=torch.float64, requires_grad=True)
+    gain = torch.tensor([[[[1.1]]]], dtype=torch.float64, requires_grad=True)
+    theta = torch.tensor([[[[0.7]]]], dtype=torch.float64, requires_grad=True)
+
+    def function(*inputs):
+        return lsso_gain_alpha(
+            *inputs,
+            trace_normalize=True,
+            length_normalize=False,
+            _log_alpha=True,
+        )
+
+    assert torch.autograd.gradcheck(
+        function, (u, c, gain, theta), atol=2e-6, rtol=2e-5
+    )
+    assert torch.autograd.gradgradcheck(
+        function, (u, c, gain, theta), atol=3e-6, rtol=3e-5
+    )
+
+
+def test_mixed_masked_adaptive_path_has_no_padding_leakage() -> None:
+    torch.manual_seed(801)
+    B, H, N, rank, width = 2, 2, 7, 5, 3
+    lengths = torch.tensor([2, 7])
+    mask = torch.arange(N)[None] < lengths[:, None]
+    active = mask[:, None, :, None]
+    u_leaf = torch.randn(B, H, N, rank, dtype=torch.float64, requires_grad=True)
+    c_leaf = torch.randn(B, H, N, width, dtype=torch.float64, requires_grad=True)
+    u = torch.where(active, u_leaf, torch.full_like(u_leaf, float("nan")))
+    c = torch.where(active, c_leaf, torch.full_like(c_leaf, float("nan")))
+    theta = torch.zeros(1, H, 1, 1, dtype=torch.float64, requires_grad=True)
+    gain = torch.ones(1, H, 1, 1, dtype=torch.float64, requires_grad=True)
+
+    output = lsso_gain_alpha(
+        u,
+        c,
+        gain,
+        theta,
+        trace_normalize=True,
+        length_normalize=False,
+        valid_mask=mask,
+        _log_alpha=True,
+    )
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output.masked_select((~active).expand_as(output))) == 0
+    output.square().sum().backward()
+    assert torch.isfinite(u_leaf.grad).all()
+    assert torch.isfinite(c_leaf.grad).all()
+    assert torch.count_nonzero(
+        u_leaf.grad.masked_select((~active).expand_as(u_leaf.grad))
+    ) == 0
+    assert torch.count_nonzero(
+        c_leaf.grad.masked_select((~active).expand_as(c_leaf.grad))
+    ) == 0
+
+
+def test_primal_mask_decision_cache_tracks_inplace_mask_changes() -> None:
+    import lsso.modules as modules
+
+    u = torch.empty(2, 1, 9, 5)
+    mask = torch.ones(2, 9, dtype=torch.bool)
+    assert not modules._requires_primal_trace(u, mask)
+    assert not modules._requires_primal_trace(u, mask)
+    mask[1, 3:] = False
+    assert modules._requires_primal_trace(u, mask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("theta_value", [20.0, 40.0, 60.0, 80.0])
+def test_native_log_alpha_keeps_extreme_theta_gradient_finite_and_nonzero(
+    theta_value: float,
+) -> None:
+    torch.manual_seed(889)
+    u = torch.randn(
+        1, 1, 33, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    c = torch.randn(
+        1, 1, 33, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    gain = torch.ones(1, 1, 1, 1, device="cuda", requires_grad=True)
+    theta = torch.full(
+        (1, 1, 1, 1), theta_value, device="cuda", requires_grad=True
+    )
+    output = lsso_gain_alpha(
+        u,
+        c,
+        gain,
+        theta,
+        trace_normalize=True,
+        length_normalize=False,
+        _log_alpha=True,
+    )
+    output.float().square().sum().backward()
+    assert torch.isfinite(output).all()
+    assert theta.grad is not None
+    assert torch.isfinite(theta.grad).all()
+    assert torch.count_nonzero(theta.grad) == theta.numel()
 
 
 def _inputs(dtype=torch.float64, device="cpu"):

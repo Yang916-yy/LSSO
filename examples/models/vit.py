@@ -23,7 +23,6 @@ class VisionEncoder(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         gain_init: float = 1.0,
-        alpha_init: float = 1.2,
         normalize_u: bool = True,
     ) -> None:
         super().__init__()
@@ -53,7 +52,6 @@ class VisionEncoder(nn.Module):
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
                     gain_init=gain_init,
-                    alpha_init=alpha_init,
                     normalize_u=normalize_u,
                 )
                 for _ in range(depth)

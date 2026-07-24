@@ -13,8 +13,9 @@ over valid tokens. This fixes the total Gram energy while preserving relative
 token radii. The implementation neither materializes a normalized basis nor
 performs a separate energy pass: it obtains `||Z||_F^2` from
 `trace(Z.T @ Z)` after the required Woodbury Gram statistic has been formed.
-The old row-wise RMS basis remains available as the PyTorch-only
-`basis_normalization="token_rms"` ablation; its CUDA path is retired.
+The old row-wise RMS basis is preserved only in
+`archive/retired_parameterization_ablations/token_rms_reference.py`; it is no
+longer exposed by supported constructors.
 
 With `eps=0`, global rescaling of `Z` leaves the layer invariant and the exact
 backward is orthogonal to the single global radial direction. The custom
@@ -47,7 +48,8 @@ projection limit as `beta` tends to zero.
 
 New image resolutions, ranks, or downstream tasks should first use this
 dimensionless default and then inspect the learned per-head alpha distribution.
-The maintained initialization search
-is `experiments/search/sweep_trace_alpha_init_cifar100.py`; the superseded
+The retired initialization search is preserved as
+`archive/retired_parameterization_ablations/sweep_trace_alpha_init_cifar100.py`;
+the superseded
 RMS/length-normalization diagnostic is preserved under
 `archive/retired_auxiliary_benchmarks/experiments/`.

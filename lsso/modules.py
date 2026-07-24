@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 
 import torch
 import torch.nn as nn
@@ -20,63 +21,54 @@ from .types import LSSOAux, LSSODiagnostics, SolveStateCache
 
 
 DEFAULT_GAIN_INIT = 1.0
-DEFAULT_ALPHA_INIT = 1.0
+_FROZEN_ALPHA_INIT = 1.0
+_MASK_REQUIRES_PRIMAL_CACHE: dict[
+    int, tuple[weakref.ReferenceType[torch.Tensor], int, int, bool]
+] = {}
 
 
 def _initialize_solve_parameters(
     module: nn.Module,
     count: int,
     *,
-    solve_parameterization: str,
     gain_init: float,
-    alpha_init: float,
 ) -> None:
-    """Create the canonical gain and unbounded positive solve strength."""
+    """Create the frozen public gain/log-strength parameterization."""
 
-    if solve_parameterization not in {"gain_alpha", "fixed_gain_alpha"}:
-        raise ValueError(
-            "solve_parameterization must be 'gain_alpha' or 'fixed_gain_alpha', "
-            f"got {solve_parameterization!r}"
-        )
     if gain_init <= 0:
         raise ValueError(f"gain_init must be positive, got {gain_init}")
-    if alpha_init <= 0:
-        raise ValueError(f"alpha_init must be positive, got {alpha_init}")
-
-    module.solve_parameterization = solve_parameterization
     module._global_disabled = bool(module.no_global)
-    theta_alpha0 = torch.log(torch.tensor(alpha_init, dtype=torch.float64))
-    if solve_parameterization == "gain_alpha":
-        module.theta_gain = nn.Parameter(
-            torch.full(
-                (count,),
-                float(torch.log(torch.tensor(gain_init, dtype=torch.float64))),
-                dtype=torch.float32,
-            )
+    module.theta_gain = nn.Parameter(
+        torch.full(
+            (count,),
+            float(torch.log(torch.tensor(gain_init, dtype=torch.float64))),
+            dtype=torch.float32,
         )
-    else:
-        module.register_buffer(
-            "_matched_initial_gain",
-            torch.full((count,), float(gain_init), dtype=torch.float32),
-            persistent=False,
-        )
-        module._fixed_gain_folded = False
+    )
     module.theta_alpha = nn.Parameter(
-        torch.full((count,), float(theta_alpha0), dtype=torch.float32)
+        torch.full(
+            (count,),
+            float(torch.log(torch.tensor(_FROZEN_ALPHA_INIT, dtype=torch.float64))),
+            dtype=torch.float32,
+        )
     )
 
 
 def _solve_parameters(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
     """Return gain and an unbounded positive log-parameterized strength."""
 
-    if module.solve_parameterization == "gain_alpha":
-        gain = torch.exp(module.theta_gain)
-    else:
-        gain = torch.ones_like(module.theta_alpha)
+    gain = torch.exp(module.theta_gain)
     alpha = torch.exp(module.theta_alpha)
     if module.no_global:
         alpha = torch.zeros_like(alpha)
     return gain, alpha
+
+
+def _solve_log_parameters(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return gain and the canonical log-strength without materializing alpha."""
+
+    gain = torch.exp(module.theta_gain)
+    return gain, module.theta_alpha
 
 
 def _solve_coefficients(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -85,30 +77,6 @@ def _solve_coefficients(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
     gain, alpha = _solve_parameters(module)
     mu = gain.reciprocal()
     return mu, alpha * mu
-
-
-def _fold_fixed_gain_into_output(
-    module: nn.Module,
-    *,
-    groups: int,
-    group_width: int,
-    force: bool = False,
-) -> None:
-    """Absorb the matched initial head gain into ``W_O`` exactly once."""
-
-    if module.solve_parameterization != "fixed_gain_alpha":
-        return
-    if module._fixed_gain_folded and not force:
-        return
-    with torch.no_grad():
-        scale = module._matched_initial_gain.to(
-            device=module.w_o.weight.device,
-            dtype=module.w_o.weight.dtype,
-        ).repeat_interleave(group_width)
-        if scale.numel() != groups * group_width:
-            raise RuntimeError("fixed-gain output-fold shape mismatch")
-        module.w_o.weight.mul_(scale.unsqueeze(0))
-    module._fixed_gain_folded = True
 
 
 def _solve_dtype(*tensors: torch.Tensor) -> torch.dtype:
@@ -1160,6 +1128,7 @@ def _trace_statistics_forward(
     length_normalize: bool,
     length_reference: float,
     padding_ratio_hint: float | None = None,
+    theta_alpha: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -1174,17 +1143,21 @@ def _trace_statistics_forward(
 
     B, H, N, rank = U.shape
     width = C.shape[-1]
+    log_alpha = (
+        theta_alpha if theta_alpha is not None else torch.log(alpha)
+    )
     split_trace = False
     split_chunk_size = _SPLIT_STATS_CHUNK_SIZE
     if valid_mask is None:
         native = try_trace_stats_solve_readout(
             U,
             C,
-            alpha.expand(B, H, 1, 1).reshape(B * H).float().contiguous(),
+            log_alpha.expand(B, H, 1, 1).reshape(B * H).float().contiguous(),
             gain.expand(B, H, 1, 1).reshape(B * H).float().contiguous(),
             normalization_eps=eps,
             length_reference=length_reference,
             length_normalize=length_normalize,
+            input_is_log=True,
         )
         if native is not None:
             return native
@@ -1203,12 +1176,13 @@ def _trace_statistics_forward(
                 U,
                 C,
                 valid_mask,
-                alpha.expand(B, H, 1, 1).reshape(B * H).float().contiguous(),
+                log_alpha.expand(B, H, 1, 1).reshape(B * H).float().contiguous(),
                 gain.expand(B, H, 1, 1).reshape(B * H).float().contiguous(),
                 normalization_eps=eps,
                 length_reference=length_reference,
                 length_normalize=length_normalize,
                 padding_ratio_hint=padding_ratio_hint,
+                input_is_log=True,
             )
         if native is not None:
             return native
@@ -1280,12 +1254,198 @@ def _trace_statistics_forward(
     )
 
 
+def _adaptive_trace_reference(
+    U: torch.Tensor,
+    C: torch.Tensor,
+    gain: torch.Tensor,
+    alpha: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    *,
+    eps: float,
+    length_normalize: bool,
+    length_reference: float,
+    input_is_log: bool = False,
+) -> torch.Tensor:
+    """Exact smaller-side solve used when at least one system has ``Nvalid < r``.
+
+    Each sample uses only its valid rows.  The token-side branch therefore
+    forms ``U U.T`` without first forming ``U.T U`` or ``U.T C``; the rank-side
+    branch retains Woodbury.  The two branches implement the same SPD
+    resolvent and are fully differentiable, including second derivatives.
+    This portable path is also the numerical oracle for native kernels.
+    """
+
+    B, H, N, rank = U.shape
+    width = C.shape[-1]
+    solve_dtype = _solve_dtype(U, C)
+    gain_bh = gain.expand(B, H, 1, 1).to(solve_dtype)
+    log_alpha_bh = (
+        alpha if input_is_log else torch.log(alpha)
+    ).expand(B, H, 1, 1).to(solve_dtype)
+
+    if valid_mask is None and N < rank:
+        # Common fixed-length short-sequence case: one batched primal solve,
+        # with no gather/scatter and no rank-space projection/readout.
+        u_bh = U.flatten(0, 1).to(solve_dtype)
+        c_bh = C.flatten(0, 1).to(solve_dtype)
+        kernel = torch.bmm(u_bh, u_bh.transpose(1, 2))
+        energy = kernel.diagonal(dim1=-2, dim2=-1).sum(-1).view(B, H, 1, 1)
+        element_count = float(N * rank)
+        target = (
+            float(rank) * float(length_reference)
+            if length_normalize else element_count
+        )
+        denominator = energy + float(eps) * element_count
+        log_effective = log_alpha_bh + torch.log(
+            target / denominator.clamp_min(torch.finfo(solve_dtype).tiny)
+        )
+        reciprocal = log_effective >= 0.0
+        delta = torch.where(reciprocal, torch.exp(-log_effective), 1.0)
+        eta = torch.where(reciprocal, 1.0, torch.exp(log_effective))
+        eye = torch.eye(N, device=U.device, dtype=solve_dtype).expand(
+            B * H, N, N
+        )
+        system = (
+            delta.reshape(B * H, 1, 1) * eye
+            + eta.reshape(B * H, 1, 1) * kernel
+        )
+        solved = _solve_no_check(
+            system, delta.reshape(B * H, 1, 1) * c_bh
+        )
+        record_mathdx_path("forward.trace_primal_batched")
+        return (
+            solved.view(B, H, N, width)
+            * gain_bh
+        ).to(C.dtype)
+
+    sample_outputs: list[torch.Tensor] = []
+    used_primal = False
+    used_dual = False
+
+    for batch in range(B):
+        if valid_mask is None:
+            indices = torch.arange(N, device=U.device)
+        else:
+            indices = torch.nonzero(valid_mask[batch], as_tuple=False).flatten()
+        active_tokens = int(indices.numel())
+        if active_tokens == 0:
+            # Retain a zero-valued graph edge so all-padding batches produce
+            # explicit zero gradients instead of ``None``.
+            zero_dependency = (
+                U[batch].sum() + gain_bh[batch].sum()
+                + log_alpha_bh[batch].sum()
+            ) * 0.0
+            sample_outputs.append(C[batch] * 0.0 + zero_dependency)
+            continue
+
+        u_active = U[batch].index_select(1, indices).to(solve_dtype)
+        c_active = C[batch].index_select(1, indices).to(solve_dtype)
+        element_count = float(active_tokens * rank)
+        target = (
+            float(rank) * float(length_reference)
+            if length_normalize else element_count
+        )
+        eye_size = active_tokens if active_tokens < rank else rank
+        eye = torch.eye(
+            eye_size, device=U.device, dtype=solve_dtype
+        ).expand(H, eye_size, eye_size)
+
+        if active_tokens < rank:
+            # Primal/token-space system.  Derive trace from K's diagonal so
+            # normalization adds no standalone U-energy read.
+            kernel = torch.bmm(u_active, u_active.transpose(1, 2))
+            energy = kernel.diagonal(dim1=-2, dim2=-1).sum(-1).view(H, 1, 1)
+            denominator = energy + float(eps) * element_count
+            scale_squared = target / denominator.clamp_min(
+                torch.finfo(solve_dtype).tiny
+            )
+            log_effective = (
+                log_alpha_bh[batch] + torch.log(scale_squared)
+            )
+            reciprocal = log_effective >= 0.0
+            delta = torch.where(reciprocal, torch.exp(-log_effective), 1.0)
+            eta = torch.where(reciprocal, 1.0, torch.exp(log_effective))
+            system = delta * eye + eta * kernel
+            solved = _solve_no_check(system, delta * c_active)
+            used_primal = True
+        else:
+            gram = torch.bmm(u_active.transpose(1, 2), u_active)
+            energy = gram.diagonal(dim1=-2, dim2=-1).sum(-1).view(H, 1, 1)
+            denominator = energy + float(eps) * element_count
+            scale_squared = target / denominator.clamp_min(
+                torch.finfo(solve_dtype).tiny
+            )
+            log_effective = (
+                log_alpha_bh[batch] + torch.log(scale_squared)
+            )
+            reciprocal = log_effective >= 0.0
+            delta = torch.where(reciprocal, torch.exp(-log_effective), 1.0)
+            eta = torch.where(reciprocal, 1.0, torch.exp(log_effective))
+            cross = torch.bmm(u_active.transpose(1, 2), c_active)
+            system = delta * eye + eta * gram
+            balanced_cross = eta * cross
+            compact = _solve_no_check(system, balanced_cross)
+            solved = torch.baddbmm(c_active, u_active, compact, alpha=-1.0)
+            used_dual = True
+
+        solved = solved * gain_bh[batch]
+        full = C[batch].new_zeros((H, N, width))
+        sample_outputs.append(
+            full.index_copy(1, indices, solved.to(C.dtype))
+        )
+
+    record_mathdx_path(
+        "forward.trace_adaptive_mixed" if used_primal and used_dual
+        else "forward.trace_primal_torch"
+    )
+    return torch.stack(sample_outputs, dim=0)
+
+
+def _requires_primal_trace(
+    U: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+) -> bool:
+    """Return whether any logical system is wider than its valid token side."""
+
+    rank = U.shape[-1]
+    if U.shape[-2] < rank:
+        return True
+    if valid_mask is None:
+        return False
+    # A shared padding mask is normally reused by every mixer layer. Cache the
+    # one required device reduction by object identity and tensor version so a
+    # deep masked model does not introduce one CPU synchronization per layer.
+    key = id(valid_mask)
+    version = valid_mask._version
+    cached = _MASK_REQUIRES_PRIMAL_CACHE.get(key)
+    if (
+        cached is not None
+        and cached[0]() is valid_mask
+        and cached[1] == version
+        and cached[2] == rank
+    ):
+        return cached[3]
+    result = bool((valid_mask.sum(dim=-1) < rank).any().item())
+    _MASK_REQUIRES_PRIMAL_CACHE[key] = (
+        weakref.ref(valid_mask), version, rank, result
+    )
+    if len(_MASK_REQUIRES_PRIMAL_CACHE) > 64:
+        dead = [
+            cache_key for cache_key, entry in _MASK_REQUIRES_PRIMAL_CACHE.items()
+            if entry[0]() is None
+        ]
+        for cache_key in dead:
+            _MASK_REQUIRES_PRIMAL_CACHE.pop(cache_key, None)
+    return result
+
+
 def _trace_gain_alpha_backward(
     U: torch.Tensor,
     Y: torch.Tensor,
     grad_output: torch.Tensor,
     gain: torch.Tensor,
     alpha: torch.Tensor,
+    theta_alpha: torch.Tensor,
     effective_alpha: torch.Tensor,
     scale_squared: torch.Tensor,
     denominator: torch.Tensor,
@@ -1338,15 +1498,23 @@ def _trace_gain_alpha_backward(
         # q=(G+beta I)^-1 U^T C and r=(G+beta I)^-1 U^T dY
         # expose a cancellation-free derivative:
         #   dU_direct = -(P q^T + Y r^T)
-        #   d alpha_eff = -g beta^2 <r,q>.
+        #   d log(alpha_eff) = -g beta <r,q>.
         # Unlike the historical alpha*(Y^T U/P^T U) form, neither expression
         # subtracts nearly equal high-alpha quantities.
-        beta = effective_alpha_flat.to(calc_dtype).reciprocal()
+        log_effective_alpha = (
+            theta_alpha.expand(B, H, 1, 1).reshape(B * H).to(calc_dtype)
+            + torch.log(
+                scale_squared.reshape(B * H).to(calc_dtype).clamp_min(
+                    torch.finfo(calc_dtype).tiny
+                )
+            )
+        )
+        beta = torch.exp(-log_effective_alpha)
         compact_inner = (
             compact_q.to(calc_dtype) * compact_r.to(calc_dtype)
         ).sum(dim=(1, 2))
-        grad_effective_alpha = (
-            -gain_flat.to(calc_dtype) * beta.square() * compact_inner
+        grad_log_effective_alpha = (
+            -gain_flat.to(calc_dtype) * beta * compact_inner
         )
         if mask is None:
             gain_inner = (grad_output.to(calc_dtype) * Y.to(calc_dtype)).sum(
@@ -1364,8 +1532,7 @@ def _trace_gain_alpha_backward(
         )
         radial_coefficient = (
             -2.0
-            * effective_alpha_flat.to(calc_dtype)
-            * grad_effective_alpha.to(calc_dtype)
+            * grad_log_effective_alpha.to(calc_dtype)
             / denominator.reshape(B * H).to(calc_dtype)
         )
         direct_grad = try_dual_grad_u_tensorcore(
@@ -1391,12 +1558,12 @@ def _trace_gain_alpha_backward(
                 Y_m, compact_r.transpose(1, 2).contiguous()
             )
             direct_grad.neg_()
-    # d alpha_eff / dU = -2 * alpha_eff * U / denominator. The
-    # compact inner product is represented using the gain-scaled states.
+    # d log(alpha_eff) / dU = -2 U / denominator.  Returning the
+    # log-strength derivative directly avoids an underflow-prone
+    # dL/dalpha * exp(theta_alpha) chain at very large strengths.
     radial_coefficient = (
         -2.0
-        * effective_alpha.reshape(B * H).to(calc_dtype)
-        * grad_effective_alpha.to(calc_dtype)
+        * grad_log_effective_alpha.to(calc_dtype)
         / denominator.reshape(B * H).to(calc_dtype)
     )
     if radial_fused:
@@ -1421,15 +1588,12 @@ def _trace_gain_alpha_backward(
             )
 
     grad_gain_bh = grad_gain_flat.view(B, H, 1, 1).to(calc_dtype)
-    grad_alpha_bh = (
-        grad_effective_alpha.view(B, H, 1, 1).to(calc_dtype)
-        * scale_squared.to(calc_dtype)
-    )
+    grad_theta_bh = grad_log_effective_alpha.view(B, H, 1, 1).to(calc_dtype)
     return (
         grad_U.to(U.dtype),
         P.to(grad_output.dtype),
         grad_gain_bh,
-        grad_alpha_bh,
+        grad_theta_bh,
     )
 
 
@@ -1440,7 +1604,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
         U,
         C,
         gain,
-        alpha,
+        theta_alpha,
         eye,
         valid_mask,
         eps,
@@ -1448,6 +1612,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
         length_reference,
         padding_ratio_hint,
     ):
+        alpha = torch.exp(theta_alpha)
         (
             Y,
             effective_alpha,
@@ -1465,6 +1630,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
             length_normalize=bool(length_normalize),
             length_reference=float(length_reference),
             padding_ratio_hint=padding_ratio_hint,
+            theta_alpha=theta_alpha,
         )
         mask_tensor = (
             valid_mask
@@ -1490,7 +1656,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
             saved_c,
             Y,
             gain,
-            alpha,
+            theta_alpha,
             effective_alpha,
             scale_squared,
             denominator,
@@ -1514,7 +1680,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
             C,
             Y,
             gain,
-            alpha,
+            theta_alpha,
             effective_alpha,
             scale_squared,
             denominator,
@@ -1540,7 +1706,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
                     U,
                     C,
                     gain,
-                    alpha,
+                    torch.exp(theta_alpha),
                     eye,
                     valid_mask,
                     eps=ctx.eps,
@@ -1548,7 +1714,7 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
                     length_reference=ctx.length_reference,
                     padding_ratio_hint=ctx.padding_ratio_hint,
                 )
-                inputs = (U, C, gain, alpha)
+                inputs = (U, C, gain, theta_alpha)
                 required = [value for value in inputs if value.requires_grad]
                 computed = torch.autograd.grad(
                     reference,
@@ -1569,12 +1735,14 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
                 None, None, None, None, None, None,
             )
         B, H = U.shape[:2]
-        grad_U, grad_C, grad_gain_bh, grad_alpha_bh = _trace_gain_alpha_backward(
+        alpha = torch.exp(theta_alpha)
+        grad_U, grad_C, grad_gain_bh, grad_theta_bh = _trace_gain_alpha_backward(
             U,
             Y,
             grad_output,
             gain,
             alpha,
+            theta_alpha,
             effective_alpha,
             scale_squared,
             denominator,
@@ -1587,16 +1755,16 @@ class _TraceNormalizedLSSOAutograd(torch.autograd.Function):
             if gain.shape[0] == 1
             else grad_gain_bh
         )
-        grad_alpha = (
-            grad_alpha_bh.sum(dim=0, keepdim=True)
-            if alpha.shape[0] == 1
-            else grad_alpha_bh
+        grad_theta = (
+            grad_theta_bh.sum(dim=0, keepdim=True)
+            if theta_alpha.shape[0] == 1
+            else grad_theta_bh
         )
         return (
             grad_U,
             grad_C,
             grad_gain.to(gain.dtype),
-            grad_alpha.to(alpha.dtype),
+            grad_theta.to(theta_alpha.dtype),
             None,
             None,
             None,
@@ -1806,6 +1974,7 @@ def lsso_gain_alpha(
     normalization_eps: float = 1e-5,
     valid_mask: torch.Tensor | None = None,
     padding_ratio_hint: float | None = None,
+    _log_alpha: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, LSSOAux]:
     """Canonical structured solve parameterized by output gain and strength.
 
@@ -1819,6 +1988,8 @@ def lsso_gain_alpha(
         gain = gain.view(1, H, 1, 1)
     if alpha.dim() == 1:
         alpha = alpha.view(1, H, 1, 1)
+    theta_alpha = alpha if _log_alpha else torch.log(alpha)
+    positive_alpha = None if _log_alpha else alpha
     if valid_mask is not None:
         if valid_mask.shape != (B, U.shape[2]):
             raise ValueError(
@@ -1839,7 +2010,9 @@ def lsso_gain_alpha(
             length_reference=length_reference,
         )
         mu = gain.reciprocal()
-        gamma = alpha * mu
+        gamma = (
+            torch.exp(theta_alpha) if positive_alpha is None else positive_alpha
+        ) * mu
         return lsso(
             normalized_U,
             C,
@@ -1856,6 +2029,18 @@ def lsso_gain_alpha(
         )
 
     if trace_normalize and not no_global:
+        if _requires_primal_trace(U, valid_mask):
+            return _adaptive_trace_reference(
+                U,
+                C,
+                gain,
+                theta_alpha if _log_alpha else positive_alpha,
+                valid_mask,
+                eps=normalization_eps,
+                length_normalize=length_normalize,
+                length_reference=length_reference,
+                input_is_log=_log_alpha,
+            )
         if torch.is_grad_enabled() and (
             U.requires_grad
             or C.requires_grad
@@ -1866,7 +2051,7 @@ def lsso_gain_alpha(
                 U,
                 C,
                 gain,
-                alpha,
+                theta_alpha,
                 eye,
                 valid_mask,
                 normalization_eps,
@@ -1884,7 +2069,10 @@ def lsso_gain_alpha(
             U,
             C,
             gain,
-            alpha,
+            (
+                torch.exp(theta_alpha)
+                if positive_alpha is None else positive_alpha
+            ),
             eye,
             valid_mask,
             eps=normalization_eps,
@@ -1894,7 +2082,9 @@ def lsso_gain_alpha(
         return output
 
     mu = gain.reciprocal()
-    gamma = alpha * mu
+    gamma = (
+        torch.exp(theta_alpha) if positive_alpha is None else positive_alpha
+    ) * mu
     return lsso(
         U,
         C,
@@ -1932,11 +2122,8 @@ class LSSO(nn.Module):
         dropout: float = 0.0,
         eps: float = 1e-5,
         gain_init: float = DEFAULT_GAIN_INIT,
-        alpha_init: float = DEFAULT_ALPHA_INIT,
-        solve_parameterization: str = "gain_alpha",
         no_global: bool = False,
         normalize_u: bool = True,
-        basis_normalization: str = "trace",
         length_normalize: bool = True,
         length_reference: float = 1.0,
         bias: bool = False,
@@ -1953,12 +2140,6 @@ class LSSO(nn.Module):
         self.eps = eps
         self.no_global = no_global
         self.normalize_u = normalize_u
-        if basis_normalization not in {"trace", "token_rms"}:
-            raise ValueError(
-                "basis_normalization must be 'trace' or 'token_rms', "
-                f"got {basis_normalization!r}"
-            )
-        self.basis_normalization = basis_normalization
         self.length_normalize = length_normalize
         if length_reference <= 0:
             raise ValueError(f"length_reference must be positive, got {length_reference}")
@@ -1975,14 +2156,7 @@ class LSSO(nn.Module):
         _initialize_solve_parameters(
             self,
             num_heads,
-            solve_parameterization=solve_parameterization,
             gain_init=gain_init,
-            alpha_init=alpha_init,
-        )
-        _fold_fixed_gain_into_output(
-            self,
-            groups=num_heads,
-            group_width=self.head_dim,
         )
 
         self.dropout_p = dropout
@@ -1994,14 +2168,6 @@ class LSSO(nn.Module):
         """Return the positive output gain and relative solve strength."""
 
         return _solve_parameters(self)
-
-    def fold_fixed_gain_into_output(self, *, force: bool = False) -> None:
-        _fold_fixed_gain_into_output(
-            self,
-            groups=self.num_heads,
-            group_width=self.head_dim,
-            force=force,
-        )
 
     def forward(
         self,
@@ -2020,12 +2186,7 @@ class LSSO(nn.Module):
         C = C.view(B, N, H, dh).transpose(1, 2)
 
         pruning_active = self.prune_rank_keep is not None and 0 < self.prune_rank_keep < r
-        token_rms = self.normalize_u and self.basis_normalization == "token_rms"
-        trace_basis = self.normalize_u and self.basis_normalization == "trace"
-        # Historical token-wise RMS is intentionally PyTorch-only. The
-        # maintained CUDA path is reserved for trace-normalized statistics.
-        if token_rms:
-            U = U * torch.rsqrt(torch.mean(U * U, dim=-1, keepdim=True) + self.eps)
+        trace_basis = self.normalize_u
         solve_eye = self._eye
         if pruning_active:
             keep = int(self.prune_rank_keep)
@@ -2042,16 +2203,16 @@ class LSSO(nn.Module):
             U = U.gather(-1, indices[:, :, None, :].expand(B, H, N, keep))
             solve_eye = None
 
-        gain, alpha = _solve_parameters(self)
+        gain, theta_alpha = _solve_log_parameters(self)
 
         gain = gain.view(1, H, 1, 1)
-        alpha = alpha.view(1, H, 1, 1)
+        theta_alpha = theta_alpha.view(1, H, 1, 1)
         if self.record_diagnostics:
             Y, aux = lsso_gain_alpha(
                 U,
                 C,
                 gain,
-                alpha,
+                torch.exp(theta_alpha),
                 eye=solve_eye,
                 no_global=self._global_disabled,
                 return_aux=True,
@@ -2067,7 +2228,7 @@ class LSSO(nn.Module):
                 U,
                 C,
                 gain,
-                alpha,
+                theta_alpha,
                 eye=solve_eye,
                 no_global=self._global_disabled,
                 length_normalize=self.length_normalize,
@@ -2076,6 +2237,7 @@ class LSSO(nn.Module):
                 normalization_eps=self.eps,
                 valid_mask=valid_mask,
                 padding_ratio_hint=padding_ratio_hint,
+                _log_alpha=True,
             )
             aux = None
 
