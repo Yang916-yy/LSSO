@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lsso-operator"
+version = "0.6.0.dev0"
+description = "Accretive-equilibrium low-rank token mixing in PyTorch."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = ["torch>=2.9,<2.12"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "numpy>=1.26"]
+sequence = [
+    "datasets>=3,<5",
+    "numpy>=1.26",
+    "pillow>=10",
+]
+vision = [
+    "timm>=1.0.16,<2",
+    "torchvision>=0.24,<0.27",
+]
+openmmlab = [
+    "mmengine>=0.10,<1",
+    "mmdet>=3.3,<4",
+    "mmsegmentation>=1.2,<2",
+]
+
+[tool.setuptools.packages.find]
+include = ["lsso*"]
+
+[tool.setuptools.package-data]
+lsso = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "core: reference mathematics, model, configuration, and public API contracts",
+    "cuda: CUDA runtime, numerical, or native-extension contract",
+    "integration: framework adapter contract",
+    "experiment: data and training-entrypoint contract",
+    "repository: repository-layout contract",
+]

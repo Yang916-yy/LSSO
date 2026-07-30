@@ -1,0 +1,546 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\I}{\mathbf{I}}
+\newcommand{\T}{\mathsf{T}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\inner}[2]{\left\langle #1, #2 \right\rangle}
+\newcommand{\rank}{\operatorname{rank}}
+\newcommand{\sym}{\operatorname{sym}}
+\newcommand{\diag}{\operatorname{Diag}}
+\newcommand{\tril}{\operatorname{tril}}
+\newcommand{\triu}{\operatorname{triu}}
+\newcommand{\qf}{\operatorname{qf}}
+
+\title{LSSO: Certified Content-Conditioned Global Mixing with Accretive Equilibria}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Efficient sequence layers face a persistent three-way tension: global
+bidirectional interaction, content-conditioned token mixing, and an explicit
+stability certificate.  We introduce LSSO, a global low-rank mixer that
+constructs a compact, sample-conditioned equilibrium rather than an unrolled
+inner optimization.  Relation features define a QR soft frame, while a shared
+content cross-moment generates a strictly accretive compact operator.  Its
+reflected resolvent ranges over the full interior of the compact matrix ball;
+a learned scalar complement then lifts it to token space without fixing the
+unmodeled subspace to the identity.  In exact arithmetic, every frozen
+input-conditioned token mixer is strictly contractive in $\ell_2$, and its
+deviation from the scalar complement has rank at most the compact rank.  The
+equilibrium is evaluated by one small direct solve, so no fixed-point iteration
+or test-time gradient updates are part of the forward pass.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+Global token interaction is useful in both sequence and vision encoders, but
+the usual dense attention map has quadratic sequence cost.  Recent efficient
+models explore several alternatives: fixed or low-rank attention
+approximations, latent bottlenecks, and input-selective recurrent state
+updates \cite{wang2020linformer,xiong2021nystrom,jaegle2021perceiver,
+gu2022s4,gu2024mamba,dao2024mamba2}.  These approaches establish that the
+design space is broader than dense attention, but they expose a different
+tension.  A token mixer that changes with each sample is expressive, while a
+token mixer with a simple, per-instance spectral certificate is easier to
+reason about.  Obtaining both without reverting to an iterative implicit
+solver is less direct.
+
+This tension matters because the stability of an attention-like layer is not a
+cosmetic property.  Standard dot-product self-attention is not globally
+Lipschitz on an unbounded input domain \cite{kim2021lipschitz}.  Monotone and
+equilibrium networks instead impose structure that gives existence and
+stability guarantees \cite{winston2020mondeq}, but their parameters are
+typically static and their forward computation is framed around a fixed-point
+or splitting solver.  Meanwhile, test-time training (TTT) builds a compact
+inner model from the current sequence through online optimization
+\cite{sun2025ttt}; ViT$^3$ makes the associated inner-model design space
+explicit for visual sequence modeling \cite{han2026vit3}.  These are useful
+perspectives, but an unrolled inner optimizer introduces choices of objective,
+step size, and update count.
+
+We ask a narrower question:
+\begin{quote}
+Can a noncausal, global token mixer be conditioned on the current sample,
+scale linearly with sequence length at fixed compact rank, and still carry an
+explicit spectral certificate for every generated token kernel?
+\end{quote}
+
+LSSO answers this question with a compact matrix-ball construction.  Each head
+first compresses content into a shared cross-moment $Z=P^\T C$.  In the
+default \textsc{Dynamic} mode, $Z$ generates unconstrained compact coordinates
+that are mapped to a strictly accretive matrix $K$.  A reflected resolvent
+\begin{equation}
+    M = 2(\I + K)^{-1}-\I
+\label{eq:reflected-resolvent}
+\end{equation}
+is therefore a strict contraction.  LSSO does not materialize an $N\times N$
+transition matrix.  Instead, a QR soft frame $P$ and a learned scalar
+complement $\eta$ lift $M$ to
+\begin{equation}
+    T = \eta\I + P(M-\eta\I)P^\T.
+\label{eq:token-mixer-intro}
+\end{equation}
+The complement is essential: on the token subspace not represented by $P$, the
+mixer acts as $\eta\I$ rather than as a hard-coded identity.
+
+The paper makes three technical contributions.
+\begin{enumerate}
+    \item We define a content-conditioned global mixer with a QR soft frame,
+    an accretive compact equilibrium, and a scalar-complement token lift.  The
+    only public ablations are the compact-core ownership modes
+    \textsc{Dynamic}, \textsc{Static}, and \textsc{Zero}, together with an
+    optional rank-space phase rotation.
+    \item We prove that the compact parameterization covers all real strictly
+    accretive matrices and, through the Cayley map, all real strict compact
+    contractions.  The direct solve is the unique closed-form equilibrium of a
+    strongly monotone linear system.
+    \item We prove that every frozen, sample-conditioned token mixer is a
+    strict $\ell_2$ contraction and satisfies
+    $\rank(T-\eta\I)\leq r$.  We state precisely why this does \emph{not}
+    imply a global Lipschitz bound for the complete dynamic neural block.
+\end{enumerate}
+
+\section{Related Work and Positioning}
+\label{sec:related-work}
+
+\paragraph{Efficient global and selective sequence models.}
+Low-rank attention methods such as Linformer and Nystr\"omformer reduce the
+cost of dense attention through projection or landmark structure
+\cite{wang2020linformer,xiong2021nystrom}.  Perceiver-style models use a
+latent bottleneck for global exchange \cite{jaegle2021perceiver}.  State-space
+and selective sequence models offer another route to long context, using
+structured recurrences and input-dependent state evolution
+\cite{gu2022s4,gu2024mamba,dao2024mamba2}.  LSSO is neither a softmax
+approximation nor a causal scan.  It is a noncausal encoder mixer that forms
+one global compact state per sample and head.  Its formal object is a
+content-conditioned low-rank perturbation of a scalar complement, not an
+arbitrary attention matrix.
+
+\paragraph{Inner adaptation and test-time training.}
+TTT interprets sequence processing through a compact inner model learned from
+the sequence \cite{sun2025ttt}; ViT$^3$ shows that the choices inside that
+inner model remain consequential in vision \cite{han2026vit3}.  LSSO shares
+the useful idea that a sequence can produce compact, context-specific
+quantities.  It differs in the mechanism: $Z$ directly generates an
+accretive system and $U^\star=(\I+K)^{-1}Z$ is evaluated by a small solve.
+There is no inference-time gradient descent, no learned inner-model weights
+updated per sequence, and no claim of literal equivalence to a TTT layer.
+
+\paragraph{Certified and implicit networks.}
+Monotone operator equilibrium networks obtain well-posedness from monotone
+operator structure \cite{winston2020mondeq}.  Our construction uses the same
+classical accretive/resolvent geometry, but in a different regime: the compact
+operator is generated from the current input, its equilibrium has a closed
+form, and the certificate applies to the resulting frozen token kernel.  This
+is intentionally weaker than a theorem about the full input-to-output
+Jacobian of a dynamic network.  The distinction is important in light of the
+non-Lipschitz behavior of ordinary self-attention
+\cite{kim2021lipschitz}.
+
+\section{LSSO}
+\label{sec:method}
+
+We describe one head and omit the batch index.  Let $X\in\R^{N\times D}$ be
+the incoming token matrix, $d$ the head width, and $r$ the compact rank.  A
+single input projection produces relation and content coordinates
+\begin{equation}
+    [A,C] = XW_{bc}+b_{bc},
+    \qquad A\in\R^{N\times r},\quad C\in\R^{N\times d}.
+\label{eq:input-projection}
+\end{equation}
+Heads are concatenated and passed through an ordinary output projection after
+mixing.  The construction below is repeated independently for each head,
+except that the same head's compact state couples all of its valid tokens.
+
+\subsection{Masking and rank-space phase}
+\label{sec:mask-and-phase}
+
+For a boolean validity mask $m\in\{0,1\}^N$, invalid rows of both $A$ and $C$
+are set to zero before any compact statistic is formed.  Let
+\begin{equation}
+    n = \sum_{i=1}^N m_i.
+\end{equation}
+For a nonempty sequence, relation coordinates are normalized as
+$A\leftarrow A/\sqrt{n}$.  An entirely masked sequence is assigned the zero
+output by definition.  This convention makes padding a semantic input rather
+than a separate dense-only path.
+
+The optional Rank-Rotary ablation applies a block-diagonal planar rotation to
+the $r$ relation coordinates before the soft frame.  For centered position
+$p_i$ and frequencies $\{\omega_j\}_{j=1}^{r/2}$, each coordinate pair uses
+the angle $p_i\omega_j$.  The transformation preserves each relation row's
+Euclidean norm and obeys the relative-phase identity
+\begin{equation}
+    \mathcal R(p_i)^\T\mathcal R(p_j)=\mathcal R(p_j-p_i).
+\label{eq:rank-rotary-relative}
+\end{equation}
+It is therefore an internal phase choice in rank-feature space.  It is not a
+RoPE replacement, an absolute-position representation, or a claim of
+two-dimensional spatial equivariance.
+
+\subsection{QR soft frame and compact statistic}
+\label{sec:soft-frame}
+
+The QR soft frame maps unconstrained relation coordinates to a strict column
+contraction.  Form the reduced QR factorization
+\begin{equation}
+    \begin{bmatrix}P\\E\end{bmatrix}R_{\mathrm{qr}}
+    \begin{bmatrix}A\\\I_r\end{bmatrix},
+    \qquad
+    \begin{bmatrix}P\\E\end{bmatrix}^{\!\T}
+    \begin{bmatrix}P\\E\end{bmatrix}=\I_r,
+\label{eq:soft-frame}
+\end{equation}
+where $P\in\R^{N\times r}$ is the token-space frame.  The implementation
+applies a detached positive common scale before this QR; it leaves the exact
+$Q$ factor unchanged and keeps the numerical evaluation in a normal range.
+The identity augmentation means that the factorization is defined even when
+$N<r$ or $A$ is rank deficient.
+
+The frame compresses the content into one shared cross-moment,
+\begin{equation}
+    Z=P^\T C\in\R^{r\times d}.
+\label{eq:cross-moment}
+\end{equation}
+Unlike a recurrent state, $Z$ summarizes all valid positions symmetrically in
+one noncausal pass.  The token-level matrix in \eqref{eq:token-mixer-intro}
+is conceptual only; it is never instantiated.
+
+\subsection{Accretive compact equilibrium}
+\label{sec:accretive-core}
+
+In the default \textsc{Dynamic} mode, $Z$ generates compact raw coordinates
+\begin{equation}
+    \Theta = \Theta_0 + \frac{ZW_{\mathrm{drive}}}{\sqrt{n}},
+\label{eq:dynamic-coordinates}
+\end{equation}
+where $\Theta_0\in\R^{r\times r}$ and
+$W_{\mathrm{drive}}\in\R^{d\times r}$ are learned per-head parameters.  The
+\textsc{Static} ablation uses $\Theta=\Theta_0$, and \textsc{Zero} owns no compact
+coordinates.  No other core variants are part of the operator contract.
+
+For \textsc{Dynamic} and \textsc{Static}, define
+\begin{align}
+    L(\Theta) & = \tril(\Theta,-1)+
+        \diag\!\left(\operatorname{softplus}
+        \bigl(\operatorname{diag}(\Theta)+c_1\bigr)\right), \\
+    \Omega(\Theta) & = \triu(\Theta,1)-\triu(\Theta,1)^\T, \\
+    K(\Theta) & = L(\Theta)L(\Theta)^\T+\Omega(\Theta),
+\label{eq:accretive-parameterization}
+\end{align}
+where $c_1=\operatorname{softplus}^{-1}(1)$.  Thus $L$ is lower triangular
+with positive diagonal, while $\Omega$ is skew-symmetric.  The compact
+equilibrium and the pre-output token coordinates are
+\begin{align}
+    U^\star &=(\I_r+K)^{-1}Z, \\
+    Y &= \eta C+P\left[2U^\star-(1+\eta)Z\right],
+    \qquad \eta=\tanh(\eta_{\mathrm{raw}})\in(-1,1).
+\label{eq:equilibrium-readout}
+\end{align}
+The complement is learned independently for each head.  In \textsc{Zero},
+we set the compact term to $M=0$, which gives
+\begin{equation}
+    Y=\eta(C-PZ).
+\label{eq:zero-core}
+\end{equation}
+At $\Theta=0$, $L=\I_r$, $\Omega=0$, $K=\I_r$, and the compact contraction is
+$M=0$.  Both nonzero-core modes start at that point; \textsc{Dynamic} also
+starts with $W_{\mathrm{drive}}=0$.
+
+For later use, define the reflected resolvent
+\begin{equation}
+    M = 2(\I_r+K)^{-1}-\I_r
+      = (\I_r-K)(\I_r+K)^{-1}.
+\label{eq:cayley}
+\end{equation}
+Substituting $Z=P^\T C$ into \eqref{eq:equilibrium-readout} gives the exact
+token-mixing form
+\begin{equation}
+    Y=TC,\qquad
+    T=\eta\I_N+P(M-\eta\I_r)P^\T.
+\label{eq:token-mixer}
+\end{equation}
+
+\paragraph{Closed form, not unrolled TTT.}
+Equation~\eqref{eq:equilibrium-readout} is the exact solution of a small
+linear system.  It is also the unique minimizer of the residual objective
+\begin{equation}
+    \min_U \; \frac{1}{2}\norm{(\I_r+K)U-Z}_F^2,
+\label{eq:residual-objective}
+\end{equation}
+whose gradient descent converges to $U^\star$ for a sufficiently small fixed
+step size.  This supplies an optional inner-adaptation interpretation, but it
+is not the computation performed by LSSO.  In particular, when
+$\Omega\neq0$, the original equation $(\I_r+K)U=Z$ is not the first-order
+condition of a ridge or other symmetric convex energy in $U$.
+
+\paragraph{Cost.}
+For fixed $r$ and $d$, frame formation costs
+$O(Nr^2)$ per head, the frame-content products cost $O(Nrd)$, and the compact
+solve costs $O(r^2d+r^3)$.  The mixer is therefore linear in $N$ at fixed
+compact dimensions and never stores an $N\times N$ token matrix.  The dense
+input and output projections remain ordinary feature projections, as in other
+token mixers.
+
+\section{Theory}
+\label{sec:theory}
+
+All statements in this section are exact-real-arithmetic statements about a
+single head after its input-conditioned quantities have been generated.  The
+mixed-precision numerical contract is discussed separately in
+Section~\ref{sec:theory-scope}; it is not a claim of bitwise strictness for arbitrary
+floating-point inputs.
+
+\subsection{The QR soft frame is a strict contraction chart}
+
+\begin{theorem}[Soft-frame contract]
+\label{thm:soft-frame}
+Let $P$ be the upper block of the $Q$ factor in
+\eqref{eq:soft-frame}.  Then
+\begin{equation}
+    P^\T P \prec \I_r,
+    \qquad
+    \I_N-PP^\T \succ 0.
+\label{eq:soft-frame-contract}
+\end{equation}
+Moreover, at the level of represented frames, the construction covers every
+$P\in\R^{N\times r}$ satisfying $P^\T P\prec\I_r$.
+\end{theorem}
+
+\begin{proof}
+The lower block of \eqref{eq:soft-frame} obeys
+$ER_{\mathrm{qr}}=\I_r$.  Since the augmented matrix has full
+column rank, $R_{\mathrm{qr}}$ and hence $E$ are nonsingular.  Orthogonality
+of the full thin-$Q$ factor gives
+\begin{equation}
+    P^\T P+E^\T E=\I_r.
+\end{equation}
+Because $E^\T E\succ0$, the first claim follows.  In particular,
+$\norm{P}_2<1$, which implies $PP^\T\prec\I_N$ and proves the second
+claim.
+
+For completeness, take any $P$ with $P^\T P\prec\I_r$ and write
+$S=\I_r-P^\T P\succ0$.  Let $C$ be the upper-triangular Cholesky factor of
+$S$, so $S=C^\T C$, and set $R_{\mathrm{qr}}=C^{-1}$ and
+$A=PR_{\mathrm{qr}}$.  Then
+\begin{equation}
+    \begin{bmatrix}A\\\I_r\end{bmatrix}
+    =
+    \begin{bmatrix}P\\R_{\mathrm{qr}}^{-1}\end{bmatrix}
+    R_{\mathrm{qr}},
+\end{equation}
+and the left factor has orthonormal columns because
+$R_{\mathrm{qr}}^{-\T}R_{\mathrm{qr}}^{-1}=S$.  This is a valid reduced QR
+factorization with positive diagonal and produces the desired upper block.
+\end{proof}
+
+The identity augmentation is more than a numerical safeguard.  It supplies a
+strict defect $\I_N-PP^\T$, which will let us complete the compact contraction
+to token space without an uncontrolled residual subspace.
+
+\subsection{The compact core parameterizes the strict matrix ball}
+
+\begin{definition}[Strict accretivity]
+\label{def:accretive}
+A real square matrix $K$ is strictly accretive when
+\begin{equation}
+    \sym(K) \coloneqq \frac{K+K^\T}{2}\succ0.
+\end{equation}
+\end{definition}
+
+\begin{theorem}[Accretive Cayley parameterization]
+\label{thm:accretive-cayley}
+The map in \eqref{eq:accretive-parameterization} ranges over all real
+strictly accretive $r\times r$ matrices.  For every such $K$, the reflected
+resolvent $M$ in \eqref{eq:cayley} is a strict spectral-norm contraction and
+obeys
+\begin{equation}
+    \I_r-M^\T M
+    =4(\I_r+K)^{-\T}L L^\T(\I_r+K)^{-1}\succ0.
+\label{eq:cayley-defect}
+\end{equation}
+Conversely, the map $K\mapsto M$ is a bijection from real strictly accretive
+matrices to the open real matrix ball $\{M:\norm{M}_2<1\}$, with inverse
+\begin{equation}
+    K=(\I_r-M)(\I_r+M)^{-1}.
+\label{eq:inverse-cayley}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+The construction has
+$\sym(K)=LL^\T\succ0$, because $L$ has positive diagonal.  Conversely, for
+any strictly accretive $K$, let $L$ be the lower-triangular Cholesky factor of
+$\sym(K)$ and let $\Omega=K-LL^\T$.  Then $\Omega^\T=-\Omega$.  The strict
+lower, diagonal, and strict upper entries can independently be represented by
+the raw coordinates in \eqref{eq:accretive-parameterization}; the softplus
+diagonal maps onto $(0,\infty)$.  Thus the parameterization is complete.
+
+Let $Q=\I_r+K$.  Strict accretivity implies that $Q$ is nonsingular.  Using
+$M=(\I_r-K)Q^{-1}$ gives
+\begin{align}
+    \I_r-M^\T M
+    &=Q^{-\T}\left[Q^\T Q-(\I_r-K)^\T(\I_r-K)\right]Q^{-1}\\
+    &=4Q^{-\T}\sym(K)Q^{-1},
+\end{align}
+which is \eqref{eq:cayley-defect}.  It is positive definite, so
+$\norm{M}_2<1$.
+
+For the converse, $\norm{M}_2<1$ makes $\I_r+M$ nonsingular.  Substitution of
+\eqref{eq:inverse-cayley} yields
+\begin{equation}
+    K+K^\T
+    =2(\I_r+M)^{-\T}(\I_r-M^\T M)(\I_r+M)^{-1}\succ0.
+\end{equation}
+The two fractional-linear expressions are algebraic inverses wherever they
+are defined, establishing the bijection.
+\end{proof}
+
+\begin{corollary}[Closed-form strongly monotone equilibrium]
+\label{cor:equilibrium}
+For every $Z\in\R^{r\times d}$, the equilibrium
+$U^\star=(\I_r+K)^{-1}Z$ exists uniquely.  Moreover,
+\begin{equation}
+    \sigma_{\min}(\I_r+K)\geq1.
+\label{eq:solve-bound}
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+For a nonzero $v$,
+\begin{equation}
+    \inner{(\I_r+K)v}{v}
+    =\norm{v}_2^2+\norm{L^\T v}_2^2>0,
+\end{equation}
+because the skew-symmetric part contributes zero.  Therefore
+$\I_r+K$ is strongly monotone and nonsingular.  Cauchy--Schwarz gives
+\begin{equation}
+    \norm{(\I_r+K)v}_2\norm{v}_2
+    \geq \inner{(\I_r+K)v}{v}
+    \geq\norm{v}_2^2,
+\end{equation}
+which proves \eqref{eq:solve-bound}.  Applying the inverse to each column of
+$Z$ gives the unique equilibrium.
+\end{proof}
+
+\subsection{Defect completion lifts the certificate to tokens}
+
+\begin{theorem}[Conditional contraction and low-rank structure]
+\label{thm:token-contraction}
+Fix a sample and head, and let $P$, $M$, and $\eta$ be constructed as above.
+Then the token mixer in \eqref{eq:token-mixer} satisfies
+\begin{equation}
+    \norm{T}_2 <1,
+    \qquad
+    \rank(T-\eta\I_N)\leq r.
+\label{eq:token-contract}
+\end{equation}
+For every $v\in\ker(P^\T)$, it further obeys $Tv=\eta v$.
+\end{theorem}
+
+\begin{proof}
+By Theorem~\ref{thm:soft-frame},
+$\Delta=(\I_N-PP^\T)^{1/2}$ is well-defined and
+\begin{equation}
+    F=[P\;\Delta],\qquad FF^\T=\I_N.
+\end{equation}
+The token mixer admits the defect-completed factorization
+\begin{equation}
+    T
+    =PMP^\T+\eta(\I_N-PP^\T)
+    =F
+      \begin{bmatrix}
+          M & 0\\
+          0 & \eta\I_N
+      \end{bmatrix}
+      F^\T.
+\label{eq:defect-completion}
+\end{equation}
+Theorem~\ref{thm:accretive-cayley} gives $\norm{M}_2<1$, while
+$\eta=\tanh(\eta_{\mathrm{raw}})$ gives $|\eta|<1$.  Since $F$ is a
+coisometry,
+\begin{equation}
+    \norm{T}_2
+    \leq\max\{\norm{M}_2,|\eta|\}<1.
+\end{equation}
+Finally,
+\begin{equation}
+    T-\eta\I_N=P(M-\eta\I_r)P^\T,
+\end{equation}
+which has rank at most $r$.  If $P^\T v=0$, the same expression immediately
+gives $Tv=\eta v$.
+\end{proof}
+
+\begin{remark}[Why the scalar complement is part of the model]
+\label{rem:complement}
+Without the complement, a conventional form $\I_N+PAP^\T$ fixes the entire
+$\ker(P^\T)$ subspace to gain one.  Equation~\eqref{eq:defect-completion}
+instead assigns that unmodeled subspace the learned per-head scalar $\eta$,
+while retaining the same rank-$r$ correction and the strict contraction
+certificate.  This does not make $T$ an arbitrary full-rank attention map:
+outside the represented subspace it remains isotropic.
+\end{remark}
+
+\begin{proposition}[Padding isolation]
+\label{prop:padding}
+If an invalid row has $A_i=C_i=0$, then its soft-frame row is zero and its
+pre-output coordinate $Y_i$ is zero.  Consequently, explicit output masking
+preserves a zero value for every invalid token.
+\end{proposition}
+
+\begin{proof}
+The upper block of the QR factor spans the columns of $A$, so a zero row of
+$A$ produces a zero row of $P$.  With $C_i=0$, the $i$th row of
+\eqref{eq:equilibrium-readout} is therefore zero.  The final output mask
+retains that value after the feature projection.
+\end{proof}
+
+\subsection{Scope of the certificate}
+\label{sec:theory-scope}
+
+Theorems~\ref{thm:accretive-cayley} and \ref{thm:token-contraction} are
+deliberately conditional: for every input, once the relation frame and compact
+core generated by that input are frozen, the resulting linear token mixer is
+strictly contractive.  They do \emph{not} prove that the map
+$X\mapsto T(X)C(X)$ is globally Lipschitz.  Its Jacobian also contains the
+derivatives of the input projection, QR factorization, dynamic compact
+coordinates, output projection, residual connection, and surrounding MLP.
+Nor do the theorems imply a global bound for a full residual block or network.
+
+The result also makes no claim to approximate every softmax attention matrix.
+The structural restriction $\rank(T-\eta\I_N)\leq r$ is explicit.  LSSO is
+noncausal and global, not a streaming state-space model with constant-size
+autoregressive inference.  Finally, Rank-Rotary is only an optional
+rank-feature phase ablation; learned image positional embeddings or other
+backbone position mechanisms remain responsible for spatial coordinates.
+
+The production implementation evaluates the same equations with a documented
+mixed TF32/TC16 contract for supported CUDA paths and an FP64 reference oracle
+for validation.  The exact theorems explain the intended normal-training
+geometry; they are not a bitwise statement about arbitrarily extreme
+floating-point raw coordinates.
+
+% Experimental sections, tables, and empirical conclusions are deliberately
+% added after the DNA, LRA, ImageNet, COCO, and ADE20K runs are complete.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

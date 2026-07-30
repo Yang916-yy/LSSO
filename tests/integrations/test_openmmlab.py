@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+import runpy
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytest.importorskip("timm")
+
+import integrations.openmmlab as openmmlab
+from experiments.imagenet import checkpoint_contract_digest
+from experiments.train_openmmlab import _configure_checkpoint
+from integrations.timm import DeiT3Spec, LSSODeiT3
+from lsso import CoreMode
+
+
+pytestmark = pytest.mark.integration
+
+
+CONFIG_ROOT = (
+    Path(__file__).resolve().parents[2] / "experiments" / "openmmlab" / "configs"
+)
+
+
+def _tiny_imagenet_checkpoint(source: LSSODeiT3) -> dict[str, object]:
+    contract = {
+        "tier": "small",
+        "phase": "pretrain",
+        "model": {
+            "image_size": 32,
+            "patch_size": 16,
+            "num_classes": 1000,
+            "mlp_ratio": 4.0,
+            "layer_scale_init_value": 1e-4,
+            "norm_eps": 1e-6,
+            "embed_dim": 32,
+            "depth": 4,
+            "num_heads": 4,
+            "rank": 4,
+            "drop_path_rate": 0.0,
+        },
+        "operator": {
+            "core_mode": "dynamic",
+            "rank_rotary": True,
+            "bias": True,
+            "implementation": "reference",
+        },
+        "train": {"recipe": "test"},
+    }
+    return {
+        "format_version": 2,
+        "contract": contract,
+        "contract_digest": checkpoint_contract_digest(contract),
+        "model": source.state_dict(),
+    }
+
+
+@pytest.fixture
+def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.LSSODeiT3Backbone:
+    """Build the real downstream adapter with a CPU-sized DeiT-shaped encoder."""
+
+    spec = DeiT3Spec(
+        embed_dim=32,
+        depth=4,
+        num_heads=4,
+        drop_path_rate=0.0,
+    )
+    monkeypatch.setattr(openmmlab, "deit3_spec", lambda variant: spec)
+    model = openmmlab.LSSODeiT3Backbone(
+        variant="small",
+        image_size=32,
+        rank=4,
+        out_indices=(0, 1, 2, 3),
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        implementation="reference",
+    ).eval()
+    assert all(parameter.device.type == "cpu" for parameter in model.parameters())
+    return model
+
+
+def test_backbone_emits_xcit_style_four_level_pyramid(
+    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+) -> None:
+    """A plain ViT grid must become strides 4, 8, 16, and 32 for OpenMMLab."""
+
+    torch.manual_seed(101)
+    image = torch.randn(1, 3, 32, 32)
+
+    with torch.inference_mode():
+        features = tiny_backbone(image)
+
+    assert len(features) == 4
+    assert tuple(feature.shape for feature in features) == (
+        (1, 32, 8, 8),
+        (1, 32, 4, 4),
+        (1, 32, 2, 2),
+        (1, 32, 1, 1),
+    )
+    assert all(torch.isfinite(feature).all() for feature in features)
+
+
+def test_backbone_masks_padded_pixels_before_global_mixing(
+    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+) -> None:
+    """Padding must neither enter LSSO nor leak back through the pyramid."""
+
+    torch.manual_seed(102)
+    valid_mask = torch.zeros(1, 48, 48, dtype=torch.bool)
+    valid_mask[:, :32, :32] = True
+    image = torch.randn(1, 3, 48, 48)
+    changed_padding = torch.where(
+        valid_mask.unsqueeze(1),
+        image,
+        torch.randn_like(image) * 100.0,
+    )
+
+    with torch.inference_mode():
+        expected = tiny_backbone(image, valid_mask=valid_mask)
+        actual = tiny_backbone(changed_padding, valid_mask=valid_mask)
+        patch_mask = tiny_backbone._patch_valid_mask(image, valid_mask)
+
+    for index, (expected_feature, actual_feature) in enumerate(
+        zip(expected, actual, strict=True)
+    ):
+        output_mask = tiny_backbone._scale_mask(patch_mask, index)
+        expanded_mask = output_mask.expand_as(actual_feature)
+        torch.testing.assert_close(
+            actual_feature[expanded_mask],
+            expected_feature[expanded_mask],
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            actual_feature[~expanded_mask],
+            torch.zeros_like(actual_feature[~expanded_mask]),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_backbone_zeros_partial_patch_padding_before_embedding(
+    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+) -> None:
+    """A valid edge patch must not retain arbitrary pixel-padding values."""
+
+    torch.manual_seed(103)
+    valid_mask = torch.zeros(1, 48, 48, dtype=torch.bool)
+    valid_mask[:, :35, :34] = True
+    image = torch.randn(1, 3, 48, 48)
+    changed_padding = torch.where(
+        valid_mask.unsqueeze(1),
+        image,
+        torch.randn_like(image) * 100.0,
+    )
+
+    with torch.inference_mode():
+        expected = tiny_backbone(image, valid_mask=valid_mask)
+        actual = tiny_backbone(changed_padding, valid_mask=valid_mask)
+
+    for expected_feature, actual_feature in zip(expected, actual, strict=True):
+        torch.testing.assert_close(
+            actual_feature,
+            expected_feature,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_backbone_accepts_the_imagenet_checkpoint_contract(
+    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tmp_path: Path,
+) -> None:
+    """The downstream backbone consumes the classifier checkpoint verbatim."""
+
+    source = LSSODeiT3(
+        image_size=32,
+        patch_size=16,
+        num_classes=1000,
+        embed_dim=32,
+        depth=4,
+        num_heads=4,
+        rank=4,
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        bias=True,
+        implementation="reference",
+        drop_path_rate=0.0,
+    )
+    checkpoint = tmp_path / "imagenet.pt"
+    torch.save(_tiny_imagenet_checkpoint(source), checkpoint)
+
+    tiny_backbone.load_pretrained(checkpoint)
+
+    torch.testing.assert_close(
+        tiny_backbone.encoder.patch_embed.proj.weight,
+        source.encoder.patch_embed.proj.weight,
+    )
+    torch.testing.assert_close(
+        tiny_backbone.encoder.pos_embed,
+        source.encoder.pos_embed,
+    )
+
+
+def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
+    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tmp_path: Path,
+) -> None:
+    source = LSSODeiT3(
+        image_size=32,
+        patch_size=16,
+        num_classes=1000,
+        embed_dim=32,
+        depth=4,
+        num_heads=4,
+        rank=4,
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        bias=True,
+        implementation="reference",
+        drop_path_rate=0.0,
+    )
+    payload = _tiny_imagenet_checkpoint(source)
+    contract = payload["contract"]
+    assert isinstance(contract, dict)
+    model_contract = contract["model"]
+    assert isinstance(model_contract, dict)
+    model_contract["rank"] = 8
+    payload["contract_digest"] = checkpoint_contract_digest(contract)
+    checkpoint = tmp_path / "wrong-rank.pt"
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="at rank"):
+        tiny_backbone.load_pretrained(checkpoint)
+
+
+def test_launcher_places_new_run_checkpoint_on_backbone(tmp_path: Path) -> None:
+    """The OpenMMLab bridge must use the backbone's explicit checkpoint field."""
+
+    checkpoint = tmp_path / "imagenet.pt"
+    checkpoint.touch()
+    config = SimpleNamespace(model=SimpleNamespace(backbone=SimpleNamespace()))
+    arguments = SimpleNamespace(
+        test=None,
+        resume=None,
+        backbone_checkpoint=checkpoint,
+    )
+
+    assert not _configure_checkpoint(config, arguments)
+    assert config.model.backbone.checkpoint == str(checkpoint.resolve())
+    assert not hasattr(config.model.backbone, "init_cfg")
+
+
+def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
+    """COCO leaves should vary only the LSSO DeiT III scale and rank."""
+
+    expected = {
+        "small": (32, 384, (3, 5, 7, 11)),
+        "base": (48, 768, (3, 5, 7, 11)),
+        "large": (64, 1024, (7, 11, 15, 23)),
+    }
+    for variant, (rank, channels, out_indices) in expected.items():
+        path = CONFIG_ROOT / f"coco_mask_rcnn_lsso_deit3_{variant}_3x.py"
+        config = runpy.run_path(str(path))
+        backbone = config["model"]["backbone"]
+        assert config["_base_"] == "./_base_/coco_mask_rcnn_fpn_3x.py"
+        assert config["custom_imports"] == {
+            "imports": ["integrations.openmmlab"],
+            "allow_failed_imports": False,
+        }
+        assert backbone == {
+            "type": "LSSODeiT3Backbone",
+            "variant": variant,
+            "rank": rank,
+            "out_indices": out_indices,
+            "implementation": "cuda",
+            "core_mode": "dynamic",
+            "rank_rotary": True,
+        }
+        assert config["model"]["neck"] == {
+            "in_channels": [channels] * 4,
+        }
+
+    base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "coco_mask_rcnn_fpn_3x.py"))
+    assert base["model"]["type"] == "LSSOMaskRCNN"
+    assert "init_cfg" not in base["model"]["backbone"]
+    assert base["model"]["neck"]["type"] == "FPN"
+    assert base["model"]["neck"]["num_outs"] == 5
+    assert base["max_epochs"] == 36
+    assert base["param_scheduler"][1]["milestones"] == [27, 33]
+    policy = base["train_pipeline"][3]["transforms"]
+    assert policy[0][0]["scales"] == [
+        (1333, short_side) for short_side in range(480, 801, 32)
+    ]
+    assert policy[1][0]["scales"] == [(1333, short_side) for short_side in (400, 500, 600)]
+
+
+def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
+    """ADE20K leaves should preserve the common UperNet 160k protocol."""
+
+    expected = {
+        "small": (32, 384, (3, 5, 7, 11), 384),
+        "base": (48, 768, (3, 5, 7, 11), 512),
+        "large": (64, 1024, (7, 11, 15, 23), 512),
+    }
+    for variant, (rank, channels, out_indices, decoder_channels) in expected.items():
+        path = CONFIG_ROOT / f"ade20k_upernet_lsso_deit3_{variant}_160k.py"
+        config = runpy.run_path(str(path))
+        backbone = config["model"]["backbone"]
+        assert config["_base_"] == "./_base_/ade20k_upernet_160k.py"
+        assert backbone["variant"] == variant
+        assert backbone["rank"] == rank
+        assert backbone["out_indices"] == out_indices
+        assert backbone["implementation"] == "cuda"
+        assert backbone["core_mode"] == "dynamic"
+        assert backbone["rank_rotary"]
+        assert config["model"]["decode_head"] == {
+            "in_channels": [channels] * 4,
+            "channels": decoder_channels,
+        }
+        assert config["model"]["auxiliary_head"] == {"in_channels": channels}
+
+    base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "ade20k_upernet_160k.py"))
+    assert base["model"]["type"] == "LSSOEncoderDecoder"
+    assert "init_cfg" not in base["model"]["backbone"]
+    assert base["model"]["decode_head"]["type"] == "UPerHead"
+    assert base["crop_size"] == (512, 512)
+    assert base["train_cfg"]["max_iters"] == 160000
