@@ -22,4 +22,4 @@ def test_public_api_is_narrow() -> None:
         "LSSOConfig",
         "__version__",
     }
-    assert lsso.__version__ == "0.6.0"
+    assert lsso.__version__ == "0.6.1"

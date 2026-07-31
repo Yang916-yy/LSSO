@@ -324,7 +324,7 @@ def test_runtime_wheel_rejects_a_mismatched_torch_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = ModuleType("lsso_cuda_runtime")
-    runtime.LSSO_VERSION = "0.6.0"
+    runtime.LSSO_VERSION = "0.6.1"
     runtime.NATIVE_CONTRACT_VERSION = cuda._NATIVE_CONTRACT_VERSION
     runtime.TORCH_VERSION = "not-the-installed-torch"
     runtime.CUDA_VERSION = torch.version.cuda or ""
