@@ -41,8 +41,8 @@ device-specific artifact without a local CUDA toolkit or compilation step.
 python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
   'torch==2.11.0+cu128'
 python -m pip install \
-  ./lsso_operator-0.6.1-py3-none-any.whl \
-  ./lsso_cuda_runtime-0.6.1+torch2110cu128-py3-none-linux_x86_64.whl
+  ./lsso_operator-0.6.2-py3-none-any.whl \
+  ./lsso_cuda_runtime-0.6.2+torch2110cu128-py3-none-linux_x86_64.whl
 ~~~
 
 Source checkouts still prefer `build/cuda/lib/` for development; an explicit
