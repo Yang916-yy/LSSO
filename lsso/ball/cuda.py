@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 from threading import Lock
@@ -10,6 +11,7 @@ import torch
 _LOAD_LOCK = Lock()
 _SUPPORTED_ARCHITECTURES = frozenset((75, 80, 86, 87, 89, 90, 100, 120))
 _NATIVE_CONTRACT_VERSION = 6
+_RUNTIME_PACKAGE = "lsso_cuda_runtime"
 _LOADED_ARCHITECTURE: int | None = None
 
 
@@ -72,7 +74,8 @@ def require_available() -> None:
                 _check_native_contract()
             raise RuntimeError(
                 "the LSSO accretive-equilibrium CUDA extension is not loaded; "
-                "build it with tools/build_cuda.sh, then call lsso.ball.cuda.load(); "
+                "install the matching precompiled runtime wheel or build it with "
+                "tools/build_cuda.sh, then call lsso.ball.cuda.load(); "
                 f"native contract version {_NATIVE_CONTRACT_VERSION} is required"
             )
 
@@ -107,13 +110,49 @@ def _device_architecture(device: torch.device | int | None = None) -> int:
     return architecture
 
 
-def _default_library_path(device: torch.device | int | None = None) -> Path:
-    override = os.environ.get("LSSO_CUDA_LIBRARY")
-    if override:
-        return Path(override).expanduser()
+def _packaged_library_path(architecture: int) -> Path | None:
+    """Return the matching release runtime library when its wheel is installed."""
 
+    try:
+        runtime = importlib.import_module(_RUNTIME_PACKAGE)
+    except ModuleNotFoundError as error:
+        if error.name == _RUNTIME_PACKAGE:
+            return None
+        raise RuntimeError(
+            "the installed LSSO CUDA runtime wheel could not be imported"
+        ) from error
+
+    from lsso import __version__ as package_version
+
+    expected = {
+        "LSSO_VERSION": package_version,
+        "NATIVE_CONTRACT_VERSION": _NATIVE_CONTRACT_VERSION,
+        "TORCH_VERSION": torch.__version__,
+        "CUDA_VERSION": torch.version.cuda or "",
+        "CXX11_ABI": int(torch.compiled_with_cxx11_abi()),
+    }
+    for name, value in expected.items():
+        if getattr(runtime, name, None) != value:
+            raise RuntimeError(
+                "the installed LSSO CUDA runtime wheel is incompatible: "
+                f"{name} is {getattr(runtime, name, None)!r}, expected {value!r}"
+            )
+    architectures = getattr(runtime, "ARCHITECTURES", ())
+    if architecture not in architectures:
+        raise RuntimeError(
+            "the installed LSSO CUDA runtime wheel does not contain "
+            f"lsso_equilibrium_sm{architecture}.so"
+        )
+    library_path = getattr(runtime, "library_path", None)
+    if not callable(library_path):
+        raise RuntimeError(
+            "the installed LSSO CUDA runtime wheel does not expose library_path()"
+        )
+    return Path(library_path(architecture))
+
+
+def _development_library_path(architecture: int) -> Path:
     repository_root = Path(__file__).resolve().parents[2]
-    architecture = _device_architecture(device)
     return (
         repository_root
         / "build"
@@ -121,6 +160,19 @@ def _default_library_path(device: torch.device | int | None = None) -> Path:
         / "lib"
         / f"lsso_equilibrium_sm{architecture}.so"
     )
+
+
+def _default_library_path(device: torch.device | int | None = None) -> Path:
+    override = os.environ.get("LSSO_CUDA_LIBRARY")
+    if override:
+        return Path(override).expanduser()
+
+    architecture = _device_architecture(device)
+    development = _development_library_path(architecture)
+    if development.is_file():
+        return development
+    packaged = _packaged_library_path(architecture)
+    return packaged if packaged is not None else development
 
 
 def load(

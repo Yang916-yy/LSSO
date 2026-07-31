@@ -31,6 +31,23 @@ cuda.load(device=x.device)
 y = layer(x, implementation="cuda")
 ~~~
 
+Official releases provide a separate runtime wheel containing all eight CUDA
+artifacts. It is intentionally exact to the release binary contract:
+`torch==2.11.0+cu128`, CUDA `12.8`, native contract `6`, and Linux x86_64.
+Install the matching main and runtime wheels, then `cuda.load()` discovers the
+device-specific artifact without a local CUDA toolkit or compilation step.
+
+~~~bash
+python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
+  'torch==2.11.0+cu128'
+python -m pip install \
+  ./lsso_operator-0.6.0-py3-none-any.whl \
+  ./lsso_cuda_runtime-0.6.0+torch2110cu128-py3-none-linux_x86_64.whl
+~~~
+
+Source checkouts still prefer `build/cuda/lib/` for development; an explicit
+`LSSO_CUDA_LIBRARY` remains available for a manually built artifact.
+
 The timm adapter keeps the backend explicit for the ImageNet and downstream
 workflows.
 

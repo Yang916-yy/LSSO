@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import sys
 from threading import Event, Thread
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -288,6 +289,59 @@ def test_default_cuda_library_path_is_arch_specific(
     monkeypatch.delenv("LSSO_CUDA_LIBRARY", raising=False)
     monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
     assert cuda._default_library_path().name == "lsso_equilibrium_sm80.so"
+
+
+def test_default_cuda_library_path_discovers_a_matching_runtime_wheel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lsso import __version__
+
+    library = tmp_path / "lsso_equilibrium_sm80.so"
+    library.touch()
+    runtime = ModuleType("lsso_cuda_runtime")
+    runtime.LSSO_VERSION = __version__
+    runtime.NATIVE_CONTRACT_VERSION = cuda._NATIVE_CONTRACT_VERSION
+    runtime.TORCH_VERSION = torch.__version__
+    runtime.CUDA_VERSION = torch.version.cuda or ""
+    runtime.CXX11_ABI = int(torch.compiled_with_cxx11_abi())
+    runtime.ARCHITECTURES = (80,)
+    runtime.library_path = lambda architecture: library
+    monkeypatch.setitem(sys.modules, "lsso_cuda_runtime", runtime)
+    monkeypatch.delenv("LSSO_CUDA_LIBRARY", raising=False)
+    monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
+    monkeypatch.setattr(
+        cuda,
+        "_development_library_path",
+        lambda architecture: tmp_path / "development" / f"sm{architecture}.so",
+    )
+
+    assert cuda._default_library_path() == library
+
+
+def test_runtime_wheel_rejects_a_mismatched_torch_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ModuleType("lsso_cuda_runtime")
+    runtime.LSSO_VERSION = "0.6.0"
+    runtime.NATIVE_CONTRACT_VERSION = cuda._NATIVE_CONTRACT_VERSION
+    runtime.TORCH_VERSION = "not-the-installed-torch"
+    runtime.CUDA_VERSION = torch.version.cuda or ""
+    runtime.CXX11_ABI = int(torch.compiled_with_cxx11_abi())
+    runtime.ARCHITECTURES = (80,)
+    runtime.library_path = lambda architecture: tmp_path / "lsso_equilibrium_sm80.so"
+    monkeypatch.setitem(sys.modules, "lsso_cuda_runtime", runtime)
+    monkeypatch.delenv("LSSO_CUDA_LIBRARY", raising=False)
+    monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
+    monkeypatch.setattr(
+        cuda,
+        "_development_library_path",
+        lambda architecture: tmp_path / "development" / f"sm{architecture}.so",
+    )
+
+    with pytest.raises(RuntimeError, match="TORCH_VERSION"):
+        cuda._default_library_path()
 
 
 def test_cuda_architecture_normalizes_sm121(

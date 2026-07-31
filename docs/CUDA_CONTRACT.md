@@ -152,3 +152,10 @@ before configuration, preventing a cached Torch_DIR from linking a newly
 selected Python environment against an old libtorch. The loaded artifact
 verifies both its compiled SM and native contract version before launching
 kernels.
+
+The official `lsso-cuda-runtime` wheel contains all eight files. Its generated
+metadata is checked before loading: LSSO version, native contract, exact Torch
+version, CUDA version, and PyTorch's C++ ABI must all match. Release packaging
+removes every build-host RPATH/RUNPATH and rejects ELF artifacts requiring a
+GLIBC version above 2.31, so the published CUDA 12.8 runtime can load on
+Ubuntu 20.04 and newer x86_64 systems with the matching PyTorch runtime.
