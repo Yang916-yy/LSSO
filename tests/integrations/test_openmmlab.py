@@ -83,7 +83,7 @@ def _tiny_imagenet_checkpoint(
                     "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
                 },
                 "source_views": 3,
-                "repeated_augmentation_placement": "rank-local-stream",
+                "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
                 "validation_partition": "worker-stride-full-per-rank",
             },
         },

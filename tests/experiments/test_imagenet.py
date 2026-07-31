@@ -7,6 +7,7 @@ import random
 import sys
 import runpy
 import tarfile
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType
@@ -115,7 +116,7 @@ def _data_contract(*, source_views: int = 3) -> dict[str, object]:
                 "initial_size": imagenet.WDS_SAMPLE_SHUFFLE_INITIAL,
             },
             "source_views": source_views,
-            "repeated_augmentation_placement": "rank-local-stream",
+            "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
             "validation_partition": "worker-stride-full-per-rank",
         },
     }
@@ -295,6 +296,44 @@ def test_webdataset_manifest_requires_the_pinned_layout(
         imagenet.load_imagenet_webdataset_manifest(root)
 
 
+def test_webdataset_preflight_rejects_duplicate_and_noncontiguous_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_webdataset_root(tmp_path, monkeypatch)
+    shard = root / "imagenet1k-train-0001.tar"
+
+    with tarfile.open(shard, "a") as archive:
+        for suffix, value in (("jpg", b"image"), ("cls", b"0"), ("json", b"{}")):
+            member = tarfile.TarInfo(f"train-01-00.{suffix}")
+            member.size = len(value)
+            archive.addfile(member, io.BytesIO(value))
+    with pytest.raises(ValueError, match="repeats source key"):
+        imagenet._verify_webdataset_shard(shard, expected_samples=4)
+
+    with tarfile.open(shard, "w") as archive:
+        members = (
+            ("alpha.jpg", b"image"),
+            ("beta.jpg", b"image"),
+            ("alpha.cls", b"0"),
+            ("alpha.json", b"{}"),
+            ("beta.cls", b"0"),
+            ("beta.json", b"{}"),
+            ("gamma.jpg", b"image"),
+            ("gamma.cls", b"0"),
+            ("gamma.json", b"{}"),
+            ("delta.jpg", b"image"),
+            ("delta.cls", b"0"),
+            ("delta.json", b"{}"),
+        )
+        for name, value in members:
+            member = tarfile.TarInfo(name)
+            member.size = len(value)
+            archive.addfile(member, io.BytesIO(value))
+    with pytest.raises(ValueError, match="does not contain exactly one"):
+        imagenet._verify_webdataset_shard(shard, expected_samples=4)
+
+
 def test_webdataset_train_repeats_undecoded_groups_and_replays_an_epoch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -323,8 +362,8 @@ def test_webdataset_train_repeats_undecoded_groups_and_replays_an_epoch(
     )
     dataset.set_epoch(4)
     batch = next(iter(DataLoader(dataset, batch_size=4, num_workers=0, drop_last=True)))
-    assert batch[1][:2].tolist() == batch[1][2:].tolist()
     assert batch[0][:, 0].tolist() == [0, 1, 2, 3]
+    assert calls == [0, 1, 2, 3]
 
     def stable_transform(image: object) -> torch.Tensor:
         return torch.tensor(image.getpixel((0, 0)), dtype=torch.int64)  # type: ignore[union-attr]
@@ -483,6 +522,54 @@ def test_webdataset_multiple_workers_preserve_repeat_groups_and_replay_epoch(
     ]
     assert all(len(group) == 2 for group in source_groups)
     assert all(source_groups.count(group) == 3 for group in source_groups)
+    assert all(
+        len({group for group in source_groups[index : index + 2]}) == 2
+        for index in range(0, len(source_groups), 2)
+    )
+
+
+@pytest.mark.parametrize("groups_per_batch", (1, 2, 3, 4, 8))
+def test_repeated_augmentation_blocks_keep_physical_batches_source_unique(
+    groups_per_batch: int,
+) -> None:
+    dataset = imagenet._ImageNetWebDataset(
+        imagenet._WebDatasetSplit("train", (), (), 1),
+        transform=lambda _image: torch.zeros(1),
+        state=_cpu_state(),
+        seed=0,
+        num_classes=1,
+        training=True,
+        augmentation_group_size=1,
+        source_views=3,
+        physical_batch_size=groups_per_batch,
+        microbatches_per_epoch=17,
+        worker_count=1,
+    )
+    remaining = groups_per_batch * 17
+    next_source = 0
+    emitted: list[int] = []
+    while remaining:
+        source_count, output_count = dataset._repeated_augmentation_block(remaining)
+        sources = list(range(next_source, next_source + source_count))
+        next_source += source_count
+        block_emitted = 0
+        for _ in range(dataset.source_views):
+            for source in sources:
+                if block_emitted == output_count:
+                    break
+                emitted.append(source)
+                block_emitted += 1
+            if block_emitted == output_count:
+                break
+        remaining -= output_count
+
+    assert next_source == dataset._source_group_count(groups_per_batch * 17)
+    assert len(emitted) == groups_per_batch * 17
+    assert max(Counter(emitted).values()) <= dataset.source_views
+    assert all(
+        len(set(emitted[offset : offset + groups_per_batch])) == groups_per_batch
+        for offset in range(0, len(emitted), groups_per_batch)
+    )
 
 
 def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(

@@ -31,21 +31,25 @@ The runner keeps the formal optimizer update independent of the available GPU
 count. `batch_size` is a physical per-GPU batch; it must be a multiple of the
 configured virtual Mixup group. The launcher derives accumulation so that
 `world_size * batch_size * grad_accum` equals the fixed global effective batch.
-Each physical batch is split into independent batch-mode Mixup/CutMix groups,
-and repeated augmentation replays whole source groups, so no group contains two
-views of the same image. Epochs are truncated to whole effective-batch updates.
+Each physical batch is split into independent batch-mode Mixup/CutMix groups.
+Repeated augmentation buffers three physical batches of source groups, then
+interleaves their three views across nine output physical batches, so neither a
+physical batch nor a Mixup/CutMix group contains two views of the same image.
+Epochs are truncated to whole effective-batch updates.
 
 Training shards are globally permuted from the fixed run seed at each epoch,
 then each rank assigns a finite, unique source-record quota to every worker.
-Workers use a bounded 1,024-sample WebDataset shuffle buffer and never cycle a
-shard within an epoch; their quotas align with virtual Mixup-group boundaries.
-Repeated augmentation buffers a source group before image decoding and reruns
-its stochastic transform per retained view. The fixed update schedule can
-truncate only the final rank-local group at a physical-batch boundary. Views
-are deliberately local to the streaming rank; this preserves batch-mode Mixup
-boundaries and the fixed update schedule, but is not an index-identical replay
-of the retired ImageFolder sampler's cross-rank view placement. This behavior
-is recorded in each checkpoint's data contract.
+Workers use a bounded 8,192-sample WebDataset shuffle buffer, initially filled
+with 2,048 samples. They never cycle a shard within an epoch; their quotas
+align with virtual Mixup-group boundaries.
+Repeated augmentation buffers a bounded window of source groups before image
+decoding, then emits one independently transformed view from every group before
+cycling to their next views. The fixed update schedule can truncate only the
+final rank-local group at a physical-batch boundary. Views are deliberately
+local to the streaming rank; this preserves batch-mode Mixup boundaries and the
+fixed update schedule, but is not an index-identical replay of the retired
+ImageFolder sampler's cross-rank view placement. This behavior is recorded in
+each checkpoint's data contract.
 
 Validation retains the public DeiT behavior: every rank reads the complete
 50,000-example validation split and reductions preserve the metric. Only its

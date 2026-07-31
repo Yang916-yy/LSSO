@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -53,8 +54,8 @@ IMAGENET_TRAIN_SAMPLES = 1_281_167
 IMAGENET_VALIDATION_SAMPLES = 50_000
 IMAGENET_TRAIN_SHARDS = 1_024
 IMAGENET_VALIDATION_SHARDS = 64
-WDS_SAMPLE_SHUFFLE_SIZE = 1_024
-WDS_SAMPLE_SHUFFLE_INITIAL = 256
+WDS_SAMPLE_SHUFFLE_SIZE = 8_192
+WDS_SAMPLE_SHUFFLE_INITIAL = 2_048
 
 
 def checkpoint_contract_digest(contract: Mapping[str, Any]) -> str:
@@ -980,7 +981,7 @@ class ImageNetWebDatasetManifest:
                     "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
                 },
                 "source_views": 3 if repeated_augmentation else 1,
-                "repeated_augmentation_placement": "rank-local-stream",
+                "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
                 "validation_partition": "worker-stride-full-per-rank",
             },
         }
@@ -1107,24 +1108,57 @@ def load_imagenet_webdataset_manifest(
 
 
 def _verify_webdataset_shard(path: Path, *, expected_samples: int) -> None:
-    keys = {"jpg": set(), "cls": set(), "json": set()}
+    expected_fields = {"jpg", "cls", "json"}
+    completed_keys: set[str] = set()
+    current_key: str | None = None
+    current_fields: set[str] = set()
+    record_count = 0
+
+    def finish_record() -> None:
+        nonlocal current_key, current_fields, record_count
+        if current_key is None:
+            return
+        if current_key in completed_keys:
+            raise ValueError(
+                f"WebDataset shard {path} repeats source key {current_key!r}"
+            )
+        if current_fields != expected_fields:
+            raise ValueError(
+                f"WebDataset shard {path} record {current_key!r} does not contain "
+                "exactly one .jpg/.cls/.json triple"
+            )
+        completed_keys.add(current_key)
+        record_count += 1
+        current_key = None
+        current_fields = set()
+
     try:
         with tarfile.open(path, mode="r:*") as archive:
             for member in archive:
                 if not member.isfile():
                     continue
-                stem, separator, suffix = member.name.rpartition(".")
-                if separator and suffix in keys:
-                    keys[suffix].add(stem)
+                # Match WebDataset's base_plus_ext grouping rule so the preflight
+                # validates the same logical records the streaming reader will see.
+                match = re.match(r"^((?:.*/|)[^.]+)[.]([^/]*)$", member.name)
+                if match is None:
+                    continue
+                key, suffix = match.group(1), match.group(2).lower()
+                if current_key is not None and key != current_key:
+                    finish_record()
+                if current_key is None:
+                    current_key = key
+                if suffix in current_fields:
+                    raise ValueError(
+                        f"WebDataset shard {path} repeats field {suffix!r} for "
+                        f"source key {key!r}"
+                    )
+                current_fields.add(suffix)
+            finish_record()
     except (OSError, tarfile.TarError) as error:
         raise ValueError(f"WebDataset shard {path} is not a readable tar archive") from error
-    if (
-        len(keys["jpg"]) != expected_samples
-        or keys["jpg"] != keys["cls"]
-        or keys["jpg"] != keys["json"]
-    ):
+    if record_count != expected_samples:
         raise ValueError(
-            f"WebDataset shard {path} does not match its manifest sample structure"
+            f"WebDataset shard {path} has {record_count} records, expected {expected_samples}"
         )
 
 
@@ -1205,7 +1239,10 @@ def _validate_webdataset_contract(value: object) -> None:
         raise ValueError("checkpoint WebDataset sample shuffle contract is invalid")
     if streaming["source_views"] not in (1, 3):
         raise ValueError("checkpoint WebDataset source view count is invalid")
-    if streaming["repeated_augmentation_placement"] != "rank-local-stream":
+    if (
+        streaming["repeated_augmentation_placement"]
+        != "rank-local-physical-batch-interleave"
+    ):
         raise ValueError("checkpoint WebDataset repeated-augmentation placement is invalid")
     if streaming["validation_partition"] != "worker-stride-full-per-rank":
         raise ValueError("checkpoint WebDataset validation partition is invalid")
@@ -1384,6 +1421,45 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         groups[-1] += remainder
         return tuple(groups)
 
+    def _groups_per_physical_batch(self) -> int:
+        if self.physical_batch_size is None:
+            raise RuntimeError("training WebDataset is missing its physical batch size")
+        return self.physical_batch_size // self.augmentation_group_size
+
+    def _repeated_augmentation_block(
+        self,
+        remaining_virtual_groups: int,
+    ) -> tuple[int, int]:
+        """Return source groups to cache and virtual groups to emit from one block."""
+
+        if remaining_virtual_groups < 1:
+            raise ValueError("remaining virtual groups must be positive")
+        groups_per_batch = self._groups_per_physical_batch()
+        source_window = self.source_views * groups_per_batch
+        output_window = self.source_views * source_window
+        if remaining_virtual_groups >= output_window:
+            return source_window, output_window
+        return (
+            max(
+                math.ceil(remaining_virtual_groups / self.source_views),
+                groups_per_batch,
+            ),
+            remaining_virtual_groups,
+        )
+
+    def _source_group_count(self, virtual_groups: int) -> int:
+        if virtual_groups < 0:
+            raise ValueError("virtual group count must be non-negative")
+        if self.source_views == 1:
+            return virtual_groups
+        source_groups = 0
+        remaining = virtual_groups
+        while remaining:
+            block_sources, block_outputs = self._repeated_augmentation_block(remaining)
+            source_groups += block_sources
+            remaining -= block_outputs
+        return source_groups
+
     def _training_slices(
         self,
         *,
@@ -1399,7 +1475,7 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         if not 0 <= worker_id < len(groups):
             raise RuntimeError("training WebDataset reported an invalid worker id")
         source_counts = tuple(
-            math.ceil(group_count / self.source_views) * self.augmentation_group_size
+            self._source_group_count(group_count) * self.augmentation_group_size
             for group_count in groups
         )
         shards = self._rank_shards(epoch)
@@ -1481,34 +1557,54 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         virtual_groups = self._training_virtual_group_counts()[worker_id]
         if not virtual_groups:
             return
-        expected = virtual_groups * self.augmentation_group_size
-        emitted = 0
-        group: list[Mapping[str, Any]] = []
-        for sample in self._raw_samples(
-            self._training_slices(
-                worker_id=worker_id,
-                worker_count=worker_count,
-                epoch=self._epoch,
-            ),
-            shuffle_seed=_webdataset_seed(
-                self.seed,
-                self._epoch,
-                self.state.rank,
-                worker_id,
-            ),
-        ):
-            group.append(sample)
-            if len(group) != self.augmentation_group_size:
-                continue
-            # Repeat undecoded records so every retained view reruns the stochastic transform.
+        source = iter(
+            self._raw_samples(
+                self._training_slices(
+                    worker_id=worker_id,
+                    worker_count=worker_count,
+                    epoch=self._epoch,
+                ),
+                shuffle_seed=_webdataset_seed(
+                    self.seed,
+                    self._epoch,
+                    self.state.rank,
+                    worker_id,
+                ),
+            )
+        )
+        emitted_groups = 0
+        while emitted_groups < virtual_groups:
+            if self.source_views == 1:
+                source_group_count = 1
+                output_group_count = 1
+            else:
+                source_group_count, output_group_count = self._repeated_augmentation_block(
+                    virtual_groups - emitted_groups
+                )
+            source_groups = [
+                list(itertools.islice(source, self.augmentation_group_size))
+                for _ in range(source_group_count)
+            ]
+            if any(len(group) != self.augmentation_group_size for group in source_groups):
+                raise RuntimeError(
+                    "WebDataset stream ended before its unique-source batch quota was produced"
+                )
+            # Buffer three input physical batches, then cycle their views across
+            # nine output physical batches. Every window, including the final
+            # partial one, keeps a source out of duplicate positions in a
+            # physical batch or virtual Mixup group.
+            block_emitted = 0
             for _ in range(self.source_views):
-                for source in group:
-                    if emitted == expected:
-                        return
-                    yield self._decode(source)
-                    emitted += 1
-            group.clear()
-        if emitted != expected:
+                for group in source_groups:
+                    if block_emitted == output_group_count:
+                        break
+                    for sample in group:
+                        yield self._decode(sample)
+                    block_emitted += 1
+                    emitted_groups += 1
+                if block_emitted == output_group_count:
+                    break
+        if emitted_groups != virtual_groups:
             raise RuntimeError(
                 "WebDataset stream ended before its unique-source batch quota was produced"
             )
