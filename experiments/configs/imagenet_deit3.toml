@@ -1,5 +1,6 @@
 # ImageNet-1K recipes from facebookresearch/deit commit 7e160fe43f0252d17191b71cbb5826254114ea5b.
-# `batch_size` is per GPU because the official commands use --unscale-lr.
+# `batch_size` is physical per GPU. `effective_batch` is global and remains
+# fixed through derived gradient accumulation; learning rates use --unscale-lr.
 
 [defaults]
 num_classes = 1000
@@ -42,6 +43,8 @@ drop_path_rate = 0.05
 [tiers.small.pretrain]
 input_size = 224
 batch_size = 256
+effective_batch = 2048
+augmentation_group_size = 256
 lr = 0.004
 optimizer = "fusedlamb"
 augmentation = "three_augment"
@@ -61,6 +64,8 @@ drop_path_rate = 0.20
 [tiers.base.pretrain]
 input_size = 192
 batch_size = 256
+effective_batch = 2048
+augmentation_group_size = 256
 lr = 0.003
 optimizer = "fusedlamb"
 augmentation = "three_augment"
@@ -73,6 +78,8 @@ label_smoothing = 0.0
 [tiers.base.finetune_224]
 input_size = 224
 batch_size = 64
+effective_batch = 512
+augmentation_group_size = 64
 epochs = 20
 lr = 1.0e-5
 weight_decay = 0.10
@@ -94,6 +101,8 @@ drop_path_rate = 0.45
 [tiers.large.pretrain]
 input_size = 192
 batch_size = 64
+effective_batch = 2048
+augmentation_group_size = 64
 lr = 0.003
 optimizer = "fusedlamb"
 augmentation = "three_augment"
@@ -106,6 +115,8 @@ label_smoothing = 0.0
 [tiers.large.finetune_224]
 input_size = 224
 batch_size = 64
+effective_batch = 512
+augmentation_group_size = 64
 epochs = 20
 lr = 1.0e-5
 weight_decay = 0.10

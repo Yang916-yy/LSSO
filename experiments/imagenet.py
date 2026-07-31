@@ -18,6 +18,7 @@ import random
 import subprocess
 import time
 import tomllib
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -28,7 +29,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as functional
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler, SequentialSampler
+from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +40,7 @@ OFFICIAL_DEIT3_URL = (
     "https://github.com/facebookresearch/deit/blob/"
     "7e160fe43f0252d17191b71cbb5826254114ea5b/README_revenge.md"
 )
-IMAGENET_CHECKPOINT_FORMAT = 2
+IMAGENET_CHECKPOINT_FORMAT = 3
 
 
 def checkpoint_contract_digest(contract: Mapping[str, Any]) -> str:
@@ -65,9 +66,11 @@ def validate_checkpoint_contract(checkpoint: Mapping[str, Any]) -> dict[str, Any
         raise ValueError("checkpoint does not use the current ImageNet contract format")
     contract = checkpoint.get("contract")
     if not isinstance(contract, dict) or not all(
-        key in contract for key in ("tier", "phase", "model", "operator", "train")
+        key in contract
+        for key in ("tier", "phase", "model", "operator", "train", "batching")
     ):
         raise ValueError("checkpoint is missing its complete ImageNet contract")
+    _validate_batching_contract(contract["batching"])
     digest = checkpoint.get("contract_digest")
     expected = checkpoint_contract_digest(contract)
     if not isinstance(digest, str) or digest != expected:
@@ -94,6 +97,38 @@ class DistributedState:
 
 
 @dataclass(frozen=True)
+class BatchingPlan:
+    """Resolved physical, virtual, and optimizer-update batching contract."""
+
+    world_size: int
+    physical_batch_size: int
+    effective_batch_size: int
+    augmentation_group_size: int
+    grad_accum: int
+    samples_per_epoch: int
+    updates_per_epoch: int
+
+    @property
+    def samples_per_rank(self) -> int:
+        return self.samples_per_epoch // self.world_size
+
+    @property
+    def microbatches_per_epoch(self) -> int:
+        return self.updates_per_epoch * self.grad_accum
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "world_size": self.world_size,
+            "physical_batch_size": self.physical_batch_size,
+            "effective_batch_size": self.effective_batch_size,
+            "augmentation_group_size": self.augmentation_group_size,
+            "grad_accum": self.grad_accum,
+            "samples_per_epoch": self.samples_per_epoch,
+            "updates_per_epoch": self.updates_per_epoch,
+        }
+
+
+@dataclass(frozen=True)
 class ImageNetRun:
     """Fully resolved run contract, including the selected official recipe."""
 
@@ -105,19 +140,21 @@ class ImageNetRun:
     train: dict[str, Any]
     overrides: tuple[str, ...]
 
-    def checkpoint_contract(self) -> dict[str, Any]:
-        return {
+    def checkpoint_contract(self, batching_plan: BatchingPlan) -> dict[str, Any]:
+        contract: dict[str, Any] = {
             "tier": self.tier,
             "phase": self.phase,
             "model": self.model,
             "operator": self.operator,
             "train": self.train,
         }
+        contract["batching"] = batching_plan.as_dict()
+        return contract
 
-    def checkpoint_contract_digest(self) -> str:
-        return checkpoint_contract_digest(self.checkpoint_contract())
+    def checkpoint_contract_digest(self, batching_plan: BatchingPlan) -> str:
+        return checkpoint_contract_digest(self.checkpoint_contract(batching_plan))
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, batching_plan: BatchingPlan) -> dict[str, Any]:
         return {
             "config_path": str(self.config_path),
             "tier": self.tier,
@@ -127,12 +164,13 @@ class ImageNetRun:
             "train": self.train,
             "overrides": list(self.overrides),
             "official_deit3_recipe": OFFICIAL_DEIT3_URL,
-            "checkpoint_contract_digest": self.checkpoint_contract_digest(),
+            "batching": batching_plan.as_dict(),
+            "checkpoint_contract_digest": self.checkpoint_contract_digest(batching_plan),
         }
 
 
-class RepeatedAugmentationSampler(Sampler[int]):
-    """DeiT's three-view distributed sampler, retained verbatim in behavior."""
+class VirtualGroupSampler(Sampler[int]):
+    """Finite distributed sampler with whole-group repeated augmentation views."""
 
     def __init__(
         self,
@@ -140,6 +178,8 @@ class RepeatedAugmentationSampler(Sampler[int]):
         *,
         num_replicas: int,
         rank: int,
+        samples_per_rank: int,
+        group_size: int,
         shuffle: bool = True,
         num_repeats: int = 3,
     ) -> None:
@@ -149,20 +189,27 @@ class RepeatedAugmentationSampler(Sampler[int]):
             raise ValueError("rank must be in [0, num_replicas)")
         if num_repeats < 1:
             raise ValueError("num_repeats must be positive")
+        if group_size < 1:
+            raise ValueError("group_size must be positive")
+        if samples_per_rank < 1:
+            raise ValueError("samples_per_rank must be positive")
+        if samples_per_rank % group_size:
+            raise ValueError("samples_per_rank must be divisible by group_size")
         self.dataset = dataset
         self.num_replicas = num_replicas
         self.rank = rank
         self.shuffle = shuffle
         self.num_repeats = num_repeats
+        self.group_size = group_size
+        self.num_samples = samples_per_rank
+        self.global_groups = (samples_per_rank // group_size) * num_replicas
+        self.source_groups = math.ceil(self.global_groups / num_repeats)
+        self.source_samples = self.source_groups * group_size
+        if len(self.dataset) < self.source_samples:
+            raise ValueError(
+                "dataset is too small to construct the requested virtual augmentation groups"
+            )
         self.epoch = 0
-        self.num_samples = int(
-            math.ceil(len(self.dataset) * self.num_repeats / self.num_replicas)
-        )
-        self.total_size = self.num_samples * self.num_replicas
-        # The 256-image truncation is part of the published DeiT sampler.
-        self.num_selected_samples = int(
-            math.floor(len(self.dataset) // 256 * 256 / self.num_replicas)
-        )
 
     def __iter__(self) -> Iterator[int]:
         if self.shuffle:
@@ -172,20 +219,22 @@ class RepeatedAugmentationSampler(Sampler[int]):
         else:
             indices = torch.arange(len(self.dataset))
 
-        indices = torch.repeat_interleave(indices, repeats=self.num_repeats).tolist()
-        padding = self.total_size - len(indices)
-        if padding > 0:
-            indices += indices[:padding]
-        if len(indices) != self.total_size:
-            raise RuntimeError("repeated-augmentation sampler produced an invalid size")
-
-        local_indices = indices[self.rank : self.total_size : self.num_replicas]
+        source_groups = indices[: self.source_samples].reshape(
+            self.source_groups,
+            self.group_size,
+        )
+        virtual_groups = torch.repeat_interleave(
+            source_groups,
+            repeats=self.num_repeats,
+            dim=0,
+        )[: self.global_groups]
+        local_indices = virtual_groups[self.rank :: self.num_replicas].reshape(-1)
         if len(local_indices) != self.num_samples:
-            raise RuntimeError("repeated-augmentation sampler produced an invalid shard")
-        return iter(local_indices[: self.num_selected_samples])
+            raise RuntimeError("virtual-group sampler produced an invalid shard")
+        return iter(local_indices.tolist())
 
     def __len__(self) -> int:
-        return self.num_selected_samples
+        return self.num_samples
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -273,7 +322,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Override the official duration for a diagnostic run; recorded as non-canonical.",
     )
-    parser.add_argument("--batch-size", type=int, help="Override the per-GPU batch size.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="Override the physical per-GPU batch size.",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        help="Require this many physical batches per optimizer update.",
+    )
     parser.add_argument("--workers", type=int, help="Override ImageFolder worker count.")
     parser.add_argument("--seed", type=int, help="Override the official seed.")
     parser.add_argument("--save-every", type=int, help="Checkpoint interval in epochs.")
@@ -367,6 +425,9 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         if argument is not None:
             train[key] = argument
             overrides.append(key)
+    if args.grad_accum is not None:
+        _positive_int(args.grad_accum, "--grad-accum")
+        overrides.append("grad_accum")
     if args.implementation is not None:
         operator["implementation"] = args.implementation
         overrides.append("implementation")
@@ -424,6 +485,8 @@ def _validate_run(
         (
             "epochs",
             "batch_size",
+            "effective_batch",
+            "augmentation_group_size",
             "lr",
             "min_lr",
             "warmup_lr",
@@ -478,6 +541,13 @@ def _validate_run(
 
     _positive_int(train["epochs"], "epochs")
     _positive_int(train["batch_size"], "batch_size")
+    effective_batch = _positive_int(train["effective_batch"], "effective_batch")
+    augmentation_group_size = _positive_int(
+        train["augmentation_group_size"],
+        "augmentation_group_size",
+    )
+    if effective_batch % augmentation_group_size:
+        raise ValueError("effective_batch must be divisible by augmentation_group_size")
     _positive_int(train["workers"], "workers")
     _nonnegative_int(train["warmup_epochs"], "warmup_epochs")
     _positive_int(train["save_every"], "save_every")
@@ -522,6 +592,111 @@ def _validate_run(
             raise ValueError("DeiT III does not define a 224px fine-tuning phase for small")
         if model["image_size"] != 224 or train["optimizer"] != "adamw":
             raise ValueError("the B/L 224px fine-tuning phase requires 224px AdamW")
+
+
+def _validate_batching_contract(value: object) -> None:
+    batching = _as_mapping(value, "checkpoint batching contract")
+    _require_keys(
+        batching,
+        (
+            "world_size",
+            "physical_batch_size",
+            "effective_batch_size",
+            "augmentation_group_size",
+            "grad_accum",
+            "samples_per_epoch",
+            "updates_per_epoch",
+        ),
+        "checkpoint batching contract",
+    )
+    world_size = _positive_int(batching["world_size"], "batching.world_size")
+    physical_batch_size = _positive_int(
+        batching["physical_batch_size"],
+        "batching.physical_batch_size",
+    )
+    effective_batch_size = _positive_int(
+        batching["effective_batch_size"],
+        "batching.effective_batch_size",
+    )
+    augmentation_group_size = _positive_int(
+        batching["augmentation_group_size"],
+        "batching.augmentation_group_size",
+    )
+    grad_accum = _positive_int(batching["grad_accum"], "batching.grad_accum")
+    samples_per_epoch = _positive_int(
+        batching["samples_per_epoch"],
+        "batching.samples_per_epoch",
+    )
+    updates_per_epoch = _positive_int(
+        batching["updates_per_epoch"],
+        "batching.updates_per_epoch",
+    )
+    if physical_batch_size % augmentation_group_size:
+        raise ValueError(
+            "checkpoint physical_batch_size must be divisible by augmentation_group_size"
+        )
+    if effective_batch_size != world_size * physical_batch_size * grad_accum:
+        raise ValueError(
+            "checkpoint effective_batch_size does not match world_size, "
+            "physical_batch_size, and grad_accum"
+        )
+    if samples_per_epoch % effective_batch_size:
+        raise ValueError("checkpoint samples_per_epoch is not a whole effective batch")
+    if updates_per_epoch != samples_per_epoch // effective_batch_size:
+        raise ValueError("checkpoint updates_per_epoch does not match samples_per_epoch")
+
+
+def resolve_batching_plan(
+    run: ImageNetRun,
+    state: DistributedState,
+    *,
+    dataset_size: int,
+    requested_grad_accum: int | None,
+) -> BatchingPlan:
+    """Resolve one exact optimizer-update schedule for the current launcher."""
+
+    if dataset_size < 1:
+        raise ValueError("ImageNet train dataset must contain at least one sample")
+    physical_batch_size = int(run.train["batch_size"])
+    effective_batch_size = int(run.train["effective_batch"])
+    augmentation_group_size = int(run.train["augmentation_group_size"])
+    if physical_batch_size % augmentation_group_size:
+        raise ValueError(
+            "physical batch_size must be divisible by augmentation_group_size"
+        )
+    if effective_batch_size % augmentation_group_size:
+        raise ValueError("effective_batch must be divisible by augmentation_group_size")
+
+    global_physical_batch = state.world_size * physical_batch_size
+    if requested_grad_accum is None:
+        if effective_batch_size % global_physical_batch:
+            raise ValueError(
+                "effective_batch must be divisible by world_size * physical batch_size"
+            )
+        grad_accum = effective_batch_size // global_physical_batch
+    else:
+        grad_accum = _positive_int(requested_grad_accum, "--grad-accum")
+    if global_physical_batch * grad_accum != effective_batch_size:
+        raise ValueError(
+            "world_size * physical batch_size * grad_accum must equal effective_batch"
+        )
+
+    updates_per_epoch = dataset_size // effective_batch_size
+    if updates_per_epoch < 1:
+        raise ValueError(
+            "ImageNet train dataset is smaller than one configured effective batch"
+        )
+    plan = BatchingPlan(
+        world_size=state.world_size,
+        physical_batch_size=physical_batch_size,
+        effective_batch_size=effective_batch_size,
+        augmentation_group_size=augmentation_group_size,
+        grad_accum=grad_accum,
+        samples_per_epoch=updates_per_epoch * effective_batch_size,
+        updates_per_epoch=updates_per_epoch,
+    )
+    _validate_batching_contract(plan.as_dict())
+    return plan
 
 
 def initialize_distributed() -> DistributedState:
@@ -663,7 +838,9 @@ def build_loaders(
     run: ImageNetRun,
     data_root: Path,
     state: DistributedState,
-) -> tuple[DataLoader[Any], DataLoader[Any], Sampler[int]]:
+    *,
+    requested_grad_accum: int | None,
+) -> tuple[DataLoader[Any], DataLoader[Any], VirtualGroupSampler, BatchingPlan]:
     from torchvision.datasets import ImageFolder
 
     root = data_root.resolve()
@@ -683,23 +860,21 @@ def build_loaders(
     if len(val_dataset.classes) != len(train_dataset.classes):
         raise ValueError("ImageNet train/val class directory sets do not agree")
 
-    if bool(run.train["repeated_aug"]):
-        train_sampler: Sampler[int] = RepeatedAugmentationSampler(
-            train_dataset,
-            num_replicas=state.world_size,
-            rank=state.rank,
-            shuffle=True,
-            num_repeats=3,
-        )
-    elif state.enabled:
-        train_sampler = torch.utils.data.DistributedSampler(
-            train_dataset,
-            num_replicas=state.world_size,
-            rank=state.rank,
-            shuffle=True,
-        )
-    else:
-        train_sampler = RandomSampler(train_dataset)
+    batching_plan = resolve_batching_plan(
+        run,
+        state,
+        dataset_size=len(train_dataset),
+        requested_grad_accum=requested_grad_accum,
+    )
+    train_sampler = VirtualGroupSampler(
+        train_dataset,
+        num_replicas=state.world_size,
+        rank=state.rank,
+        samples_per_rank=batching_plan.samples_per_rank,
+        group_size=batching_plan.augmentation_group_size,
+        shuffle=True,
+        num_repeats=3 if bool(run.train["repeated_aug"]) else 1,
+    )
 
     # The public DeiT command does not enable --dist-eval, so every process
     # evaluates the full validation set and reductions preserve the same metric.
@@ -716,9 +891,9 @@ def build_loaders(
     }
     train_loader = DataLoader(
         train_dataset,
-        batch_size=int(run.train["batch_size"]),
+        batch_size=batching_plan.physical_batch_size,
         sampler=train_sampler,
-        drop_last=True,
+        drop_last=False,
         **common,
     )
     val_loader = DataLoader(
@@ -728,7 +903,9 @@ def build_loaders(
         drop_last=False,
         **common,
     )
-    return train_loader, val_loader, train_sampler
+    if len(train_loader) != batching_plan.microbatches_per_epoch:
+        raise RuntimeError("ImageNet train loader does not match the resolved batching plan")
+    return train_loader, val_loader, train_sampler, batching_plan
 
 
 def prepare_operator_backend(run: ImageNetRun, device: torch.device) -> None:
@@ -1015,6 +1192,32 @@ def build_mixup_and_loss(run: ImageNetRun) -> tuple[Any | None, nn.Module]:
     return mixup, nn.CrossEntropyLoss()
 
 
+def apply_virtual_group_mixup(
+    images: torch.Tensor,
+    targets: torch.Tensor,
+    mixup: Any,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply batch-mode Mixup/CutMix independently to virtual GPU groups."""
+
+    if images.shape[0] != targets.shape[0]:
+        raise ValueError("images and targets must have the same batch dimension")
+    if group_size < 1:
+        raise ValueError("group_size must be positive")
+    if images.shape[0] % group_size:
+        raise ValueError(
+            "physical batch size must be divisible by the virtual Mixup group size"
+        )
+
+    mixed_targets: list[torch.Tensor] = []
+    for start in range(0, images.shape[0], group_size):
+        stop = start + group_size
+        # timm's batch-mode Mixup mutates this image view in place.
+        _, group_targets = mixup(images[start:stop], targets[start:stop])
+        mixed_targets.append(group_targets)
+    return images, torch.cat(mixed_targets, dim=0)
+
+
 def build_ema(model: nn.Module, run: ImageNetRun) -> Any:
     from timm.utils import ModelEma
 
@@ -1062,40 +1265,61 @@ def train_epoch(
     epoch: int,
     state: DistributedState,
     run: ImageNetRun,
+    batching_plan: BatchingPlan,
     print_freq: int,
 ) -> tuple[float, float, float]:
     if hasattr(sampler, "set_epoch"):
         sampler.set_epoch(epoch)  # type: ignore[union-attr]
+    if len(loader) != batching_plan.microbatches_per_epoch:
+        raise RuntimeError("ImageNet train loader does not match the resolved batching plan")
     model.train()
     loss_sum = 0.0
     correct1 = 0
     correct5 = 0
     count = 0
+    optimizer_updates = 0
+    processed_steps = 0
     started = time.perf_counter()
+    model.zero_grad(set_to_none=True)
     for step, (images, targets) in enumerate(loader):
         images = images.to(state.device, non_blocking=True)
         targets = targets.to(state.device, non_blocking=True)
         metric_targets = targets
         if mixup is not None:
-            images, targets = mixup(images, targets)
+            images, targets = apply_virtual_group_mixup(
+                images,
+                targets,
+                mixup,
+                batching_plan.augmentation_group_size,
+            )
         if bool(run.train["bce_loss"]):
             targets = targets.gt(0.0).to(dtype=targets.dtype)
 
-        optimizer.zero_grad(set_to_none=True)
-        with _autocast():
-            logits = model(images)
-            loss = criterion(logits, targets)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(
-                f"non-finite training loss at epoch {epoch + 1}, step {step + 1}"
-            )
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        ema.update(model)
+        update_boundary = (step + 1) % batching_plan.grad_accum == 0
+        sync_context = nullcontext()
+        if state.enabled and not update_boundary:
+            if not isinstance(model, DistributedDataParallel):
+                raise RuntimeError("distributed ImageNet training requires DistributedDataParallel")
+            sync_context = model.no_sync()
+        with sync_context:
+            with _autocast():
+                logits = model(images)
+                data_loss = criterion(logits, targets)
+                loss = data_loss / batching_plan.grad_accum
+            if not torch.isfinite(data_loss):
+                raise FloatingPointError(
+                    f"non-finite training loss at epoch {epoch + 1}, step {step + 1}"
+                )
+            scaler.scale(loss).backward()
+        if update_boundary:
+            scaler.step(optimizer)
+            scaler.update()
+            model.zero_grad(set_to_none=True)
+            ema.update(model)
+            optimizer_updates += 1
 
         batch = images.shape[0]
-        loss_sum += float(loss.detach()) * batch
+        loss_sum += float(data_loss.detach()) * batch
         if metric_targets.ndim == 1:
             correct1 += int((logits.detach().argmax(dim=1) == metric_targets).sum())
             correct5 += int(
@@ -1104,6 +1328,7 @@ def train_epoch(
                 ).any(dim=1).sum()
             )
         count += batch
+        processed_steps += 1
         if state.is_main and print_freq > 0 and (step + 1) % print_freq == 0:
             elapsed = time.perf_counter() - started
             print(
@@ -1113,13 +1338,19 @@ def train_epoch(
                         "epoch": epoch + 1,
                         "step": step + 1,
                         "steps": len(loader),
-                        "loss": float(loss.detach()),
+                        "optimizer_step": optimizer_updates,
+                        "optimizer_steps": batching_plan.updates_per_epoch,
+                        "loss": float(data_loss.detach()),
                         "lr": optimizer.param_groups[0]["lr"],
                         "images_per_second": count / max(elapsed, 1.0e-9),
                     }
                 ),
                 flush=True,
             )
+    if processed_steps != batching_plan.microbatches_per_epoch:
+        raise RuntimeError("ImageNet train loader ended before the resolved batching plan")
+    if optimizer_updates != batching_plan.updates_per_epoch:
+        raise RuntimeError("ImageNet epoch ended without complete optimizer updates")
     return _reduce_metrics((loss_sum, correct1, correct5, count), state)
 
 
@@ -1183,6 +1414,7 @@ def _record_runtime_metadata(
     parameter_count: int,
     resolved_optimizer: str,
     run: ImageNetRun,
+    batching_plan: BatchingPlan,
     allow_lamb_fallback: bool,
 ) -> None:
     path = output / "metadata.json"
@@ -1194,6 +1426,7 @@ def _record_runtime_metadata(
     metadata["lamb_fallback_permitted"] = allow_lamb_fallback
     metadata["recipe_fidelity"] = _recipe_fidelity(
         run,
+        batching_plan=batching_plan,
         resolved_optimizer=resolved_optimizer,
         allow_lamb_fallback=allow_lamb_fallback,
     )
@@ -1203,12 +1436,17 @@ def _record_runtime_metadata(
 def _recipe_fidelity(
     run: ImageNetRun,
     *,
+    batching_plan: BatchingPlan,
     resolved_optimizer: str,
     allow_lamb_fallback: bool,
 ) -> str:
+    non_semantic_overrides = {"batch_size", "grad_accum", "workers", "save_every"}
     if (
-        not run.overrides
+        not (set(run.overrides) - non_semantic_overrides)
         and not allow_lamb_fallback
+        and batching_plan.effective_batch_size == int(run.train["effective_batch"])
+        and batching_plan.augmentation_group_size
+        == int(run.train["augmentation_group_size"])
         and (
             resolved_optimizer == "apex.fused_lamb"
             or run.train["optimizer"] == "adamw"
@@ -1223,6 +1461,7 @@ def _prepare_output(
     args: argparse.Namespace,
     run: ImageNetRun,
     state: DistributedState,
+    batching_plan: BatchingPlan,
 ) -> Path:
     output = output.resolve()
     failure: str | None = None
@@ -1235,7 +1474,7 @@ def _prepare_output(
                 )
             metadata = {
                 "event": "start",
-                "run": run.as_dict(),
+                "run": run.as_dict(batching_plan),
                 "launcher": {
                     "world_size": state.world_size,
                     "rank": state.rank,
@@ -1280,9 +1519,10 @@ def _checkpoint(
     scheduler: Any,
     scaler: torch.amp.GradScaler,
     run: ImageNetRun,
+    batching_plan: BatchingPlan,
     best_acc1: float,
 ) -> dict[str, Any]:
-    contract = run.checkpoint_contract()
+    contract = run.checkpoint_contract(batching_plan)
     return {
         "format_version": IMAGENET_CHECKPOINT_FORMAT,
         "epoch": epoch,
@@ -1290,7 +1530,7 @@ def _checkpoint(
         "contract": contract,
         "contract_digest": checkpoint_contract_digest(contract),
         "model": _unwrap_model(model).state_dict(),
-        "model_ema": ema.module.state_dict(),
+        "model_ema": ema.ema.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -1306,17 +1546,18 @@ def _load_resume(
     scheduler: Any,
     scaler: torch.amp.GradScaler,
     run: ImageNetRun,
+    batching_plan: BatchingPlan,
 ) -> tuple[int, float]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict):
         raise ValueError("resume checkpoint must be a mapping")
-    if validate_checkpoint_contract(checkpoint) != run.checkpoint_contract():
+    if validate_checkpoint_contract(checkpoint) != run.checkpoint_contract(batching_plan):
         raise ValueError("resume checkpoint contract does not match the requested run")
     _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint), strict=True)
     ema_state = checkpoint.get("model_ema")
     if not isinstance(ema_state, dict):
         raise ValueError("resume checkpoint is missing model_ema")
-    ema.module.load_state_dict(ema_state, strict=True)
+    ema.ema.load_state_dict(ema_state, strict=True)
     for key, owner in (("optimizer", optimizer), ("scheduler", scheduler), ("scaler", scaler)):
         state = checkpoint.get(key)
         if not isinstance(state, dict):
@@ -1340,9 +1581,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         prepare_operator_backend(run, state.device)
-        output = _prepare_output(args.output, args, run, state)
-        train_loader, val_loader, train_sampler = build_loaders(
-            run, args.data_root, state
+        train_loader, val_loader, train_sampler, batching_plan = build_loaders(
+            run,
+            args.data_root,
+            state,
+            requested_grad_accum=args.grad_accum,
         )
         model = build_model(run)
         if args.init_checkpoint is not None:
@@ -1373,10 +1616,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 scheduler=scheduler,
                 scaler=scaler,
                 run=run,
+                batching_plan=batching_plan,
             )
             # This matches the public DeiT entrypoint after restoring scheduler state.
             scheduler.step(start_epoch)
 
+        output = _prepare_output(args.output, args, run, state, batching_plan)
         parameter_count = sum(
             parameter.numel() for parameter in model_without_ddp.parameters() if parameter.requires_grad
         )
@@ -1386,6 +1631,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 parameter_count=parameter_count,
                 resolved_optimizer=resolved_optimizer,
                 run=run,
+                batching_plan=batching_plan,
                 allow_lamb_fallback=args.allow_lamb_fallback,
             )
             print(
@@ -1396,8 +1642,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "phase": run.phase,
                         "parameters": parameter_count,
                         "train_samples": len(train_loader.dataset),
+                        "scheduled_train_samples": batching_plan.samples_per_epoch,
                         "val_samples": len(val_loader.dataset),
                         "steps_per_epoch": len(train_loader),
+                        "optimizer_steps_per_epoch": batching_plan.updates_per_epoch,
+                        "physical_batch_size": batching_plan.physical_batch_size,
+                        "effective_batch": batching_plan.effective_batch_size,
+                        "grad_accum": batching_plan.grad_accum,
+                        "augmentation_group_size": batching_plan.augmentation_group_size,
                         "optimizer": resolved_optimizer,
                         "world_size": state.world_size,
                     }
@@ -1436,6 +1688,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 epoch=epoch,
                 state=state,
                 run=run,
+                batching_plan=batching_plan,
                 print_freq=args.print_freq,
             )
             # timm's epoch scheduler receives the next epoch at the end of
@@ -1466,6 +1719,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     scheduler=scheduler,
                     scaler=scaler,
                     run=run,
+                    batching_plan=batching_plan,
                     best_acc1=best_acc1,
                 )
                 if (epoch + 1) % int(run.train["save_every"]) == 0:

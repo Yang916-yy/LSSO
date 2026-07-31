@@ -12,6 +12,36 @@ FusedLAMB. The S model uses 224px input; B and L use 192px before the official
 20-epoch 224px AdamW fine-tuning phase. Per-GPU batches and learning rates are
 not linearly rescaled, matching `--unscale-lr` in the source commands.
 
+The runner keeps the formal optimizer update independent of the available GPU
+count. `batch_size` is a physical per-GPU batch; it must be a multiple of the
+configured virtual Mixup group. The launcher derives accumulation so that
+`world_size * batch_size * grad_accum` equals the fixed global effective batch.
+Each physical batch is split into independent batch-mode Mixup/CutMix groups,
+and repeated augmentation replays whole source groups, so no group contains two
+views of the same image. Epochs are truncated to whole effective-batch updates.
+
+| Phase | Effective global batch | Virtual Mixup group | Updates per ImageNet-1K epoch |
+| --- | ---: | ---: | ---: |
+| S/B pretraining | 2048 | 256 | 625 |
+| L pretraining | 2048 | 64 | 625 |
+| B/L 224px fine-tuning | 512 | 64 | 2502 |
+
+`--grad-accum` is optional and only accepted when it exactly matches this
+contract. It is useful for asserting a launch plan, not for changing the
+effective batch. A larger single-GPU physical batch remains `deit3-derived`
+when the resolved plan is exact. For example, one H100 can use 512 images for
+S/B pretraining or 128 for L pretraining:
+
+```bash
+torchrun --standalone --nproc_per_node=1 experiments/train_imagenet.py \
+  --tier small --phase pretrain --data-root /datasets/imagenet \
+  --output runs/imagenet/deit3_small_h100 --batch-size 512
+
+torchrun --standalone --nproc_per_node=1 experiments/train_imagenet.py \
+  --tier large --phase pretrain --data-root /datasets/imagenet \
+  --output runs/imagenet/deit3_large_h100 --batch-size 128
+```
+
 The model geometry is:
 
 | Tier | Width | Depth | Heads | LSSO rank | Pretraining input |
@@ -54,10 +84,13 @@ torchrun --nnodes=4 --node_rank="$NODE_RANK" --nproc_per_node=8 \
 
 Every output directory contains `metadata.json`, append-only `metrics.jsonl`,
 `checkpoint_last.pt`, and `checkpoint_best.pt`. Resume only with the exact
-same tier, phase, model contract, and recipe; the runner rejects mismatches.
-Each current checkpoint carries a canonical SHA-256 digest of that contract.
-Fine-tuning and downstream loading reject a missing, altered, or incompatible
-ImageNet contract before loading model tensors.
+same tier, phase, model contract, recipe, and resolved batching plan; the
+runner rejects mismatches, including a changed world size or accumulation
+factor. Each current checkpoint carries a canonical SHA-256 digest of that
+contract. This schedule change uses ImageNet checkpoint format 3, so older
+ImageNet runner checkpoints are intentionally not resumable. Fine-tuning and
+downstream loading continue to validate only the compatible model and operator
+contract before loading model tensors.
 
 The shared backbone boundary is intentionally narrow:
 

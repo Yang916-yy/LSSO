@@ -48,9 +48,18 @@ def _tiny_imagenet_checkpoint(source: LSSODeiT3) -> dict[str, object]:
             "implementation": "reference",
         },
         "train": {"recipe": "test"},
+        "batching": {
+            "world_size": 1,
+            "physical_batch_size": 1,
+            "effective_batch_size": 1,
+            "augmentation_group_size": 1,
+            "grad_accum": 1,
+            "samples_per_epoch": 1,
+            "updates_per_epoch": 1,
+        },
     }
     return {
-        "format_version": 2,
+        "format_version": 3,
         "contract": contract,
         "contract_digest": checkpoint_contract_digest(contract),
         "model": source.state_dict(),
