@@ -53,7 +53,7 @@ DEFAULT_CACHE_ROOT = ROOT / "data" / "sequence_cache"
 
 @dataclass(frozen=True)
 class TaskDefaults:
-    max_length: int
+    max_length: int | None
     epochs: int
     batch_size: int
     eval_batch_size: int
@@ -72,9 +72,12 @@ LRA_DEFAULTS = {
     "listops": TaskDefaults(2048, 40, 50, 50, 5e-4, 0.05, 8, 256, 2, 8, 32, 0.1, 0.01),
     "text": TaskDefaults(4096, 32, 32, 32, 5e-4, 0.05, 6, 256, 2, 8, 32, 0.1, 0.01),
     "retrieval": TaskDefaults(4000, 20, 64, 64, 5e-4, 0.05, 5, 256, 2, 8, 32, 0.1, 0.01),
-    "pathfinder": TaskDefaults(1024, 200, 64, 64, 2e-4, 0.05, 20, 256, 2, 8, 32, 0.1, 0.01),
+    "pathfinder": TaskDefaults(None, 200, 64, 64, 2e-4, 0.05, 20, 256, 2, 8, 32, 0.1, 0.01),
 }
 GENOMIC_DEFAULTS = TaskDefaults(0, 40, 128, 256, 3e-4, 0.05, 8, 128, 4, 4, 16, 0.1, 0.01)
+DEFAULT_PATHFINDER_RESOLUTION = 32
+DEFAULT_VALIDATION_FRACTION = 0.1
+DEFAULT_SPLIT_SEED = 2026
 
 
 class MaskedMultiheadAttention(nn.Module):
@@ -385,9 +388,9 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--data-revision")
-    parser.add_argument("--pathfinder-resolution", type=int, default=32)
-    parser.add_argument("--validation-fraction", type=float, default=0.1)
-    parser.add_argument("--split-seed", type=int, default=2026)
+    parser.add_argument("--pathfinder-resolution", type=int)
+    parser.add_argument("--validation-fraction", type=float)
+    parser.add_argument("--split-seed", type=int)
     parser.add_argument("--mixer", choices=("mha", "lsso"), default="lsso")
     parser.add_argument("--implementation", choices=("reference", "cuda"), default="cuda")
     parser.add_argument("--core-mode", choices=[mode.value for mode in CoreMode], default="dynamic")
@@ -455,6 +458,10 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         if args.task not in LRA_TASKS:
             raise ValueError(f"unsupported LRA task {args.task!r}")
         defaults = LRA_DEFAULTS[args.task]
+    pathfinder = args.suite == "lra" and args.task == "pathfinder"
+    uses_validation_split = args.suite == "genomic" or (
+        args.suite == "lra" and args.task == "text"
+    )
     for name in (
         "rank",
         "dim",
@@ -471,10 +478,49 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     ):
         if getattr(args, name) is None:
             setattr(args, name, getattr(defaults, name))
-    if args.max_length is None:
-        args.max_length = defaults.max_length
-    if args.suite == "lra" and args.max_length == 0:
-        args.max_length = defaults.max_length
+    if pathfinder:
+        if args.max_length is not None:
+            raise ValueError(
+                "--max-length is not supported for LRA Pathfinder; "
+                "use --pathfinder-resolution"
+            )
+        if args.pathfinder_resolution is None:
+            args.pathfinder_resolution = DEFAULT_PATHFINDER_RESOLUTION
+    else:
+        if args.pathfinder_resolution is not None:
+            raise ValueError("--pathfinder-resolution is only supported for LRA Pathfinder")
+        if args.max_length is None:
+            if defaults.max_length is None:
+                raise RuntimeError("task has no default max_length")
+            args.max_length = defaults.max_length
+        if args.suite == "lra" and args.max_length == 0:
+            if defaults.max_length is None:
+                raise RuntimeError("task has no default max_length")
+            args.max_length = defaults.max_length
+    if uses_validation_split:
+        if args.validation_fraction is None:
+            args.validation_fraction = DEFAULT_VALIDATION_FRACTION
+        if args.split_seed is None:
+            args.split_seed = DEFAULT_SPLIT_SEED
+    else:
+        if args.validation_fraction is not None:
+            if pathfinder:
+                raise ValueError(
+                    "--validation-fraction is not supported for LRA Pathfinder; "
+                    "it uses the official hard 80/10/10 split"
+                )
+            raise ValueError(
+                "--validation-fraction is only supported for GenomicBenchmarks and LRA Text"
+            )
+        if args.split_seed is not None:
+            if pathfinder:
+                raise ValueError(
+                    "--split-seed is not supported for LRA Pathfinder; "
+                    "it uses the official hard 80/10/10 split"
+                )
+            raise ValueError(
+                "--split-seed is only supported for GenomicBenchmarks and LRA Text"
+            )
     if args.early_stop_min_epochs < 0:
         args.early_stop_min_epochs = math.ceil(0.75 * args.epochs)
     if args.output is None:
@@ -498,8 +544,10 @@ def _validate_resolved_args(args: argparse.Namespace) -> None:
         raise ValueError("dropout must be in [0, 1)")
     if args.mlp_ratio <= 0.0:
         raise ValueError("mlp_ratio must be positive")
-    if not 0.0 < args.validation_fraction < 1.0:
+    if args.validation_fraction is not None and not 0.0 < args.validation_fraction < 1.0:
         raise ValueError("validation_fraction must be in (0, 1)")
+    if args.pathfinder_resolution is not None and args.pathfinder_resolution <= 0:
+        raise ValueError("pathfinder_resolution must be positive")
     if args.grad_accum <= 0:
         raise ValueError("grad_accum must be positive")
     if args.grad_clip < 0.0:
@@ -687,7 +735,7 @@ def _runtime_metadata(device: torch.device, *, cuda_enabled: bool) -> dict[str, 
             }
         )
     if cuda_enabled:
-        metadata["lsso_cuda_contract"] = 5
+        metadata["lsso_cuda_contract"] = cuda_backend._NATIVE_CONTRACT_VERSION
     return metadata
 
 
@@ -815,11 +863,13 @@ def _build_run_payload(
     cuda_enabled: bool,
 ) -> dict[str, Any]:
     parameters = sum(parameter.numel() for parameter in model.parameters())
+    inactive_data_arguments = _inactive_data_argument_names(args)
     return {
         "schema": 1,
         "resolved_arguments": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
+            if key not in inactive_data_arguments
         },
         "dataset": bundle.metadata,
         "data_contract": {
@@ -851,6 +901,21 @@ def _build_run_payload(
             "validation_only": args.validation_only,
         },
     }
+
+
+def _inactive_data_argument_names(args: argparse.Namespace) -> frozenset[str]:
+    pathfinder = args.suite == "lra" and args.task == "pathfinder"
+    uses_validation_split = args.suite == "genomic" or (
+        args.suite == "lra" and args.task == "text"
+    )
+    inactive = set()
+    if not pathfinder:
+        inactive.add("pathfinder_resolution")
+    else:
+        inactive.add("max_length")
+    if not uses_validation_split:
+        inactive.update(("validation_fraction", "split_seed"))
+    return frozenset(inactive)
 
 
 def train(
@@ -936,7 +1001,8 @@ def train(
             torch.cuda.reset_peak_memory_stats(device)
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        train_loss_sum, train_examples, accumulated_examples = 0.0, 0, 0
+        train_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        train_examples, accumulated_examples = 0, 0
         for batch_index, raw_batch in enumerate(train_loader):
             if config.max_train_batches and batch_index >= config.max_train_batches:
                 break
@@ -946,7 +1012,7 @@ def train(
                 logits = forward_batch(model, batch)
                 loss = F.cross_entropy(logits, batch["labels"])
             scaler.scale(loss * batch_size).backward()
-            train_loss_sum += float(loss.detach()) * batch_size
+            train_loss_sum.add_(loss.detach().to(dtype=torch.float64), alpha=batch_size)
             train_examples += batch_size
             accumulated_examples += batch_size
             last_batch = batch_index + 1 == batches_per_epoch
@@ -993,7 +1059,7 @@ def train(
         stale_epochs = 0 if accuracy_progress or loss_progress else stale_epochs + 1
         metrics = {
             "epoch": epoch,
-            "train_loss": train_loss_sum / max(train_examples, 1),
+            "train_loss": (train_loss_sum / max(train_examples, 1)).item(),
             "train_examples": train_examples,
             "val_loss": validation["loss"],
             "val_accuracy": validation["accuracy"],

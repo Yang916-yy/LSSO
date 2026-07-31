@@ -6,9 +6,10 @@ from pathlib import Path
 
 import torch
 import pytest
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, TensorDataset
 
 from experiments.sequence_data import (
+    DatasetBundle,
     NucleotideTokenizer,
     TokenVocabulary,
     build_packed_tokens,
@@ -24,6 +25,7 @@ from experiments.train_transformers import (
     SequenceEncoder,
     SequencePairClassifier,
     TrainingConfig,
+    _build_run_payload,
     _runtime_metadata,
     _is_better_validation_checkpoint,
     _makes_early_stop_progress,
@@ -73,7 +75,7 @@ def test_byte_vocabulary_preserves_utf8_bytes_and_eos() -> None:
 
 def test_cuda_runtime_metadata_records_the_current_native_contract() -> None:
     metadata = _runtime_metadata(torch.device("cpu"), cuda_enabled=True)
-    assert metadata["lsso_cuda_contract"] == 5
+    assert metadata["lsso_cuda_contract"] == cuda._NATIVE_CONTRACT_VERSION
 
 
 def test_nucleotide_tokenizer_does_not_confuse_unknown_with_padding() -> None:
@@ -309,9 +311,9 @@ def test_listops_cache_is_current_data_only(tmp_path) -> None:
         data_root=tmp_path,
         cache_root=tmp_path / "cache",
         max_length=16,
-        validation_fraction=0.1,
-        split_seed=1,
-        pathfinder_resolution=32,
+        validation_fraction=None,
+        split_seed=None,
+        pathfinder_resolution=None,
         allow_download=False,
         revision=None,
         formal=True,
@@ -365,9 +367,9 @@ def test_retrieval_pair_cache_preserves_independent_documents(tmp_path) -> None:
         data_root=tmp_path,
         cache_root=tmp_path / "cache",
         max_length=16,
-        validation_fraction=0.1,
-        split_seed=1,
-        pathfinder_resolution=32,
+        validation_fraction=None,
+        split_seed=None,
+        pathfinder_resolution=None,
         allow_download=False,
         revision=None,
     )
@@ -395,9 +397,9 @@ def test_pathfinder_bundle_uses_value_tokens_and_official_split(tmp_path) -> Non
         "pathfinder",
         data_root=tmp_path,
         cache_root=tmp_path / "cache",
-        max_length=4,
-        validation_fraction=0.1,
-        split_seed=1,
+        max_length=None,
+        validation_fraction=None,
+        split_seed=None,
         pathfinder_resolution=2,
         allow_download=False,
         revision=None,
@@ -414,8 +416,57 @@ def test_lra_defaults_preserve_the_requested_learning_rates_and_burn_in() -> Non
     listops = resolve_args(parse_args(["--suite", "lra", "--task", "listops"]))
     assert pathfinder.lr == 2e-4
     assert pathfinder.early_stop_min_epochs == 150
+    assert pathfinder.pathfinder_resolution == 32
+    assert pathfinder.max_length is None
+    assert pathfinder.validation_fraction is None
+    assert pathfinder.split_seed is None
     assert listops.lr == 5e-4
     assert listops.early_stop_min_epochs == 30
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    (
+        (("--max-length", "1024"), "--max-length is not supported for LRA Pathfinder"),
+        (
+            ("--validation-fraction", "0.2"),
+            "--validation-fraction is not supported for LRA Pathfinder",
+        ),
+        (("--split-seed", "7"), "--split-seed is not supported for LRA Pathfinder"),
+    ),
+)
+def test_pathfinder_rejects_inactive_data_options(
+    arguments: tuple[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        resolve_args(
+            parse_args(["--suite", "lra", "--task", "pathfinder", *arguments])
+        )
+
+
+def test_pathfinder_metadata_excludes_inactive_data_options() -> None:
+    args = resolve_args(parse_args(["--suite", "lra", "--task", "pathfinder"]))
+    dataset = TensorDataset(torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))
+    bundle = DatasetBundle(
+        train=dataset,
+        validation=dataset,
+        test=dataset,
+        input_kind="values",
+        num_classes=2,
+        max_length=32**2,
+        metadata={},
+    )
+    payload = _build_run_payload(
+        args,
+        bundle,
+        {"train": 1, "validation": 1, "test": 1},
+        torch.nn.Linear(1, 1),
+        torch.device("cpu"),
+        cuda_enabled=False,
+    )
+    resolved = payload["resolved_arguments"]
+    assert resolved["pathfinder_resolution"] == 32
+    assert {"max_length", "validation_fraction", "split_seed"}.isdisjoint(resolved)
 
 
 def test_formal_download_requires_an_immutable_revision() -> None:

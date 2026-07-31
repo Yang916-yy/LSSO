@@ -3,8 +3,6 @@ suite = "lra"
 task = "listops"
 data_root = "data/lra"
 cache_root = "data/sequence_cache"
-split_seed = 2026
-validation_fraction = 0.1
 
 [model]
 mixer = "lsso"

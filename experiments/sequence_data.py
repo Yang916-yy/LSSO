@@ -588,10 +588,10 @@ def prepare_lra(
     *,
     data_root: Path,
     cache_root: Path,
-    max_length: int,
-    validation_fraction: float,
-    split_seed: int,
-    pathfinder_resolution: int,
+    max_length: int | None,
+    validation_fraction: float | None,
+    split_seed: int | None,
+    pathfinder_resolution: int | None,
     allow_download: bool,
     revision: str | None,
     formal: bool = False,
@@ -600,7 +600,28 @@ def prepare_lra(
 
     if task not in LRA_TASKS:
         raise ValueError(f"unsupported LRA task: {task}")
+    if task == "pathfinder":
+        if max_length is not None:
+            raise ValueError("Pathfinder derives max_length from its resolution")
+        if validation_fraction is not None or split_seed is not None:
+            raise ValueError("Pathfinder uses the official hard 80/10/10 split")
+        if pathfinder_resolution is None or pathfinder_resolution <= 0:
+            raise ValueError("Pathfinder requires a positive resolution")
+        return _prepare_lra_pathfinder(
+            data_root=data_root,
+            resolution=pathfinder_resolution,
+            formal=formal,
+        )
+    if pathfinder_resolution is not None:
+        raise ValueError("pathfinder_resolution is only valid for Pathfinder")
+    if max_length is None:
+        raise ValueError(f"LRA {task} requires max_length")
     _require_positive_length(max_length)
+    if task == "text":
+        if validation_fraction is None or split_seed is None:
+            raise ValueError("LRA Text requires validation_fraction and split_seed")
+    elif validation_fraction is not None or split_seed is not None:
+        raise ValueError(f"LRA {task} uses its official validation split")
     if task == "listops":
         files = _resolve_listops_files(data_root)
         source = {
@@ -673,11 +694,7 @@ def prepare_lra(
             max_length=max_length,
             formal=formal,
         )
-    return _prepare_lra_pathfinder(
-        data_root=data_root,
-        resolution=pathfinder_resolution,
-        formal=formal,
-    )
+    raise AssertionError(f"unhandled LRA task: {task}")
 
 
 def stratified_split_indices(
