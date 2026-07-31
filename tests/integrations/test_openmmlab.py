@@ -12,6 +12,14 @@ pytest.importorskip("timm")
 import integrations.openmmlab as openmmlab
 from experiments.imagenet import (
     IMAGENET_CHECKPOINT_FORMAT,
+    IMAGENET_TRAIN_SAMPLES,
+    IMAGENET_TRAIN_SHARDS,
+    IMAGENET_VALIDATION_SAMPLES,
+    IMAGENET_VALIDATION_SHARDS,
+    IMAGENET_WDS_MANIFEST_SHA256,
+    IMAGENET_WDS_SOURCE,
+    WDS_SAMPLE_SHUFFLE_INITIAL,
+    WDS_SAMPLE_SHUFFLE_SIZE,
     checkpoint_contract_digest,
     interpolate_position_embedding,
 )
@@ -56,6 +64,29 @@ def _tiny_imagenet_checkpoint(
             "implementation": "reference",
         },
         "train": {"recipe": "test"},
+        "data": {
+            "format": "webdataset-v1",
+            "source": IMAGENET_WDS_SOURCE,
+            "manifest_sha256": IMAGENET_WDS_MANIFEST_SHA256,
+            "train": {
+                "samples": IMAGENET_TRAIN_SAMPLES,
+                "shards": IMAGENET_TRAIN_SHARDS,
+            },
+            "validation": {
+                "samples": IMAGENET_VALIDATION_SAMPLES,
+                "shards": IMAGENET_VALIDATION_SHARDS,
+            },
+            "streaming": {
+                "shard_order": "global-epoch-permutation-then-rank-stride-worker-quota",
+                "sample_shuffle": {
+                    "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
+                    "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
+                },
+                "source_views": 3,
+                "repeated_augmentation_placement": "rank-local-stream",
+                "validation_partition": "worker-stride-full-per-rank",
+            },
+        },
         "batching": {
             "world_size": 1,
             "physical_batch_size": 1,

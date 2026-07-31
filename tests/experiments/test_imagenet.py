@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import io
+import json
 import random
 import sys
 import runpy
-from collections import Counter
+import tarfile
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType
@@ -20,7 +22,6 @@ from experiments.imagenet import (
     DistributedState,
     ImageNetRun,
     LoaderRandomGenerators,
-    VirtualGroupSampler,
     _atomic_torch_save,
     _capture_resume_rng_state,
     _checkpoint,
@@ -92,6 +93,111 @@ def _checkpoint_batching_plan() -> BatchingPlan:
         samples_per_epoch=1_280_000,
         updates_per_epoch=625,
     )
+
+
+def _data_contract(*, source_views: int = 3) -> dict[str, object]:
+    return {
+        "format": "webdataset-v1",
+        "source": imagenet.IMAGENET_WDS_SOURCE,
+        "manifest_sha256": imagenet.IMAGENET_WDS_MANIFEST_SHA256,
+        "train": {
+            "samples": imagenet.IMAGENET_TRAIN_SAMPLES,
+            "shards": imagenet.IMAGENET_TRAIN_SHARDS,
+        },
+        "validation": {
+            "samples": imagenet.IMAGENET_VALIDATION_SAMPLES,
+            "shards": imagenet.IMAGENET_VALIDATION_SHARDS,
+        },
+        "streaming": {
+            "shard_order": "global-epoch-permutation-then-rank-stride-worker-quota",
+            "sample_shuffle": {
+                "buffer_size": imagenet.WDS_SAMPLE_SHUFFLE_SIZE,
+                "initial_size": imagenet.WDS_SAMPLE_SHUFFLE_INITIAL,
+            },
+            "source_views": source_views,
+            "repeated_augmentation_placement": "rank-local-stream",
+            "validation_partition": "worker-stride-full-per-rank",
+        },
+    }
+
+
+def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
+    from PIL import Image
+
+    image = Image.new("RGB", (8, 8), color)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _pixel_code_transform(image: object) -> torch.Tensor:
+    pixel = image.getpixel((0, 0))  # type: ignore[union-attr]
+    return torch.tensor(pixel, dtype=torch.int64)
+
+
+def _write_webdataset_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    train_shards: int = 2,
+    validation_shards: int = 2,
+    samples_per_shard: int = 4,
+) -> Path:
+    root = tmp_path / "imagenet-wds"
+    root.mkdir()
+    monkeypatch.setattr(imagenet, "IMAGENET_TRAIN_SHARDS", train_shards)
+    monkeypatch.setattr(imagenet, "IMAGENET_VALIDATION_SHARDS", validation_shards)
+    monkeypatch.setattr(
+        imagenet,
+        "IMAGENET_TRAIN_SAMPLES",
+        train_shards * samples_per_shard,
+    )
+    monkeypatch.setattr(
+        imagenet,
+        "IMAGENET_VALIDATION_SAMPLES",
+        validation_shards * samples_per_shard,
+    )
+
+    splits: dict[str, dict[str, object]] = {}
+    for split, shard_count, width in (
+        ("train", train_shards, 4),
+        ("validation", validation_shards, 2),
+    ):
+        filenames = [
+            f"imagenet1k-{split}-{index:0{width}d}.tar"
+            for index in range(shard_count)
+        ]
+        for shard_index, filename in enumerate(filenames):
+            with tarfile.open(root / filename, "w") as archive:
+                for sample_index in range(samples_per_shard):
+                    key = f"{split}-{shard_index:02d}-{sample_index:02d}"
+                    image_bytes = _jpeg_bytes(
+                        (shard_index * 40, sample_index * 40, 17)
+                    )
+                    label = (shard_index + sample_index) % 3
+                    for suffix, value in (
+                        ("jpg", image_bytes),
+                        ("cls", str(label).encode("ascii")),
+                        ("json", json.dumps({"label": label}).encode("utf-8")),
+                    ):
+                        member = tarfile.TarInfo(f"{key}.{suffix}")
+                        member.size = len(value)
+                        archive.addfile(member, io.BytesIO(value))
+        splits[split] = {
+            "name": split,
+            "filenames": filenames,
+            "shard_lengths": [samples_per_shard] * shard_count,
+            "num_samples": shard_count * samples_per_shard,
+        }
+    manifest = {"name": "imagenet1k", "splits": splits}
+    raw_manifest = json.dumps(manifest, indent=2).encode("utf-8")
+    (root / "_info.json").write_bytes(raw_manifest)
+    monkeypatch.setattr(
+        imagenet,
+        "IMAGENET_WDS_MANIFEST_SHA256",
+        imagenet.hashlib.sha256(raw_manifest).hexdigest(),
+    )
+    return root
 
 
 def _loader_generators(seed: int = 0) -> LoaderRandomGenerators:
@@ -167,62 +273,313 @@ def test_worker_counts_are_independently_overridable(tmp_path: Path) -> None:
     assert {"train_workers", "val_workers"}.issubset(run.overrides)
 
 
-def test_loaders_recreate_workers_and_keep_independent_generators(
+def test_webdataset_manifest_requires_the_pinned_layout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    datasets = pytest.importorskip("torchvision.datasets")
+    root = _write_webdataset_root(tmp_path, monkeypatch)
+    manifest = imagenet.load_imagenet_webdataset_manifest(root)
+    assert manifest.train.contract() == {"samples": 8, "shards": 2}
+    assert manifest.validation.contract() == {"samples": 8, "shards": 2}
+    assert manifest.train.paths[0].name == "imagenet1k-train-0000.tar"
+    assert manifest.validation.paths[-1].name == "imagenet1k-validation-01.tar"
+    imagenet.verify_imagenet_webdataset_payloads(manifest)
 
-    class FakeImageFolder:
-        def __init__(self, _root: Path, *, transform: object) -> None:
-            self.transform = transform
-            self.classes = tuple(f"class_{index}" for index in range(1000))
-            self.class_to_idx = {
-                name: index for index, name in enumerate(self.classes)
-            }
+    invalid = root / "imagenet1k-train-0001.tar"
+    invalid.write_bytes(b"not a tar archive")
+    with pytest.raises(ValueError, match="not a readable tar archive"):
+        imagenet.verify_imagenet_webdataset_payloads(manifest)
 
-        def __len__(self) -> int:
-            return 2048
+    invalid.unlink()
+    with pytest.raises(FileNotFoundError, match="missing non-empty shards"):
+        imagenet.load_imagenet_webdataset_manifest(root)
 
-        def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-            return torch.zeros(3, 4, 4), index % 1000
 
-    data_root = tmp_path / "imagenet"
-    (data_root / "train").mkdir(parents=True)
-    (data_root / "val").mkdir()
-    monkeypatch.setattr(datasets, "ImageFolder", FakeImageFolder)
-    monkeypatch.setattr(imagenet, "build_train_transform", lambda _run: None)
-    monkeypatch.setattr(imagenet, "build_eval_transform", lambda _run: None)
+def test_webdataset_train_repeats_undecoded_groups_and_replays_an_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("webdataset")
+    root = _write_webdataset_root(tmp_path, monkeypatch)
+    manifest = imagenet.load_imagenet_webdataset_manifest(root)
+    calls: list[int] = []
 
-    train_loader, val_loader, _, _, generators = build_loaders(
-        load_run(_args(tmp_path, "--train-workers", "2", "--val-workers", "1")),
-        data_root,
+    def counting_transform(_image: object) -> torch.Tensor:
+        calls.append(len(calls))
+        return torch.tensor([calls[-1]], dtype=torch.int64)
+
+    dataset = imagenet._ImageNetWebDataset(
+        manifest.train,
+        transform=counting_transform,
+        state=_cpu_state(),
+        seed=17,
+        num_classes=3,
+        training=True,
+        augmentation_group_size=2,
+        source_views=3,
+        physical_batch_size=4,
+        microbatches_per_epoch=2,
+        worker_count=1,
+    )
+    dataset.set_epoch(4)
+    batch = next(iter(DataLoader(dataset, batch_size=4, num_workers=0, drop_last=True)))
+    assert batch[1][:2].tolist() == batch[1][2:].tolist()
+    assert batch[0][:, 0].tolist() == [0, 1, 2, 3]
+
+    def stable_transform(image: object) -> torch.Tensor:
+        return torch.tensor(image.getpixel((0, 0)), dtype=torch.int64)  # type: ignore[union-attr]
+
+    replayable = imagenet._ImageNetWebDataset(
+        manifest.train,
+        transform=stable_transform,
+        state=_cpu_state(),
+        seed=17,
+        num_classes=3,
+        training=True,
+        augmentation_group_size=2,
+        source_views=3,
+        physical_batch_size=4,
+        microbatches_per_epoch=2,
+        worker_count=1,
+    )
+    replayable.set_epoch(7)
+    first = next(iter(DataLoader(replayable, batch_size=4, num_workers=0, drop_last=True)))
+    replayable.set_epoch(7)
+    second = next(iter(DataLoader(replayable, batch_size=4, num_workers=0, drop_last=True)))
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
+
+
+def test_webdataset_rank_partition_and_validation_are_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("webdataset")
+    root = _write_webdataset_root(tmp_path, monkeypatch, train_shards=4)
+    manifest = imagenet.load_imagenet_webdataset_manifest(root)
+    rank_zero = imagenet._ImageNetWebDataset(
+        manifest.train,
+        transform=lambda _image: torch.zeros(1),
+        state=_cpu_state(world_size=2, rank=0),
+        seed=3,
+        num_classes=3,
+        training=True,
+        augmentation_group_size=2,
+        source_views=1,
+        physical_batch_size=2,
+        microbatches_per_epoch=2,
+        worker_count=2,
+    )
+    rank_one = imagenet._ImageNetWebDataset(
+        manifest.train,
+        transform=lambda _image: torch.zeros(1),
+        state=_cpu_state(world_size=2, rank=1),
+        seed=3,
+        num_classes=3,
+        training=True,
+        augmentation_group_size=2,
+        source_views=1,
+        physical_batch_size=2,
+        microbatches_per_epoch=2,
+        worker_count=2,
+    )
+    zero_shards = rank_zero._rank_shards(epoch=2)
+    one_shards = rank_one._rank_shards(epoch=2)
+    assert {path for path, _ in zero_shards}.isdisjoint(
+        {path for path, _ in one_shards}
+    )
+    assert {path for path, _ in zero_shards} | {
+        path for path, _ in one_shards
+    } == set(manifest.train.paths)
+    worker_zero = rank_zero._training_slices(
+        worker_id=0,
+        worker_count=2,
+        epoch=2,
+    )
+    worker_one = rank_zero._training_slices(
+        worker_id=1,
+        worker_count=2,
+        epoch=2,
+    )
+    worker_zero_records = {
+        (slice_.path, index)
+        for slice_ in worker_zero
+        for index in range(slice_.start, slice_.start + slice_.count)
+    }
+    worker_one_records = {
+        (slice_.path, index)
+        for slice_ in worker_one
+        for index in range(slice_.start, slice_.start + slice_.count)
+    }
+    assert worker_zero_records.isdisjoint(worker_one_records)
+    assert len(worker_zero_records | worker_one_records) == 4
+
+    transform = lambda _image: torch.ones(1)
+    validation_zero = imagenet._ImageNetWebDataset(
+        manifest.validation,
+        transform=transform,
+        state=_cpu_state(world_size=2, rank=0),
+        seed=3,
+        num_classes=3,
+        training=False,
+    )
+    validation_one = imagenet._ImageNetWebDataset(
+        manifest.validation,
+        transform=transform,
+        state=_cpu_state(world_size=2, rank=1),
+        seed=3,
+        num_classes=3,
+        training=False,
+    )
+    labels_zero = [label for _, label in validation_zero]
+    labels_one = [label for _, label in validation_one]
+    assert labels_zero == labels_one
+    assert len(labels_zero) == manifest.validation.num_samples
+
+
+def test_webdataset_multiple_workers_preserve_repeat_groups_and_replay_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("webdataset")
+    root = _write_webdataset_root(tmp_path, monkeypatch, train_shards=4)
+    manifest = imagenet.load_imagenet_webdataset_manifest(root)
+    dataset = imagenet._ImageNetWebDataset(
+        manifest.train,
+        transform=_pixel_code_transform,
+        state=_cpu_state(),
+        seed=29,
+        num_classes=3,
+        training=True,
+        augmentation_group_size=2,
+        source_views=3,
+        physical_batch_size=4,
+        microbatches_per_epoch=12,
+        worker_count=2,
+    )
+
+    def collect() -> list[torch.Tensor]:
+        loader = DataLoader(
+            dataset,
+            batch_size=4,
+            drop_last=True,
+            num_workers=2,
+            persistent_workers=False,
+            prefetch_factor=1,
+        )
+        return [images.clone() for _, (images, _targets) in zip(range(12), loader)]
+
+    dataset.set_epoch(5)
+    first = collect()
+    dataset.set_epoch(5)
+    second = collect()
+    assert len(first) == 12
+    assert all(torch.equal(left, right) for left, right in zip(first, second, strict=True))
+
+    source_groups = [
+        tuple(tuple(pixel.tolist()) for pixel in images[offset : offset + 2])
+        for images in first
+        for offset in range(0, images.shape[0], 2)
+    ]
+    assert all(len(group) == 2 for group in source_groups)
+    assert all(source_groups.count(group) == 3 for group in source_groups)
+
+
+def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("webdataset")
+    root = _write_webdataset_root(
+        tmp_path,
+        monkeypatch,
+        train_shards=3,
+        samples_per_shard=4,
+    )
+    manifest = imagenet.load_imagenet_webdataset_manifest(root)
+    dataset = imagenet._ImageNetWebDataset(
+        manifest.train,
+        transform=_pixel_code_transform,
+        state=_cpu_state(),
+        seed=41,
+        num_classes=3,
+        training=True,
+        augmentation_group_size=2,
+        source_views=1,
+        physical_batch_size=4,
+        microbatches_per_epoch=3,
+        worker_count=2,
+    )
+    dataset.set_epoch(0)
+    loader = DataLoader(
+        dataset,
+        batch_size=4,
+        drop_last=True,
+        num_workers=2,
+        persistent_workers=False,
+        prefetch_factor=1,
+    )
+    images = torch.cat([batch for batch, _ in loader])
+    assert images.shape[0] == 12
+    assert torch.unique(images, dim=0).shape[0] == 12
+
+    short = imagenet._ImageNetWebDataset(
+        manifest.train,
+        transform=_pixel_code_transform,
+        state=_cpu_state(),
+        seed=41,
+        num_classes=3,
+        training=True,
+        augmentation_group_size=2,
+        source_views=1,
+        physical_batch_size=4,
+        microbatches_per_epoch=4,
+        worker_count=1,
+    )
+    with pytest.raises(RuntimeError, match="cannot cover the planned epoch"):
+        next(iter(DataLoader(short, batch_size=4, num_workers=0, drop_last=True)))
+
+
+def test_webdataset_loaders_recreate_workers_and_keep_independent_generators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("webdataset")
+    root = _write_webdataset_root(tmp_path, monkeypatch)
+    plan = BatchingPlan(
+        world_size=1,
+        physical_batch_size=4,
+        effective_batch_size=8,
+        augmentation_group_size=2,
+        grad_accum=2,
+        samples_per_epoch=8,
+        updates_per_epoch=1,
+    )
+    monkeypatch.setattr(imagenet, "resolve_batching_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(
+        imagenet,
+        "build_train_transform",
+        lambda _run: lambda _image: torch.zeros(3, 4, 4),
+    )
+    monkeypatch.setattr(
+        imagenet,
+        "build_eval_transform",
+        lambda _run: lambda _image: torch.zeros(3, 4, 4),
+    )
+    train_loader, val_loader, train_dataset, received_plan, generators, data = build_loaders(
+        load_run(_args(tmp_path, "--train-workers", "0", "--val-workers", "0")),
+        root,
         _cpu_state(),
         requested_grad_accum=None,
     )
+    assert received_plan is plan
     assert not train_loader.persistent_workers
     assert not val_loader.persistent_workers
     assert train_loader.generator is generators.train
     assert val_loader.generator is generators.validation
     assert not torch.equal(generators.train.get_state(), generators.validation.get_state())
-
-
-def test_imagenet_class_mapping_requires_identical_labels() -> None:
-    imagenet._validate_imagefolder_classes(
-        ("n014", "n015"),
-        {"n014": 0, "n015": 1},
-        ("n014", "n015"),
-        {"n014": 0, "n015": 1},
-        expected_classes=2,
-    )
-    with pytest.raises(ValueError, match="class mappings"):
-        imagenet._validate_imagefolder_classes(
-            ("n014", "n015"),
-            {"n014": 0, "n015": 1},
-            ("n014", "n016"),
-            {"n014": 0, "n016": 1},
-            expected_classes=2,
-        )
+    assert train_dataset.training
+    assert data["streaming"]["source_views"] == 3
 
 
 def test_source_revision_records_a_dirty_worktree(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -366,44 +723,18 @@ def test_batching_plan_rejects_non_equivalent_physical_schedules(tmp_path: Path)
         )
 
 
-def test_virtual_group_sampler_replays_whole_groups_without_duplicates() -> None:
-    dataset = TensorDataset(torch.arange(48))
-    sampler = VirtualGroupSampler(
-        dataset,
-        num_replicas=2,
-        rank=0,
-        samples_per_rank=12,
-        group_size=4,
-        num_repeats=3,
-    )
-    sampler.set_epoch(7)
-    first = list(sampler)
-    sampler.set_epoch(7)
-    assert first == list(sampler)
-    assert len(first) == 12
+def test_webdataset_contract_rejects_a_changed_manifest_or_streaming_policy() -> None:
+    data = _data_contract()
+    imagenet._validate_webdataset_contract(data)
+    changed_manifest = copy.deepcopy(data)
+    changed_manifest["manifest_sha256"] = "x" * 64
+    with pytest.raises(ValueError, match="manifest digest"):
+        imagenet._validate_webdataset_contract(changed_manifest)
 
-    peer = VirtualGroupSampler(
-        dataset,
-        num_replicas=2,
-        rank=1,
-        samples_per_rank=12,
-        group_size=4,
-        num_repeats=3,
-    )
-    peer.set_epoch(7)
-    local_groups = [tuple(first[offset : offset + 4]) for offset in range(0, 12, 4)]
-    peer_values = list(peer)
-    peer_groups = [
-        tuple(peer_values[offset : offset + 4]) for offset in range(0, 12, 4)
-    ]
-    assert all(len(set(group)) == 4 for group in (*local_groups, *peer_groups))
-
-    global_groups = [
-        group
-        for rank_groups in zip(local_groups, peer_groups, strict=True)
-        for group in rank_groups
-    ]
-    assert sorted(Counter(global_groups).values()) == [3, 3]
+    changed_streaming = copy.deepcopy(data)
+    changed_streaming["streaming"]["source_views"] = 2
+    with pytest.raises(ValueError, match="source view"):
+        imagenet._validate_webdataset_contract(changed_streaming)
 
 
 def test_finetune_position_interpolation_keeps_a_no_cls_patch_table() -> None:
@@ -429,10 +760,10 @@ def test_finetune_loader_interpolates_the_shared_encoder_position_key(tmp_path: 
     target = Model(16)
     checkpoint = tmp_path / "pretrain.pt"
     run = load_run(_args(tmp_path))
-    contract = run.checkpoint_contract(_checkpoint_batching_plan())
+    contract = run.checkpoint_contract(_checkpoint_batching_plan(), _data_contract())
     torch.save(
         {
-            "format_version": 4,
+            "format_version": imagenet.IMAGENET_CHECKPOINT_FORMAT,
             "contract": contract,
             "contract_digest": checkpoint_contract_digest(contract),
             "model": source.state_dict(),
@@ -492,8 +823,14 @@ def test_explicit_lamb_fallback_permission_is_never_canonical(tmp_path: Path) ->
         resolved_optimizer="apex.fused_lamb",
         allow_lamb_fallback=False,
     ) == "deit3-derived"
-    assert run.checkpoint_contract_digest(_checkpoint_batching_plan()) != (
-        large_physical_run.checkpoint_contract_digest(large_physical_plan)
+    assert run.checkpoint_contract_digest(
+        _checkpoint_batching_plan(),
+        _data_contract(),
+    ) != (
+        large_physical_run.checkpoint_contract_digest(
+            large_physical_plan,
+            _data_contract(),
+        )
     )
 
 
@@ -655,6 +992,7 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
         scaler=source_scaler,
         run=run,
         batching_plan=batching_plan,
+        data_contract=_data_contract(),
         best_acc1=73.5,
         rng=_capture_resume_rng_state(_cpu_state(), source_generators),
     )
@@ -676,6 +1014,7 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
         scaler=target_scaler,
         run=run,
         batching_plan=batching_plan,
+        data_contract=_data_contract(),
         state=_cpu_state(),
         generators=target_generators,
     )
@@ -714,6 +1053,24 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
             scaler=target_scaler,
             run=run,
             batching_plan=changed_physical_plan,
+            data_contract=_data_contract(),
+            state=_cpu_state(),
+            generators=target_generators,
+        )
+
+    changed_data = _data_contract()
+    changed_data["manifest_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="does not match"):
+        _load_resume(
+            path,
+            model=target,
+            ema=target_ema,
+            optimizer=target_optimizer,
+            scheduler=target_scheduler,
+            scaler=target_scaler,
+            run=run,
+            batching_plan=batching_plan,
+            data_contract=changed_data,
             state=_cpu_state(),
             generators=target_generators,
         )
@@ -804,6 +1161,7 @@ def test_resume_rejects_missing_rng_before_loading_model(tmp_path: Path) -> None
         scaler=source_scaler,
         run=run,
         batching_plan=batching_plan,
+        data_contract=_data_contract(),
         best_acc1=0.0,
         rng=_capture_resume_rng_state(_cpu_state(), _loader_generators(131)),
     )
@@ -827,6 +1185,7 @@ def test_resume_rejects_missing_rng_before_loading_model(tmp_path: Path) -> None
             scaler=target_scaler,
             run=run,
             batching_plan=batching_plan,
+            data_contract=_data_contract(),
             state=_cpu_state(),
             generators=_loader_generators(137),
         )

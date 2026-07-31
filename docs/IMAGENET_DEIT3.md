@@ -3,7 +3,16 @@
 `experiments/train_imagenet.py` launches the shared `experiments/imagenet.py`
 workflow, which implements the ImageNet-1K recipes from the
 [official DeiT III repository at commit 7e160fe43f0252d17191b71cbb5826254114ea5b](https://github.com/facebookresearch/deit/blob/7e160fe43f0252d17191b71cbb5826254114ea5b/README_revenge.md).
-The ImageNet root must be an `ImageFolder` tree with `train/` and `val/`.
+The only supported data contract is the authenticated ModelScope
+[`timm/imagenet-1k-wds`](https://modelscope.cn/datasets/timm/imagenet-1k-wds)
+release. `--data-root` must contain its `_info.json`, 1,024 training tar
+shards, and 64 validation tar shards; no ImageFolder extraction is used. The
+runner pins the currently verified `_info.json` SHA-256, rejects a partial or
+different layout, and has rank zero scan tar headers for exactly one
+`.jpg`/`.cls`/`.json` record triple per manifest sample before training begins.
+This structural preflight is not a payload checksum: JPEG decoding and label
+range checks remain in the streaming reader. ModelScope access requires
+accepting ImageNet's research/education terms.
 For a single-node notebook workflow that validates the environment, installs
 the pinned native runtime, launches a run, and exposes a refreshable monitor,
 see [`notebooks/imagenet_launcher.ipynb`](../notebooks/imagenet_launcher.ipynb).
@@ -26,12 +35,25 @@ Each physical batch is split into independent batch-mode Mixup/CutMix groups,
 and repeated augmentation replays whole source groups, so no group contains two
 views of the same image. Epochs are truncated to whole effective-batch updates.
 
-Data loading uses independent per-rank `train_workers` and `val_workers`
-settings. The defaults are 10 train workers and 4 validation workers; override
-them with `--train-workers` and `--val-workers`. Workers are recreated at each
-epoch boundary so their transform RNG can be replayed after an exact resume;
-budget up to `world_size * (train_workers + val_workers)` CPU processes while
-either loader is active.
+Training shards are globally permuted from the fixed run seed at each epoch,
+then each rank assigns a finite, unique source-record quota to every worker.
+Workers use a bounded 1,024-sample WebDataset shuffle buffer and never cycle a
+shard within an epoch; their quotas align with virtual Mixup-group boundaries.
+Repeated augmentation buffers a source group before image decoding and reruns
+its stochastic transform per retained view. The fixed update schedule can
+truncate only the final rank-local group at a physical-batch boundary. Views
+are deliberately local to the streaming rank; this preserves batch-mode Mixup
+boundaries and the fixed update schedule, but is not an index-identical replay
+of the retired ImageFolder sampler's cross-rank view placement. This behavior
+is recorded in each checkpoint's data contract.
+
+Validation retains the public DeiT behavior: every rank reads the complete
+50,000-example validation split and reductions preserve the metric. Only its
+workers are strided over the 64 validation shards. `train_workers` and
+`val_workers` are independent per-rank settings (defaults: 10 and 4), and
+workers are recreated at each epoch boundary so transform RNG can replay after
+an exact resume. The streaming readers use one prefetched physical batch per
+worker to bound host memory.
 
 | Phase | Effective global batch | Virtual Mixup group | Updates per ImageNet-1K epoch |
 | --- | ---: | ---: | ---: |
@@ -47,11 +69,11 @@ S/B pretraining or 128 for L pretraining:
 
 ```bash
 torchrun --standalone --nproc_per_node=1 experiments/train_imagenet.py \
-  --tier small --phase pretrain --data-root /datasets/imagenet \
+  --tier small --phase pretrain --data-root /datasets/imagenet-1k-wds \
   --output runs/imagenet/deit3_small_h100 --batch-size 512
 
 torchrun --standalone --nproc_per_node=1 experiments/train_imagenet.py \
-  --tier large --phase pretrain --data-root /datasets/imagenet \
+  --tier large --phase pretrain --data-root /datasets/imagenet-1k-wds \
   --output runs/imagenet/deit3_large_h100 --batch-size 128
 ```
 
@@ -63,24 +85,32 @@ The model geometry is:
 | B | 768 | 12 | 12 | 48 | 192 |
 | L | 1024 | 24 | 16 | 64 | 192 |
 
-Install `timm`, `torchvision`, and Apex with FusedLAMB in the experiment
+Install `timm`, `torchvision`, `webdataset`, and Apex with FusedLAMB in the experiment
 environment. The launcher fails rather than silently changing the published
 optimizer. `--allow-lamb-fallback` is available only for explicitly marked
 non-fused diagnostic runs.
 
 ```bash
+python -m pip install -e '.[vision]'
+python -m pip install modelscope
+modelscope login
+modelscope download timm/imagenet-1k-wds --repo-type dataset \
+  --local-dir /datasets/imagenet-1k-wds
+```
+
+```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_imagenet.py \
-  --tier small --phase pretrain --data-root /datasets/imagenet \
+  --tier small --phase pretrain --data-root /datasets/imagenet-1k-wds \
   --output runs/imagenet/deit3_small
 ```
 
 ```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_imagenet.py \
-  --tier base --phase pretrain --data-root /datasets/imagenet \
+  --tier base --phase pretrain --data-root /datasets/imagenet-1k-wds \
   --output runs/imagenet/deit3_base_192
 
 torchrun --standalone --nproc_per_node=8 experiments/train_imagenet.py \
-  --tier base --phase finetune_224 --data-root /datasets/imagenet \
+  --tier base --phase finetune_224 --data-root /datasets/imagenet-1k-wds \
   --init-checkpoint runs/imagenet/deit3_base_192/checkpoint_best.pt \
   --output runs/imagenet/deit3_base_224
 ```
@@ -92,25 +122,27 @@ each node, set the usual `torchrun` rendezvous arguments explicitly:
 torchrun --nnodes=4 --node_rank="$NODE_RANK" --nproc_per_node=8 \
   --master_addr="$MASTER_ADDR" --master_port=29500 \
   experiments/train_imagenet.py --tier large --phase pretrain \
-  --data-root /datasets/imagenet --output runs/imagenet/deit3_large_192
+  --data-root /datasets/imagenet-1k-wds --output runs/imagenet/deit3_large_192
 ```
 
 Every output directory contains `metadata.json`, append-only `metrics.jsonl`,
 `checkpoint_last.pt`, and `checkpoint_best.pt`. Checkpoints are written through
 a same-directory temporary file, `fsync`, and atomic replace, so a preemption
 cannot replace a complete checkpoint with a partial one. Resume only with the
-same tier, phase, model contract, recipe, resolved batching plan, device type,
-and world size; the runner rejects mismatches, including a changed accumulation
-factor. At each saved epoch boundary it records every rank's Python, NumPy,
+same tier, phase, model contract, recipe, WebDataset manifest and streaming
+contract, resolved batching plan, device type, and world size; the runner
+rejects mismatches, including a changed accumulation factor. At each saved epoch
+boundary it records every rank's Python, NumPy,
 Torch CPU/CUDA, and train/validation worker-generator states. Workers are
 recreated at epoch boundaries, so this replays the next epoch's augmentation
 and data-loader random streams in the same environment. It does not promise
 bitwise identity across changed GPU, CUDA, PyTorch, or kernel environments.
 Each current checkpoint carries a canonical SHA-256 digest of its contract.
-This schedule change uses ImageNet checkpoint format 4, so older ImageNet
+This streaming data contract uses ImageNet checkpoint format 5, so older ImageNet
 runner checkpoints are intentionally not resumable. Fine-tuning and downstream
-loading continue to validate only the compatible model and operator contract
-before loading model tensors. `metadata.json` also records the source commit
+loading validate the current checkpoint envelope, then compare only the
+compatible model and operator contract before loading model tensors.
+`metadata.json` also records the source commit
 and whether the worktree was dirty before the output directory was created; a
 dirty marker does not identify the uncommitted patch.
 

@@ -11,11 +11,14 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import io
+import itertools
 import json
 import math
 import os
 import random
 import subprocess
+import tarfile
 import tempfile
 import time
 import tomllib
@@ -30,7 +33,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as functional
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +44,17 @@ OFFICIAL_DEIT3_URL = (
     "https://github.com/facebookresearch/deit/blob/"
     "7e160fe43f0252d17191b71cbb5826254114ea5b/README_revenge.md"
 )
-IMAGENET_CHECKPOINT_FORMAT = 4
+IMAGENET_CHECKPOINT_FORMAT = 5
+IMAGENET_WDS_SOURCE = "timm/imagenet-1k-wds"
+IMAGENET_WDS_MANIFEST_SHA256 = (
+    "092ba12f49692720b20ebcf241e416ceab77d6f079b382d5c1bb3e1227e9834f"
+)
+IMAGENET_TRAIN_SAMPLES = 1_281_167
+IMAGENET_VALIDATION_SAMPLES = 50_000
+IMAGENET_TRAIN_SHARDS = 1_024
+IMAGENET_VALIDATION_SHARDS = 64
+WDS_SAMPLE_SHUFFLE_SIZE = 1_024
+WDS_SAMPLE_SHUFFLE_INITIAL = 256
 
 
 def checkpoint_contract_digest(contract: Mapping[str, Any]) -> str:
@@ -68,10 +81,11 @@ def validate_checkpoint_contract(checkpoint: Mapping[str, Any]) -> dict[str, Any
     contract = checkpoint.get("contract")
     if not isinstance(contract, dict) or not all(
         key in contract
-        for key in ("tier", "phase", "model", "operator", "train", "batching")
+        for key in ("tier", "phase", "model", "operator", "train", "batching", "data")
     ):
         raise ValueError("checkpoint is missing its complete ImageNet contract")
     _validate_batching_contract(contract["batching"])
+    _validate_webdataset_contract(contract["data"])
     digest = checkpoint.get("contract_digest")
     expected = checkpoint_contract_digest(contract)
     if not isinstance(digest, str) or digest != expected:
@@ -149,21 +163,36 @@ class ImageNetRun:
     train: dict[str, Any]
     overrides: tuple[str, ...]
 
-    def checkpoint_contract(self, batching_plan: BatchingPlan) -> dict[str, Any]:
+    def checkpoint_contract(
+        self,
+        batching_plan: BatchingPlan,
+        data_contract: Mapping[str, Any],
+    ) -> dict[str, Any]:
         contract: dict[str, Any] = {
             "tier": self.tier,
             "phase": self.phase,
             "model": self.model,
             "operator": self.operator,
             "train": self.train,
+            "data": dict(data_contract),
         }
         contract["batching"] = batching_plan.as_dict()
         return contract
 
-    def checkpoint_contract_digest(self, batching_plan: BatchingPlan) -> str:
-        return checkpoint_contract_digest(self.checkpoint_contract(batching_plan))
+    def checkpoint_contract_digest(
+        self,
+        batching_plan: BatchingPlan,
+        data_contract: Mapping[str, Any],
+    ) -> str:
+        return checkpoint_contract_digest(
+            self.checkpoint_contract(batching_plan, data_contract)
+        )
 
-    def as_dict(self, batching_plan: BatchingPlan) -> dict[str, Any]:
+    def as_dict(
+        self,
+        batching_plan: BatchingPlan,
+        data_contract: Mapping[str, Any],
+    ) -> dict[str, Any]:
         return {
             "config_path": str(self.config_path),
             "tier": self.tier,
@@ -174,79 +203,12 @@ class ImageNetRun:
             "overrides": list(self.overrides),
             "official_deit3_recipe": OFFICIAL_DEIT3_URL,
             "batching": batching_plan.as_dict(),
-            "checkpoint_contract_digest": self.checkpoint_contract_digest(batching_plan),
+            "data": dict(data_contract),
+            "checkpoint_contract_digest": self.checkpoint_contract_digest(
+                batching_plan,
+                data_contract,
+            ),
         }
-
-
-class VirtualGroupSampler(Sampler[int]):
-    """Finite distributed sampler with whole-group repeated augmentation views."""
-
-    def __init__(
-        self,
-        dataset: Dataset[Any],
-        *,
-        num_replicas: int,
-        rank: int,
-        samples_per_rank: int,
-        group_size: int,
-        shuffle: bool = True,
-        num_repeats: int = 3,
-    ) -> None:
-        if num_replicas < 1:
-            raise ValueError("num_replicas must be positive")
-        if not 0 <= rank < num_replicas:
-            raise ValueError("rank must be in [0, num_replicas)")
-        if num_repeats < 1:
-            raise ValueError("num_repeats must be positive")
-        if group_size < 1:
-            raise ValueError("group_size must be positive")
-        if samples_per_rank < 1:
-            raise ValueError("samples_per_rank must be positive")
-        if samples_per_rank % group_size:
-            raise ValueError("samples_per_rank must be divisible by group_size")
-        self.dataset = dataset
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.shuffle = shuffle
-        self.num_repeats = num_repeats
-        self.group_size = group_size
-        self.num_samples = samples_per_rank
-        self.global_groups = (samples_per_rank // group_size) * num_replicas
-        self.source_groups = math.ceil(self.global_groups / num_repeats)
-        self.source_samples = self.source_groups * group_size
-        if len(self.dataset) < self.source_samples:
-            raise ValueError(
-                "dataset is too small to construct the requested virtual augmentation groups"
-            )
-        self.epoch = 0
-
-    def __iter__(self) -> Iterator[int]:
-        if self.shuffle:
-            generator = torch.Generator()
-            generator.manual_seed(self.epoch)
-            indices = torch.randperm(len(self.dataset), generator=generator)
-        else:
-            indices = torch.arange(len(self.dataset))
-
-        source_groups = indices[: self.source_samples].reshape(
-            self.source_groups,
-            self.group_size,
-        )
-        virtual_groups = torch.repeat_interleave(
-            source_groups,
-            repeats=self.num_repeats,
-            dim=0,
-        )[: self.global_groups]
-        local_indices = virtual_groups[self.rank :: self.num_replicas].reshape(-1)
-        if len(local_indices) != self.num_samples:
-            raise RuntimeError("virtual-group sampler produced an invalid shard")
-        return iter(local_indices.tolist())
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
 
 
 class _GaussianBlur:
@@ -307,7 +269,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--data-root",
         type=Path,
         required=True,
-        help="ImageNet root containing train/ and val/ ImageFolder directories.",
+        help=(
+            "ModelScope timm/imagenet-1k-wds root containing _info.json and "
+            "the downloaded tar shards."
+        ),
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -348,12 +313,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--train-workers",
         type=int,
-        help="Override train ImageFolder workers per rank.",
+        help="Override streaming WebDataset workers per rank.",
     )
     parser.add_argument(
         "--val-workers",
         type=int,
-        help="Override validation ImageFolder workers per rank.",
+        help="Override validation WebDataset workers per rank.",
     )
     parser.add_argument("--seed", type=int, help="Override the official seed.")
     parser.add_argument("--save-every", type=int, help="Checkpoint interval in epochs.")
@@ -979,24 +944,620 @@ def build_eval_transform(run: ImageNetRun) -> Any:
     )
 
 
-def _validate_imagefolder_classes(
-    train_classes: Sequence[str],
-    train_class_to_idx: Mapping[str, int],
-    val_classes: Sequence[str],
-    val_class_to_idx: Mapping[str, int],
+@dataclass(frozen=True)
+class _WebDatasetSplit:
+    """One validated split from ModelScope's ImageNet-1K WebDataset manifest."""
+
+    name: str
+    paths: tuple[Path, ...]
+    shard_lengths: tuple[int, ...]
+    num_samples: int
+
+    def contract(self) -> dict[str, int]:
+        return {"samples": self.num_samples, "shards": len(self.paths)}
+
+
+@dataclass(frozen=True)
+class ImageNetWebDatasetManifest:
+    """The fixed ModelScope ImageNet-1K WebDataset layout used by this runner."""
+
+    root: Path
+    sha256: str
+    train: _WebDatasetSplit
+    validation: _WebDatasetSplit
+
+    def data_contract(self, *, repeated_augmentation: bool) -> dict[str, Any]:
+        return {
+            "format": "webdataset-v1",
+            "source": IMAGENET_WDS_SOURCE,
+            "manifest_sha256": self.sha256,
+            "train": self.train.contract(),
+            "validation": self.validation.contract(),
+            "streaming": {
+                "shard_order": "global-epoch-permutation-then-rank-stride-worker-quota",
+                "sample_shuffle": {
+                    "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
+                    "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
+                },
+                "source_views": 3 if repeated_augmentation else 1,
+                "repeated_augmentation_placement": "rank-local-stream",
+                "validation_partition": "worker-stride-full-per-rank",
+            },
+        }
+
+
+def _expected_wds_filenames(split: str, count: int, width: int) -> tuple[str, ...]:
+    return tuple(
+        f"imagenet1k-{split}-{index:0{width}d}.tar" for index in range(count)
+    )
+
+
+def _load_webdataset_split(
+    value: object,
     *,
-    expected_classes: int,
-) -> None:
-    if len(train_classes) != expected_classes:
-        raise ValueError(
-            f"ImageNet train directory has {len(train_classes)} classes, "
-            f"expected {expected_classes}"
-        )
-    if (
-        tuple(train_classes) != tuple(val_classes)
-        or dict(train_class_to_idx) != dict(val_class_to_idx)
+    root: Path,
+    split: str,
+    expected_count: int,
+    expected_samples: int,
+    index_width: int,
+) -> _WebDatasetSplit:
+    raw = _as_mapping(value, f"WebDataset manifest split {split!r}")
+    _require_keys(
+        raw,
+        ("name", "filenames", "shard_lengths", "num_samples"),
+        f"WebDataset manifest split {split!r}",
+    )
+    if raw["name"] != split:
+        raise ValueError(f"WebDataset manifest split {split!r} has a mismatched name")
+    filenames_value = raw["filenames"]
+    if not isinstance(filenames_value, list) or not all(
+        isinstance(name, str) for name in filenames_value
     ):
-        raise ValueError("ImageNet train/val class mappings do not agree")
+        raise ValueError(f"WebDataset manifest split {split!r} has invalid filenames")
+    filenames = tuple(filenames_value)
+    expected_filenames = _expected_wds_filenames(split, expected_count, index_width)
+    if filenames != expected_filenames:
+        raise ValueError(
+            f"WebDataset manifest split {split!r} does not match the official shard list"
+        )
+    lengths_value = raw["shard_lengths"]
+    if not isinstance(lengths_value, list) or len(lengths_value) != expected_count:
+        raise ValueError(f"WebDataset manifest split {split!r} has invalid shard lengths")
+    shard_lengths = tuple(
+        _positive_int(length, f"WebDataset manifest {split}.shard_lengths")
+        for length in lengths_value
+    )
+    num_samples = _positive_int(
+        raw["num_samples"],
+        f"WebDataset manifest {split}.num_samples",
+    )
+    if num_samples != expected_samples or sum(shard_lengths) != num_samples:
+        raise ValueError(
+            f"WebDataset manifest split {split!r} has an unexpected sample count"
+        )
+    paths = tuple(root / filename for filename in filenames)
+    missing = [path.name for path in paths if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        preview = ", ".join(missing[:3])
+        suffix = "..." if len(missing) > 3 else ""
+        raise FileNotFoundError(
+            f"WebDataset split {split!r} is missing non-empty shards: {preview}{suffix}"
+        )
+    return _WebDatasetSplit(
+        name=split,
+        paths=paths,
+        shard_lengths=shard_lengths,
+        num_samples=num_samples,
+    )
+
+
+def load_imagenet_webdataset_manifest(
+    data_root: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> ImageNetWebDatasetManifest:
+    """Validate the exact ModelScope ``timm/imagenet-1k-wds`` release layout."""
+
+    root = data_root.resolve()
+    manifest_path = root / "_info.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"expected ModelScope ImageNet WebDataset manifest {manifest_path}"
+        )
+    raw_bytes = manifest_path.read_bytes()
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    expected_sha256 = (
+        IMAGENET_WDS_MANIFEST_SHA256
+        if expected_sha256 is None
+        else expected_sha256
+    )
+    if digest != expected_sha256:
+        raise ValueError(
+            "_info.json does not match the pinned timm/imagenet-1k-wds manifest; "
+            "redownload the ModelScope dataset revision used by this repository"
+        )
+    try:
+        raw = json.loads(raw_bytes)
+    except json.JSONDecodeError as error:
+        raise ValueError("ImageNet WebDataset _info.json is not valid JSON") from error
+    if not isinstance(raw, dict) or raw.get("name") != "imagenet1k":
+        raise ValueError("_info.json is not the expected ImageNet-1K WebDataset manifest")
+    splits = _as_mapping(raw.get("splits"), "WebDataset manifest splits")
+    _require_keys(splits, ("train", "validation"), "WebDataset manifest splits")
+    return ImageNetWebDatasetManifest(
+        root=root,
+        sha256=digest,
+        train=_load_webdataset_split(
+            splits["train"],
+            root=root,
+            split="train",
+            expected_count=IMAGENET_TRAIN_SHARDS,
+            expected_samples=IMAGENET_TRAIN_SAMPLES,
+            index_width=4,
+        ),
+        validation=_load_webdataset_split(
+            splits["validation"],
+            root=root,
+            split="validation",
+            expected_count=IMAGENET_VALIDATION_SHARDS,
+            expected_samples=IMAGENET_VALIDATION_SAMPLES,
+            index_width=2,
+        ),
+    )
+
+
+def _verify_webdataset_shard(path: Path, *, expected_samples: int) -> None:
+    keys = {"jpg": set(), "cls": set(), "json": set()}
+    try:
+        with tarfile.open(path, mode="r:*") as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                stem, separator, suffix = member.name.rpartition(".")
+                if separator and suffix in keys:
+                    keys[suffix].add(stem)
+    except (OSError, tarfile.TarError) as error:
+        raise ValueError(f"WebDataset shard {path} is not a readable tar archive") from error
+    if (
+        len(keys["jpg"]) != expected_samples
+        or keys["jpg"] != keys["cls"]
+        or keys["jpg"] != keys["json"]
+    ):
+        raise ValueError(
+            f"WebDataset shard {path} does not match its manifest sample structure"
+        )
+
+
+def verify_imagenet_webdataset_payloads(manifest: ImageNetWebDatasetManifest) -> None:
+    """Validate tar readability and one jpg/cls/json record triple per manifest sample."""
+
+    for split in (manifest.train, manifest.validation):
+        for path, expected_samples in zip(
+            split.paths,
+            split.shard_lengths,
+            strict=True,
+        ):
+            _verify_webdataset_shard(path, expected_samples=expected_samples)
+
+
+def _verify_webdataset_payloads_for_state(
+    manifest: ImageNetWebDatasetManifest,
+    state: DistributedState,
+) -> None:
+    if not state.enabled:
+        verify_imagenet_webdataset_payloads(manifest)
+        return
+    failure: str | None = None
+    if state.is_main:
+        try:
+            verify_imagenet_webdataset_payloads(manifest)
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"
+    result: list[object] = [failure]
+    dist.broadcast_object_list(result, src=0, device=state.device)
+    if result[0] is not None:
+        raise RuntimeError(f"ImageNet WebDataset payload validation failed: {result[0]}")
+
+
+def _validate_webdataset_contract(value: object) -> None:
+    data = _as_mapping(value, "checkpoint data contract")
+    _require_keys(
+        data,
+        ("format", "source", "manifest_sha256", "train", "validation", "streaming"),
+        "checkpoint data contract",
+    )
+    if data["format"] != "webdataset-v1" or data["source"] != IMAGENET_WDS_SOURCE:
+        raise ValueError("checkpoint does not use the current ImageNet WebDataset contract")
+    digest = data["manifest_sha256"]
+    if not isinstance(digest, str) or len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError("checkpoint WebDataset manifest digest is invalid")
+    for name, expected_samples, expected_shards in (
+        ("train", IMAGENET_TRAIN_SAMPLES, IMAGENET_TRAIN_SHARDS),
+        ("validation", IMAGENET_VALIDATION_SAMPLES, IMAGENET_VALIDATION_SHARDS),
+    ):
+        split = _as_mapping(data[name], f"checkpoint WebDataset {name} split")
+        if split != {"samples": expected_samples, "shards": expected_shards}:
+            raise ValueError(f"checkpoint WebDataset {name} split is invalid")
+    streaming = _as_mapping(data["streaming"], "checkpoint WebDataset streaming contract")
+    _require_keys(
+        streaming,
+        (
+            "shard_order",
+            "sample_shuffle",
+            "source_views",
+            "repeated_augmentation_placement",
+            "validation_partition",
+        ),
+        "checkpoint WebDataset streaming contract",
+    )
+    if streaming["shard_order"] != "global-epoch-permutation-then-rank-stride-worker-quota":
+        raise ValueError("checkpoint WebDataset shard ordering is invalid")
+    sample_shuffle = _as_mapping(
+        streaming["sample_shuffle"],
+        "checkpoint WebDataset sample shuffle contract",
+    )
+    if sample_shuffle != {
+        "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
+        "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
+    }:
+        raise ValueError("checkpoint WebDataset sample shuffle contract is invalid")
+    if streaming["source_views"] not in (1, 3):
+        raise ValueError("checkpoint WebDataset source view count is invalid")
+    if streaming["repeated_augmentation_placement"] != "rank-local-stream":
+        raise ValueError("checkpoint WebDataset repeated-augmentation placement is invalid")
+    if streaming["validation_partition"] != "worker-stride-full-per-rank":
+        raise ValueError("checkpoint WebDataset validation partition is invalid")
+
+
+def _webdataset_seed(*values: int) -> int:
+    encoded = ":".join(str(int(value)) for value in values).encode("ascii")
+    return int.from_bytes(hashlib.blake2b(encoded, digest_size=8).digest(), "little")
+
+
+def _require_webdataset() -> Any:
+    try:
+        import webdataset
+    except ImportError as error:
+        raise RuntimeError(
+            "ImageNet WebDataset training requires webdataset>=1,<2; "
+            "install the package with the vision extra."
+        ) from error
+    return webdataset
+
+
+def _webdataset_local_url(path: Path) -> str:
+    resolved = path.resolve()
+    if os.name == "nt":
+        # WebDataset's local opener expects a drive path without file URI's extra slash.
+        return f"file:{resolved.as_posix()}"
+    return resolved.as_uri()
+
+
+def _decode_webdataset_sample(
+    sample: Mapping[str, Any],
+    *,
+    transform: Any,
+    num_classes: int,
+) -> tuple[torch.Tensor, int]:
+    image_bytes = sample.get("jpg")
+    if not isinstance(image_bytes, (bytes, bytearray, memoryview)):
+        raise ValueError("WebDataset sample is missing JPEG bytes under the 'jpg' field")
+    try:
+        target = int(sample["cls"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("WebDataset sample is missing a valid class id under 'cls'") from error
+    if not 0 <= target < num_classes:
+        raise ValueError(f"WebDataset class id {target} is outside [0, {num_classes})")
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(bytes(image_bytes))) as image:
+            tensor = transform(image.convert("RGB"))
+    except Exception as error:
+        raise ValueError("failed to decode or transform a WebDataset JPEG sample") from error
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("ImageNet transform must return a torch.Tensor")
+    return tensor, target
+
+
+@dataclass(frozen=True)
+class _WebDatasetShardSlice:
+    path: Path
+    start: int
+    count: int
+
+
+class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
+    """Finite validation and quota-controlled training ImageNet WebDataset reader."""
+
+    def __init__(
+        self,
+        split: _WebDatasetSplit,
+        *,
+        transform: Any,
+        state: DistributedState,
+        seed: int,
+        num_classes: int,
+        training: bool,
+        augmentation_group_size: int = 1,
+        source_views: int = 1,
+        physical_batch_size: int | None = None,
+        microbatches_per_epoch: int | None = None,
+        worker_count: int | None = None,
+    ) -> None:
+        super().__init__()
+        if augmentation_group_size < 1 or source_views < 1:
+            raise ValueError("WebDataset group size and source views must be positive")
+        if training:
+            if (
+                physical_batch_size is None
+                or microbatches_per_epoch is None
+                or worker_count is None
+            ):
+                raise ValueError("training WebDataset requires a complete batching plan")
+            if physical_batch_size < 1 or physical_batch_size % augmentation_group_size:
+                raise ValueError(
+                    "training WebDataset physical batch size must align to augmentation groups"
+                )
+            if microbatches_per_epoch < 1 or worker_count < 1:
+                raise ValueError("training WebDataset requires positive batch and worker counts")
+        self.split = split
+        self.transform = transform
+        self.state = state
+        self.seed = int(seed)
+        self.num_classes = int(num_classes)
+        self.training = training
+        self.augmentation_group_size = int(augmentation_group_size)
+        self.source_views = int(source_views)
+        self.physical_batch_size = physical_batch_size
+        self.microbatches_per_epoch = microbatches_per_epoch
+        self.worker_count = worker_count
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("WebDataset epoch must be non-negative")
+        self._epoch = int(epoch)
+
+    @staticmethod
+    def _worker_state() -> tuple[int, int]:
+        worker = get_worker_info()
+        return (0, 1) if worker is None else (worker.id, worker.num_workers)
+
+    def _rank_shards(self, epoch: int) -> tuple[tuple[Path, int], ...]:
+        shards = list(zip(self.split.paths, self.split.shard_lengths, strict=True))
+        if self.training:
+            random.Random(_webdataset_seed(self.seed, epoch)).shuffle(shards)
+            shards = shards[self.state.rank :: self.state.world_size]
+        if not shards:
+            raise RuntimeError(
+                f"WebDataset {self.split.name!r} has no shards for rank {self.state.rank}"
+            )
+        return tuple(shards)
+
+    @staticmethod
+    def _slice_shards(
+        shards: Sequence[tuple[Path, int]],
+        *,
+        offset: int,
+        count: int,
+    ) -> tuple[_WebDatasetShardSlice, ...]:
+        if offset < 0 or count < 0:
+            raise ValueError("WebDataset shard slices must be non-negative")
+        remaining = count
+        skipped = offset
+        slices: list[_WebDatasetShardSlice] = []
+        for path, shard_length in shards:
+            if skipped >= shard_length:
+                skipped -= shard_length
+                continue
+            start = skipped
+            take = min(shard_length - start, remaining)
+            if take:
+                slices.append(_WebDatasetShardSlice(path=path, start=start, count=take))
+            remaining -= take
+            skipped = 0
+            if not remaining:
+                return tuple(slices)
+        if remaining:
+            raise RuntimeError("WebDataset shard assignment exceeded its source records")
+        return tuple(slices)
+
+    def _training_virtual_group_counts(self) -> tuple[int, ...]:
+        if (
+            self.physical_batch_size is None
+            or self.microbatches_per_epoch is None
+            or self.worker_count is None
+        ):
+            raise RuntimeError("training WebDataset is missing its batching plan")
+        groups_per_batch = self.physical_batch_size // self.augmentation_group_size
+        total_groups = self.microbatches_per_epoch * groups_per_batch
+        full_unit = math.lcm(groups_per_batch, self.source_views)
+        unit_count, remainder = divmod(total_groups, full_unit)
+        base, extra = divmod(unit_count, self.worker_count)
+        groups = [
+            (base + (worker_id < extra)) * full_unit
+            for worker_id in range(self.worker_count)
+        ]
+        groups[-1] += remainder
+        return tuple(groups)
+
+    def _training_slices(
+        self,
+        *,
+        worker_id: int,
+        worker_count: int,
+        epoch: int,
+    ) -> tuple[_WebDatasetShardSlice, ...]:
+        if worker_count != self.worker_count:
+            raise RuntimeError(
+                "training WebDataset worker count changed after its batching plan was resolved"
+            )
+        groups = self._training_virtual_group_counts()
+        if not 0 <= worker_id < len(groups):
+            raise RuntimeError("training WebDataset reported an invalid worker id")
+        source_counts = tuple(
+            math.ceil(group_count / self.source_views) * self.augmentation_group_size
+            for group_count in groups
+        )
+        shards = self._rank_shards(epoch)
+        available = sum(shard_length for _, shard_length in shards)
+        required = sum(source_counts)
+        if required > available:
+            raise RuntimeError(
+                "WebDataset rank cannot cover the planned epoch with unique source records: "
+                f"requires {required}, has {available}; reduce the effective batch or workers"
+            )
+        return self._slice_shards(
+            shards,
+            offset=sum(source_counts[:worker_id]),
+            count=source_counts[worker_id],
+        )
+
+    def _validation_slices(
+        self,
+        *,
+        worker_id: int,
+        worker_count: int,
+    ) -> tuple[_WebDatasetShardSlice, ...]:
+        shards = self._rank_shards(epoch=0)
+        assigned = shards[worker_id::worker_count]
+        if not assigned:
+            raise RuntimeError(
+                f"WebDataset {self.split.name!r} has no shards for worker {worker_id}"
+            )
+        return tuple(
+            _WebDatasetShardSlice(path=path, start=0, count=shard_length)
+            for path, shard_length in assigned
+        )
+
+    def _raw_samples(
+        self,
+        shards: Sequence[_WebDatasetShardSlice],
+        *,
+        shuffle_seed: int | None,
+    ) -> Iterator[Mapping[str, Any]]:
+        wds = _require_webdataset()
+
+        def records() -> Iterator[Mapping[str, Any]]:
+            for shard in shards:
+                dataset = wds.WebDataset(
+                    [_webdataset_local_url(shard.path)],
+                    handler=wds.handlers.reraise_exception,
+                    shardshuffle=False,
+                    nodesplitter=None,
+                    workersplitter=None,
+                )
+                yield from itertools.islice(
+                    dataset,
+                    shard.start,
+                    shard.start + shard.count,
+                )
+
+        source: Iterator[Mapping[str, Any]] = records()
+        if shuffle_seed is not None:
+            source = wds.filters.shuffle(
+                WDS_SAMPLE_SHUFFLE_SIZE,
+                initial=WDS_SAMPLE_SHUFFLE_INITIAL,
+                seed=shuffle_seed,
+            )(source)
+        yield from source
+
+    def _decode(self, sample: Mapping[str, Any]) -> tuple[torch.Tensor, int]:
+        return _decode_webdataset_sample(
+            sample,
+            transform=self.transform,
+            num_classes=self.num_classes,
+        )
+
+    def _iter_training(
+        self,
+        *,
+        worker_id: int,
+        worker_count: int,
+    ) -> Iterator[tuple[torch.Tensor, int]]:
+        virtual_groups = self._training_virtual_group_counts()[worker_id]
+        if not virtual_groups:
+            return
+        expected = virtual_groups * self.augmentation_group_size
+        emitted = 0
+        group: list[Mapping[str, Any]] = []
+        for sample in self._raw_samples(
+            self._training_slices(
+                worker_id=worker_id,
+                worker_count=worker_count,
+                epoch=self._epoch,
+            ),
+            shuffle_seed=_webdataset_seed(
+                self.seed,
+                self._epoch,
+                self.state.rank,
+                worker_id,
+            ),
+        ):
+            group.append(sample)
+            if len(group) != self.augmentation_group_size:
+                continue
+            # Repeat undecoded records so every retained view reruns the stochastic transform.
+            for _ in range(self.source_views):
+                for source in group:
+                    if emitted == expected:
+                        return
+                    yield self._decode(source)
+                    emitted += 1
+            group.clear()
+        if emitted != expected:
+            raise RuntimeError(
+                "WebDataset stream ended before its unique-source batch quota was produced"
+            )
+
+    def _iter_validation(
+        self,
+        *,
+        worker_id: int,
+        worker_count: int,
+    ) -> Iterator[tuple[torch.Tensor, int]]:
+        for sample in self._raw_samples(
+            self._validation_slices(
+                worker_id=worker_id,
+                worker_count=worker_count,
+            ),
+            shuffle_seed=None,
+        ):
+            yield self._decode(sample)
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, int]]:
+        worker_id, worker_count = self._worker_state()
+        if self.training:
+            yield from self._iter_training(
+                worker_id=worker_id,
+                worker_count=worker_count,
+            )
+        else:
+            yield from self._iter_validation(
+                worker_id=worker_id,
+                worker_count=worker_count,
+            )
+
+
+def _loader_kwargs(
+    *,
+    workers: int,
+    generator: torch.Generator,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "num_workers": workers,
+        "persistent_workers": False,
+        "pin_memory": True,
+        "worker_init_fn": _seed_worker,
+        "generator": generator,
+    }
+    if workers:
+        # One prefetched physical batch per worker bounds host-side image memory.
+        kwargs["prefetch_factor"] = 1
+    return kwargs
 
 
 def build_loaders(
@@ -1008,83 +1569,86 @@ def build_loaders(
 ) -> tuple[
     DataLoader[Any],
     DataLoader[Any],
-    VirtualGroupSampler,
+    _ImageNetWebDataset,
     BatchingPlan,
     LoaderRandomGenerators,
+    dict[str, Any],
 ]:
-    from torchvision.datasets import ImageFolder
-
-    root = data_root.resolve()
-    train_root = root / "train"
-    val_root = root / "val"
-    if not train_root.is_dir() or not val_root.is_dir():
-        raise FileNotFoundError(
-            f"expected ImageNet ImageFolder directories {train_root} and {val_root}"
-        )
-    train_dataset = ImageFolder(train_root, transform=build_train_transform(run))
-    val_dataset = ImageFolder(val_root, transform=build_eval_transform(run))
-    _validate_imagefolder_classes(
-        train_dataset.classes,
-        train_dataset.class_to_idx,
-        val_dataset.classes,
-        val_dataset.class_to_idx,
-        expected_classes=int(run.model["num_classes"]),
-    )
-
+    manifest = load_imagenet_webdataset_manifest(data_root)
+    _verify_webdataset_payloads_for_state(manifest, state)
     batching_plan = resolve_batching_plan(
         run,
         state,
-        dataset_size=len(train_dataset),
+        dataset_size=manifest.train.num_samples,
         requested_grad_accum=requested_grad_accum,
     )
-    train_sampler = VirtualGroupSampler(
-        train_dataset,
-        num_replicas=state.world_size,
-        rank=state.rank,
-        samples_per_rank=batching_plan.samples_per_rank,
-        group_size=batching_plan.augmentation_group_size,
-        shuffle=True,
-        num_repeats=3 if bool(run.train["repeated_aug"]) else 1,
+    train_workers = int(run.train["train_workers"])
+    val_workers = int(run.train["val_workers"])
+    effective_train_workers = min(
+        max(1, train_workers),
+        batching_plan.microbatches_per_epoch,
     )
+    if state.world_size * effective_train_workers > len(manifest.train.paths):
+        raise ValueError("train worker count exceeds the available WebDataset shard partition")
+    if val_workers > len(manifest.validation.paths):
+        raise ValueError("validation worker count exceeds the 64 validation shards")
 
-    # The public DeiT command does not enable --dist-eval, so every process
-    # evaluates the full validation set and reductions preserve the same metric.
-    val_sampler: Sampler[int] = SequentialSampler(val_dataset)
+    source_views = 3 if bool(run.train["repeated_aug"]) else 1
+    data_contract = manifest.data_contract(
+        repeated_augmentation=bool(run.train["repeated_aug"])
+    )
+    train_dataset = _ImageNetWebDataset(
+        manifest.train,
+        transform=build_train_transform(run),
+        state=state,
+        seed=int(run.train["seed"]),
+        num_classes=int(run.model["num_classes"]),
+        training=True,
+        augmentation_group_size=batching_plan.augmentation_group_size,
+        source_views=source_views,
+        physical_batch_size=batching_plan.physical_batch_size,
+        microbatches_per_epoch=batching_plan.microbatches_per_epoch,
+        worker_count=effective_train_workers,
+    )
+    # The public DeiT command does not enable --dist-eval, so every rank scans
+    # all 50k validation examples and metric reduction preserves that protocol.
+    val_dataset = _ImageNetWebDataset(
+        manifest.validation,
+        transform=build_eval_transform(run),
+        state=state,
+        seed=int(run.train["seed"]),
+        num_classes=int(run.model["num_classes"]),
+        training=False,
+    )
     generators = LoaderRandomGenerators(
         train=torch.Generator().manual_seed(int(run.train["seed"]) + state.rank),
         validation=torch.Generator().manual_seed(
             int(run.train["seed"]) + state.world_size + state.rank
         ),
     )
-    common = {
-        "pin_memory": True,
-        "worker_init_fn": _seed_worker,
-    }
-    train_workers = int(run.train["train_workers"])
     train_loader = DataLoader(
         train_dataset,
         batch_size=batching_plan.physical_batch_size,
-        sampler=train_sampler,
-        drop_last=False,
-        num_workers=train_workers,
-        persistent_workers=False,
-        generator=generators.train,
-        **common,
+        drop_last=True,
+        **_loader_kwargs(
+            workers=0 if train_workers == 0 else effective_train_workers,
+            generator=generators.train,
+        ),
     )
-    val_workers = int(run.train["val_workers"])
     val_loader = DataLoader(
         val_dataset,
         batch_size=max(1, int(1.5 * int(run.train["batch_size"]))),
-        sampler=val_sampler,
         drop_last=False,
-        num_workers=val_workers,
-        persistent_workers=False,
-        generator=generators.validation,
-        **common,
+        **_loader_kwargs(workers=val_workers, generator=generators.validation),
     )
-    if len(train_loader) != batching_plan.microbatches_per_epoch:
-        raise RuntimeError("ImageNet train loader does not match the resolved batching plan")
-    return train_loader, val_loader, train_sampler, batching_plan, generators
+    return (
+        train_loader,
+        val_loader,
+        train_dataset,
+        batching_plan,
+        generators,
+        data_contract,
+    )
 
 
 def prepare_operator_backend(run: ImageNetRun, device: torch.device) -> None:
@@ -1440,7 +2004,7 @@ def _assert_finite_loss(loss: torch.Tensor, *, epoch: int, step: int) -> None:
 def train_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
-    sampler: Sampler[int],
+    epoch_controller: Any,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
@@ -1453,10 +2017,8 @@ def train_epoch(
     batching_plan: BatchingPlan,
     print_freq: int,
 ) -> tuple[float, float, float]:
-    if hasattr(sampler, "set_epoch"):
-        sampler.set_epoch(epoch)  # type: ignore[union-attr]
-    if len(loader) != batching_plan.microbatches_per_epoch:
-        raise RuntimeError("ImageNet train loader does not match the resolved batching plan")
+    if hasattr(epoch_controller, "set_epoch"):
+        epoch_controller.set_epoch(epoch)
     model.train()
     metric_totals = torch.zeros(4, device=state.device, dtype=torch.float64)
     processed_examples = 0
@@ -1464,7 +2026,11 @@ def train_epoch(
     processed_steps = 0
     started = time.perf_counter()
     model.zero_grad(set_to_none=True)
-    for step, (images, targets) in enumerate(loader):
+    for step, (images, targets) in zip(
+        range(batching_plan.microbatches_per_epoch),
+        loader,
+        strict=False,
+    ):
         images = images.to(state.device, non_blocking=True)
         targets = targets.to(state.device, non_blocking=True)
         metric_targets = targets
@@ -1520,7 +2086,7 @@ def train_epoch(
                         "event": "train_step",
                         "epoch": epoch + 1,
                         "step": step + 1,
-                        "steps": len(loader),
+                        "steps": batching_plan.microbatches_per_epoch,
                         "optimizer_step": optimizer_updates,
                         "optimizer_steps": batching_plan.updates_per_epoch,
                         "loss": data_loss.detach().item(),
@@ -1678,6 +2244,7 @@ def _prepare_output(
     run: ImageNetRun,
     state: DistributedState,
     batching_plan: BatchingPlan,
+    data_contract: Mapping[str, Any],
 ) -> Path:
     output = output.resolve()
     failure: str | None = None
@@ -1691,7 +2258,7 @@ def _prepare_output(
                 )
             metadata = {
                 "event": "start",
-                "run": run.as_dict(batching_plan),
+                "run": run.as_dict(batching_plan, data_contract),
                 "launcher": {
                     "world_size": state.world_size,
                     "rank": state.rank,
@@ -1737,10 +2304,11 @@ def _checkpoint(
     scaler: torch.amp.GradScaler,
     run: ImageNetRun,
     batching_plan: BatchingPlan,
+    data_contract: Mapping[str, Any],
     best_acc1: float,
     rng: Mapping[str, Any],
 ) -> dict[str, Any]:
-    contract = run.checkpoint_contract(batching_plan)
+    contract = run.checkpoint_contract(batching_plan, data_contract)
     return {
         "format_version": IMAGENET_CHECKPOINT_FORMAT,
         "epoch": epoch,
@@ -1766,13 +2334,17 @@ def _load_resume(
     scaler: torch.amp.GradScaler,
     run: ImageNetRun,
     batching_plan: BatchingPlan,
+    data_contract: Mapping[str, Any],
     state: DistributedState,
     generators: LoaderRandomGenerators,
 ) -> tuple[int, float]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict):
         raise ValueError("resume checkpoint must be a mapping")
-    if validate_checkpoint_contract(checkpoint) != run.checkpoint_contract(batching_plan):
+    if validate_checkpoint_contract(checkpoint) != run.checkpoint_contract(
+        batching_plan,
+        data_contract,
+    ):
         raise ValueError("resume checkpoint contract does not match the requested run")
     rng_state = checkpoint.get("rng")
     _resume_rng_state_for_rank(rng_state, state=state)
@@ -1805,7 +2377,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         prepare_operator_backend(run, state.device)
-        train_loader, val_loader, train_sampler, batching_plan, generators = build_loaders(
+        (
+            train_loader,
+            val_loader,
+            train_dataset,
+            batching_plan,
+            generators,
+            data_contract,
+        ) = build_loaders(
             run,
             args.data_root,
             state,
@@ -1841,13 +2420,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 scaler=scaler,
                 run=run,
                 batching_plan=batching_plan,
+                data_contract=data_contract,
                 state=state,
                 generators=generators,
             )
             # This matches the public DeiT entrypoint after restoring scheduler state.
             scheduler.step(start_epoch)
 
-        output = _prepare_output(args.output, args, run, state, batching_plan)
+        output = _prepare_output(
+            args.output,
+            args,
+            run,
+            state,
+            batching_plan,
+            data_contract,
+        )
         parameter_count = sum(
             parameter.numel() for parameter in model_without_ddp.parameters() if parameter.requires_grad
         )
@@ -1867,10 +2454,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "tier": run.tier,
                         "phase": run.phase,
                         "parameters": parameter_count,
-                        "train_samples": len(train_loader.dataset),
+                        "train_samples": data_contract["train"]["samples"],
                         "scheduled_train_samples": batching_plan.samples_per_epoch,
-                        "val_samples": len(val_loader.dataset),
-                        "steps_per_epoch": len(train_loader),
+                        "val_samples": data_contract["validation"]["samples"],
+                        "steps_per_epoch": batching_plan.microbatches_per_epoch,
                         "optimizer_steps_per_epoch": batching_plan.updates_per_epoch,
                         "physical_batch_size": batching_plan.physical_batch_size,
                         "effective_batch": batching_plan.effective_batch_size,
@@ -1905,7 +2492,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             train_loss, train_acc1, train_acc5 = train_epoch(
                 model,
                 train_loader,
-                train_sampler,
+                train_dataset,
                 criterion,
                 optimizer,
                 scaler,
@@ -1964,6 +2551,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             scaler=scaler,
                             run=run,
                             batching_plan=batching_plan,
+                            data_contract=data_contract,
                             best_acc1=best_acc1,
                             rng=rng_state,
                         )

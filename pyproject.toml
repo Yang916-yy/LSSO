@@ -13,7 +13,12 @@ license-files = ["LICENSE", "NOTICE"]
 dependencies = ["torch>=2.9,<2.12"]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "numpy>=1.26"]
+test = [
+    "pytest>=8,<10",
+    "numpy>=1.26",
+    "pillow>=10",
+    "webdataset>=1,<2",
+]
 sequence = [
     "datasets>=3,<5",
     "numpy>=1.26",
@@ -22,6 +27,7 @@ sequence = [
 vision = [
     "timm>=1.0.16,<2",
     "torchvision>=0.24,<0.27",
+    "webdataset>=1,<2",
 ]
 openmmlab = [
     "mmengine>=0.10,<1",
