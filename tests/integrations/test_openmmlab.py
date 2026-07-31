@@ -10,7 +10,11 @@ import torch
 pytest.importorskip("timm")
 
 import integrations.openmmlab as openmmlab
-from experiments.imagenet import checkpoint_contract_digest
+from experiments.imagenet import (
+    IMAGENET_CHECKPOINT_FORMAT,
+    checkpoint_contract_digest,
+    interpolate_position_embedding,
+)
 from experiments.train_openmmlab import _configure_checkpoint
 from integrations.timm import DeiT3Spec, LSSODeiT3
 from lsso import CoreMode
@@ -24,12 +28,16 @@ CONFIG_ROOT = (
 )
 
 
-def _tiny_imagenet_checkpoint(source: LSSODeiT3) -> dict[str, object]:
+def _tiny_imagenet_checkpoint(
+    source: LSSODeiT3,
+    *,
+    image_size: int = 32,
+) -> dict[str, object]:
     contract = {
         "tier": "small",
         "phase": "pretrain",
         "model": {
-            "image_size": 32,
+            "image_size": image_size,
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
@@ -59,7 +67,7 @@ def _tiny_imagenet_checkpoint(source: LSSODeiT3) -> dict[str, object]:
         },
     }
     return {
-        "format_version": 3,
+        "format_version": IMAGENET_CHECKPOINT_FORMAT,
         "contract": contract,
         "contract_digest": checkpoint_contract_digest(contract),
         "model": source.state_dict(),
@@ -211,6 +219,45 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
         tiny_backbone.encoder.pos_embed,
         source.encoder.pos_embed,
     )
+
+
+def test_backbone_interpolates_a_smaller_pretrain_position_table(
+    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tmp_path: Path,
+) -> None:
+    target = type(tiny_backbone)(
+        variant="small",
+        image_size=48,
+        rank=4,
+        out_indices=(0, 1, 2, 3),
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        implementation="reference",
+    ).eval()
+    source = LSSODeiT3(
+        image_size=32,
+        patch_size=16,
+        num_classes=1000,
+        embed_dim=32,
+        depth=4,
+        num_heads=4,
+        rank=4,
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        bias=True,
+        implementation="reference",
+        drop_path_rate=0.0,
+    )
+    checkpoint = tmp_path / "imagenet-32px.pt"
+    torch.save(_tiny_imagenet_checkpoint(source, image_size=32), checkpoint)
+
+    expected = interpolate_position_embedding(
+        source.encoder.pos_embed,
+        target.encoder.pos_embed,
+    )
+    target.load_pretrained(checkpoint)
+
+    torch.testing.assert_close(target.encoder.pos_embed, expected)
 
 
 def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(

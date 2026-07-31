@@ -66,7 +66,9 @@ before MMEngine constructs the model. New downstream runs require an explicit
 ImageNet checkpoint; they never silently train a paper result from scratch.
 The backbone verifies the checkpoint's current ImageNet contract and canonical
 digest, then checks its tier, LSSO operator, and shared DeiT III geometry before
-accepting any pretrained tensor.
+accepting any pretrained tensor. When a valid ImageNet checkpoint and the
+downstream backbone use different learned 2D patch grids, the backbone applies
+the same bicubic position-table interpolation used by ImageNet fine-tuning.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_openmmlab.py \

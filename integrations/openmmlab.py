@@ -14,7 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-from experiments.imagenet import validate_checkpoint_contract
+from experiments.imagenet import (
+    interpolate_position_embedding,
+    validate_checkpoint_contract,
+)
 from integrations.timm import (
     LSSODeiT3,
     VisionTokenLayout,
@@ -155,7 +158,18 @@ class LSSODeiT3Backbone(LSSODeiT3):
 
         payload = _checkpoint_payload(checkpoint)
         self._validate_pretrained_contract(validate_checkpoint_contract(payload))
-        incompatible = self.load_state_dict(_checkpoint_state(payload), strict=False)
+        state = _checkpoint_state(payload)
+        source_position = state.get("encoder.pos_embed")
+        target_position = self.state_dict().get("encoder.pos_embed")
+        if isinstance(source_position, torch.Tensor) and isinstance(
+            target_position, torch.Tensor
+        ):
+            if source_position.shape != target_position.shape:
+                state["encoder.pos_embed"] = interpolate_position_embedding(
+                    source_position,
+                    target_position,
+                )
+        incompatible = self.load_state_dict(state, strict=False)
         unexpected = [
             key
             for key in incompatible.unexpected_keys
