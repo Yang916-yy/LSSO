@@ -16,6 +16,7 @@ import math
 import os
 import random
 import subprocess
+import tempfile
 import time
 import tomllib
 from contextlib import nullcontext
@@ -40,7 +41,7 @@ OFFICIAL_DEIT3_URL = (
     "https://github.com/facebookresearch/deit/blob/"
     "7e160fe43f0252d17191b71cbb5826254114ea5b/README_revenge.md"
 )
-IMAGENET_CHECKPOINT_FORMAT = 3
+IMAGENET_CHECKPOINT_FORMAT = 4
 
 
 def checkpoint_contract_digest(contract: Mapping[str, Any]) -> str:
@@ -126,6 +127,14 @@ class BatchingPlan:
             "samples_per_epoch": self.samples_per_epoch,
             "updates_per_epoch": self.updates_per_epoch,
         }
+
+
+@dataclass(frozen=True)
+class LoaderRandomGenerators:
+    """Independent generators for replayable train and validation workers."""
+
+    train: torch.Generator
+    validation: torch.Generator
 
 
 @dataclass(frozen=True)
@@ -306,7 +315,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("cuda", "reference"),
         help="Override the configured LSSO implementation for a diagnostic run.",
     )
-    parser.add_argument("--resume", type=Path, help="Resume an exact previous run.")
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        help="Resume an epoch-boundary checkpoint with its captured RNG state.",
+    )
     parser.add_argument(
         "--init-checkpoint",
         type=Path,
@@ -332,7 +345,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Require this many physical batches per optimizer update.",
     )
-    parser.add_argument("--workers", type=int, help="Override ImageFolder worker count.")
+    parser.add_argument(
+        "--train-workers",
+        type=int,
+        help="Override train ImageFolder workers per rank.",
+    )
+    parser.add_argument(
+        "--val-workers",
+        type=int,
+        help="Override validation ImageFolder workers per rank.",
+    )
     parser.add_argument("--seed", type=int, help="Override the official seed.")
     parser.add_argument("--save-every", type=int, help="Checkpoint interval in epochs.")
     parser.add_argument("--print-freq", type=int, default=50)
@@ -418,7 +440,8 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
     for argument, key in (
         (args.epochs, "epochs"),
         (args.batch_size, "batch_size"),
-        (args.workers, "workers"),
+        (args.train_workers, "train_workers"),
+        (args.val_workers, "val_workers"),
         (args.seed, "seed"),
         (args.save_every, "save_every"),
     ):
@@ -492,7 +515,8 @@ def _validate_run(
             "warmup_lr",
             "warmup_epochs",
             "weight_decay",
-            "workers",
+            "train_workers",
+            "val_workers",
             "eval_crop_ratio",
             "mixup",
             "cutmix",
@@ -548,7 +572,8 @@ def _validate_run(
     )
     if effective_batch % augmentation_group_size:
         raise ValueError("effective_batch must be divisible by augmentation_group_size")
-    _positive_int(train["workers"], "workers")
+    _nonnegative_int(train["train_workers"], "train_workers")
+    _nonnegative_int(train["val_workers"], "val_workers")
     _nonnegative_int(train["warmup_epochs"], "warmup_epochs")
     _positive_int(train["save_every"], "save_every")
     _positive_float(train["lr"], "lr")
@@ -768,6 +793,126 @@ def _seed_worker(_: int) -> None:
         pass
 
 
+def _local_resume_rng_state(
+    state: DistributedState,
+    generators: LoaderRandomGenerators,
+) -> dict[str, Any]:
+    """Capture one rank's replayable epoch-boundary random state."""
+
+    try:
+        import numpy as np
+
+        numpy_state: Any | None = np.random.get_state()
+    except ImportError:
+        numpy_state = None
+    cuda_state = (
+        torch.cuda.get_rng_state(state.device)
+        if state.device.type == "cuda"
+        else None
+    )
+    return {
+        "rank": state.rank,
+        "python": random.getstate(),
+        "numpy": numpy_state,
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": cuda_state,
+        "train_generator": generators.train.get_state(),
+        "validation_generator": generators.validation.get_state(),
+    }
+
+
+def _capture_resume_rng_state(
+    state: DistributedState,
+    generators: LoaderRandomGenerators,
+) -> dict[str, Any]:
+    """Collect all rank-local random states for an exact epoch-boundary resume."""
+
+    local_state = _local_resume_rng_state(state, generators)
+    states: list[object]
+    if state.enabled:
+        states = [None] * state.world_size
+        dist.all_gather_object(states, local_state)
+    else:
+        states = [local_state]
+    return {
+        "world_size": state.world_size,
+        "device_type": state.device.type,
+        "states": states,
+    }
+
+
+def _resume_rng_state_for_rank(
+    saved: Any,
+    *,
+    state: DistributedState,
+) -> Mapping[str, Any]:
+    """Validate and select the saved random state for the current rank."""
+
+    if not isinstance(saved, dict):
+        raise ValueError("resume checkpoint is missing its epoch-boundary RNG state")
+    if saved.get("world_size") != state.world_size:
+        raise ValueError("resume checkpoint RNG world size does not match this run")
+    if saved.get("device_type") != state.device.type:
+        raise ValueError("resume checkpoint RNG device type does not match this run")
+    states = saved.get("states")
+    if not isinstance(states, list) or len(states) != state.world_size:
+        raise ValueError("resume checkpoint has an invalid per-rank RNG state")
+    rank_state = states[state.rank]
+    if not isinstance(rank_state, dict) or rank_state.get("rank") != state.rank:
+        raise ValueError("resume checkpoint RNG state does not match this rank")
+    required = (
+        "python",
+        "numpy",
+        "torch_cpu",
+        "torch_cuda",
+        "train_generator",
+        "validation_generator",
+    )
+    if any(key not in rank_state for key in required):
+        raise ValueError("resume checkpoint has an incomplete RNG state")
+    if not all(
+        isinstance(rank_state[key], torch.Tensor)
+        for key in ("torch_cpu", "train_generator", "validation_generator")
+    ):
+        raise ValueError("resume checkpoint has an invalid CPU or loader RNG state")
+    cuda_state = rank_state["torch_cuda"]
+    if state.device.type == "cuda":
+        if not isinstance(cuda_state, torch.Tensor):
+            raise ValueError("resume checkpoint has an invalid CUDA RNG state")
+    elif cuda_state is not None:
+        raise ValueError("resume checkpoint unexpectedly contains CUDA RNG state")
+    return rank_state
+
+
+def _restore_resume_rng_state(
+    saved: Any,
+    *,
+    state: DistributedState,
+    generators: LoaderRandomGenerators,
+) -> None:
+    """Restore one rank's saved random streams after model state is loaded."""
+
+    rank_state = _resume_rng_state_for_rank(saved, state=state)
+    try:
+        random.setstate(rank_state["python"])
+        numpy_state = rank_state["numpy"]
+        if numpy_state is not None:
+            try:
+                import numpy as np
+            except ImportError as error:
+                raise ValueError(
+                    "resume checkpoint requires NumPy to restore its RNG state"
+                ) from error
+            np.random.set_state(numpy_state)
+        torch.set_rng_state(rank_state["torch_cpu"])
+        if state.device.type == "cuda":
+            torch.cuda.set_rng_state(rank_state["torch_cuda"], state.device)
+        generators.train.set_state(rank_state["train_generator"])
+        generators.validation.set_state(rank_state["validation_generator"])
+    except (IndexError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("resume checkpoint has an invalid RNG state") from error
+
+
 def build_three_augment(image_size: int, color_jitter: float) -> Any:
     """Reproduce DeiT III's public ``augment.py`` 3-Augment transform."""
 
@@ -834,13 +979,39 @@ def build_eval_transform(run: ImageNetRun) -> Any:
     )
 
 
+def _validate_imagefolder_classes(
+    train_classes: Sequence[str],
+    train_class_to_idx: Mapping[str, int],
+    val_classes: Sequence[str],
+    val_class_to_idx: Mapping[str, int],
+    *,
+    expected_classes: int,
+) -> None:
+    if len(train_classes) != expected_classes:
+        raise ValueError(
+            f"ImageNet train directory has {len(train_classes)} classes, "
+            f"expected {expected_classes}"
+        )
+    if (
+        tuple(train_classes) != tuple(val_classes)
+        or dict(train_class_to_idx) != dict(val_class_to_idx)
+    ):
+        raise ValueError("ImageNet train/val class mappings do not agree")
+
+
 def build_loaders(
     run: ImageNetRun,
     data_root: Path,
     state: DistributedState,
     *,
     requested_grad_accum: int | None,
-) -> tuple[DataLoader[Any], DataLoader[Any], VirtualGroupSampler, BatchingPlan]:
+) -> tuple[
+    DataLoader[Any],
+    DataLoader[Any],
+    VirtualGroupSampler,
+    BatchingPlan,
+    LoaderRandomGenerators,
+]:
     from torchvision.datasets import ImageFolder
 
     root = data_root.resolve()
@@ -852,13 +1023,13 @@ def build_loaders(
         )
     train_dataset = ImageFolder(train_root, transform=build_train_transform(run))
     val_dataset = ImageFolder(val_root, transform=build_eval_transform(run))
-    if len(train_dataset.classes) != int(run.model["num_classes"]):
-        raise ValueError(
-            f"ImageNet train directory has {len(train_dataset.classes)} classes, "
-            f"expected {run.model['num_classes']}"
-        )
-    if len(val_dataset.classes) != len(train_dataset.classes):
-        raise ValueError("ImageNet train/val class directory sets do not agree")
+    _validate_imagefolder_classes(
+        train_dataset.classes,
+        train_dataset.class_to_idx,
+        val_dataset.classes,
+        val_dataset.class_to_idx,
+        expected_classes=int(run.model["num_classes"]),
+    )
 
     batching_plan = resolve_batching_plan(
         run,
@@ -879,33 +1050,41 @@ def build_loaders(
     # The public DeiT command does not enable --dist-eval, so every process
     # evaluates the full validation set and reductions preserve the same metric.
     val_sampler: Sampler[int] = SequentialSampler(val_dataset)
-    workers = int(run.train["workers"])
-    generator = torch.Generator()
-    generator.manual_seed(int(run.train["seed"]) + state.rank)
+    generators = LoaderRandomGenerators(
+        train=torch.Generator().manual_seed(int(run.train["seed"]) + state.rank),
+        validation=torch.Generator().manual_seed(
+            int(run.train["seed"]) + state.world_size + state.rank
+        ),
+    )
     common = {
-        "num_workers": workers,
         "pin_memory": True,
-        "persistent_workers": workers > 0,
         "worker_init_fn": _seed_worker,
-        "generator": generator,
     }
+    train_workers = int(run.train["train_workers"])
     train_loader = DataLoader(
         train_dataset,
         batch_size=batching_plan.physical_batch_size,
         sampler=train_sampler,
         drop_last=False,
+        num_workers=train_workers,
+        persistent_workers=False,
+        generator=generators.train,
         **common,
     )
+    val_workers = int(run.train["val_workers"])
     val_loader = DataLoader(
         val_dataset,
         batch_size=max(1, int(1.5 * int(run.train["batch_size"]))),
         sampler=val_sampler,
         drop_last=False,
+        num_workers=val_workers,
+        persistent_workers=False,
+        generator=generators.validation,
         **common,
     )
     if len(train_loader) != batching_plan.microbatches_per_epoch:
         raise RuntimeError("ImageNet train loader does not match the resolved batching plan")
-    return train_loader, val_loader, train_sampler, batching_plan
+    return train_loader, val_loader, train_sampler, batching_plan, generators
 
 
 def prepare_operator_backend(run: ImageNetRun, device: torch.device) -> None:
@@ -1229,27 +1408,33 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
 
 
 def _reduce_metrics(
-    values: tuple[float, int, int, int], state: DistributedState
+    packed: torch.Tensor, state: DistributedState
 ) -> tuple[float, float, float]:
-    loss_sum, correct1, correct5, count = values
-    packed = torch.tensor(
-        (loss_sum, float(correct1), float(correct5), float(count)),
-        device=state.device,
-        dtype=torch.float64,
-    )
+    if packed.shape != (4,) or packed.dtype != torch.float64:
+        raise ValueError("metrics must be a float64 tensor with shape [4]")
     if state.enabled:
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    if packed[3].item() == 0:
+    loss_sum, correct1, correct5, count = packed.tolist()
+    if count == 0:
         raise RuntimeError("no samples were processed")
     return (
-        packed[0].item() / packed[3].item(),
-        100.0 * packed[1].item() / packed[3].item(),
-        100.0 * packed[2].item() / packed[3].item(),
+        loss_sum / count,
+        100.0 * correct1 / count,
+        100.0 * correct5 / count,
     )
 
 
 def _autocast() -> Any:
     return torch.autocast(device_type="cuda", dtype=torch.float16)
+
+
+def _assert_finite_loss(loss: torch.Tensor, *, epoch: int, step: int) -> None:
+    message = f"non-finite training loss at epoch {epoch + 1}, step {step + 1}"
+    if loss.is_cuda:
+        # This checks the default CUDA stream without forcing a host readback.
+        torch._assert_async(torch.isfinite(loss), message)
+    elif not torch.isfinite(loss):
+        raise FloatingPointError(message)
 
 
 def train_epoch(
@@ -1273,10 +1458,8 @@ def train_epoch(
     if len(loader) != batching_plan.microbatches_per_epoch:
         raise RuntimeError("ImageNet train loader does not match the resolved batching plan")
     model.train()
-    loss_sum = 0.0
-    correct1 = 0
-    correct5 = 0
-    count = 0
+    metric_totals = torch.zeros(4, device=state.device, dtype=torch.float64)
+    processed_examples = 0
     optimizer_updates = 0
     processed_steps = 0
     started = time.perf_counter()
@@ -1306,10 +1489,7 @@ def train_epoch(
                 logits = model(images)
                 data_loss = criterion(logits, targets)
                 loss = data_loss / batching_plan.grad_accum
-            if not torch.isfinite(data_loss):
-                raise FloatingPointError(
-                    f"non-finite training loss at epoch {epoch + 1}, step {step + 1}"
-                )
+            _assert_finite_loss(data_loss, epoch=epoch, step=step)
             scaler.scale(loss).backward()
         if update_boundary:
             scaler.step(optimizer)
@@ -1319,15 +1499,18 @@ def train_epoch(
             optimizer_updates += 1
 
         batch = images.shape[0]
-        loss_sum += float(data_loss.detach()) * batch
+        metric_totals[0].add_(data_loss.detach().to(dtype=torch.float64), alpha=batch)
         if metric_targets.ndim == 1:
-            correct1 += int((logits.detach().argmax(dim=1) == metric_targets).sum())
-            correct5 += int(
+            correct1 = (logits.detach().argmax(dim=1) == metric_targets).sum()
+            correct5 = (
                 logits.detach().topk(k=min(5, logits.shape[1]), dim=1).indices.eq(
                     metric_targets[:, None]
-                ).any(dim=1).sum()
+                ).any(dim=1).sum().to(dtype=torch.float64)
             )
-        count += batch
+            metric_totals[1].add_(correct1.to(dtype=torch.float64))
+            metric_totals[2].add_(correct5)
+        metric_totals[3].add_(batch)
+        processed_examples += batch
         processed_steps += 1
         if state.is_main and print_freq > 0 and (step + 1) % print_freq == 0:
             elapsed = time.perf_counter() - started
@@ -1340,9 +1523,9 @@ def train_epoch(
                         "steps": len(loader),
                         "optimizer_step": optimizer_updates,
                         "optimizer_steps": batching_plan.updates_per_epoch,
-                        "loss": float(data_loss.detach()),
+                        "loss": data_loss.detach().item(),
                         "lr": optimizer.param_groups[0]["lr"],
-                        "images_per_second": count / max(elapsed, 1.0e-9),
+                        "images_per_second": processed_examples / max(elapsed, 1.0e-9),
                     }
                 ),
                 flush=True,
@@ -1351,7 +1534,7 @@ def train_epoch(
         raise RuntimeError("ImageNet train loader ended before the resolved batching plan")
     if optimizer_updates != batching_plan.updates_per_epoch:
         raise RuntimeError("ImageNet epoch ended without complete optimizer updates")
-    return _reduce_metrics((loss_sum, correct1, correct5, count), state)
+    return _reduce_metrics(metric_totals, state)
 
 
 @torch.no_grad()
@@ -1363,10 +1546,7 @@ def evaluate(
 ) -> tuple[float, float, float]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
-    loss_sum = 0.0
-    correct1 = 0
-    correct5 = 0
-    count = 0
+    metric_totals = torch.zeros(4, device=state.device, dtype=torch.float64)
     for images, targets in loader:
         images = images.to(state.device, non_blocking=True)
         targets = targets.to(state.device, non_blocking=True)
@@ -1374,33 +1554,63 @@ def evaluate(
             logits = model(images)
             loss = criterion(logits, targets)
         batch = images.shape[0]
-        loss_sum += float(loss) * batch
-        correct1 += int((logits.argmax(dim=1) == targets).sum())
-        correct5 += int(
+        correct1 = (logits.argmax(dim=1) == targets).sum()
+        correct5 = (
             logits.topk(k=min(5, logits.shape[1]), dim=1).indices.eq(
                 targets[:, None]
-            ).any(dim=1).sum()
+            ).any(dim=1).sum().to(dtype=torch.float64)
         )
-        count += batch
-    return _reduce_metrics((loss_sum, correct1, correct5, count), state)
+        metric_totals[0].add_(loss.detach().to(dtype=torch.float64), alpha=batch)
+        metric_totals[1].add_(correct1.to(dtype=torch.float64))
+        metric_totals[2].add_(correct5)
+        metric_totals[3].add_(batch)
+    return _reduce_metrics(metric_totals, state)
 
 
-def _git_revision() -> str | None:
+def _source_revision() -> dict[str, str | bool | None]:
     try:
-        return subprocess.check_output(
+        commit = subprocess.check_output(
             ("git", "rev-parse", "HEAD"),
             cwd=ROOT,
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ("git", "status", "--porcelain"),
+                cwd=ROOT,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+        return {"git_commit": commit, "git_dirty": dirty}
     except (OSError, subprocess.CalledProcessError):
-        return None
+        return {"git_commit": None, "git_dirty": None}
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def _atomic_torch_save(value: Mapping[str, Any], path: Path) -> None:
+    """Replace a checkpoint only after its complete temporary file is durable."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            torch.save(value, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
@@ -1440,7 +1650,13 @@ def _recipe_fidelity(
     resolved_optimizer: str,
     allow_lamb_fallback: bool,
 ) -> str:
-    non_semantic_overrides = {"batch_size", "grad_accum", "workers", "save_every"}
+    non_semantic_overrides = {
+        "batch_size",
+        "grad_accum",
+        "train_workers",
+        "val_workers",
+        "save_every",
+    }
     if (
         not (set(run.overrides) - non_semantic_overrides)
         and not allow_lamb_fallback
@@ -1465,6 +1681,7 @@ def _prepare_output(
 ) -> Path:
     output = output.resolve()
     failure: str | None = None
+    source_revision = _source_revision() if state.is_main else None
     if state.is_main:
         try:
             output.mkdir(parents=True, exist_ok=True)
@@ -1484,7 +1701,7 @@ def _prepare_output(
                     "torch": torch.__version__,
                     "cuda": torch.version.cuda,
                     "gpu": torch.cuda.get_device_name(state.device),
-                    "git_revision": _git_revision(),
+                    "source_revision": source_revision,
                 },
                 "args": {
                     key: str(value) if isinstance(value, Path) else value
@@ -1521,6 +1738,7 @@ def _checkpoint(
     run: ImageNetRun,
     batching_plan: BatchingPlan,
     best_acc1: float,
+    rng: Mapping[str, Any],
 ) -> dict[str, Any]:
     contract = run.checkpoint_contract(batching_plan)
     return {
@@ -1534,6 +1752,7 @@ def _checkpoint(
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
+        "rng": dict(rng),
     }
 
 
@@ -1547,28 +1766,33 @@ def _load_resume(
     scaler: torch.amp.GradScaler,
     run: ImageNetRun,
     batching_plan: BatchingPlan,
+    state: DistributedState,
+    generators: LoaderRandomGenerators,
 ) -> tuple[int, float]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict):
         raise ValueError("resume checkpoint must be a mapping")
     if validate_checkpoint_contract(checkpoint) != run.checkpoint_contract(batching_plan):
         raise ValueError("resume checkpoint contract does not match the requested run")
+    rng_state = checkpoint.get("rng")
+    _resume_rng_state_for_rank(rng_state, state=state)
     _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint), strict=True)
     ema_state = checkpoint.get("model_ema")
     if not isinstance(ema_state, dict):
         raise ValueError("resume checkpoint is missing model_ema")
     ema.ema.load_state_dict(ema_state, strict=True)
     for key, owner in (("optimizer", optimizer), ("scheduler", scheduler), ("scaler", scaler)):
-        state = checkpoint.get(key)
-        if not isinstance(state, dict):
+        serialized_state = checkpoint.get(key)
+        if not isinstance(serialized_state, dict):
             raise ValueError(f"resume checkpoint is missing {key}")
-        owner.load_state_dict(state)
+        owner.load_state_dict(serialized_state)
     epoch = checkpoint.get("epoch")
     if not isinstance(epoch, int) or epoch < 0:
         raise ValueError("resume checkpoint has an invalid epoch")
     best_acc1 = checkpoint.get("best_acc1")
     if not isinstance(best_acc1, (float, int)):
         raise ValueError("resume checkpoint has an invalid best_acc1")
+    _restore_resume_rng_state(rng_state, state=state, generators=generators)
     return epoch + 1, float(best_acc1)
 
 
@@ -1581,7 +1805,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         prepare_operator_backend(run, state.device)
-        train_loader, val_loader, train_sampler, batching_plan = build_loaders(
+        train_loader, val_loader, train_sampler, batching_plan, generators = build_loaders(
             run,
             args.data_root,
             state,
@@ -1617,6 +1841,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 scaler=scaler,
                 run=run,
                 batching_plan=batching_plan,
+                state=state,
+                generators=generators,
             )
             # This matches the public DeiT entrypoint after restoring scheduler state.
             scheduler.step(start_epoch)
@@ -1707,25 +1933,53 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "lr": optimizer.param_groups[0]["lr"],
                 "seconds": time.perf_counter() - epoch_started,
             }
+            is_best = False
             if state.is_main:
                 is_best = val_acc1 > best_acc1
                 if is_best:
                     best_acc1 = val_acc1
-                checkpoint = _checkpoint(
-                    epoch=epoch,
-                    model=model,
-                    ema=ema,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    run=run,
-                    batching_plan=batching_plan,
-                    best_acc1=best_acc1,
-                )
-                if (epoch + 1) % int(run.train["save_every"]) == 0:
-                    torch.save(checkpoint, output / "checkpoint_last.pt")
-                if is_best:
-                    torch.save(checkpoint, output / "checkpoint_best.pt")
+            if state.enabled:
+                best_payload: list[Any] = [is_best, best_acc1]
+                dist.broadcast_object_list(best_payload, src=0)
+                is_best = bool(best_payload[0])
+                best_acc1 = float(best_payload[1])
+            save_last = (epoch + 1) % int(run.train["save_every"]) == 0
+            rng_state = (
+                _capture_resume_rng_state(state, generators)
+                if save_last or is_best
+                else None
+            )
+            checkpoint_failure: str | None = None
+            if state.is_main:
+                if save_last or is_best:
+                    try:
+                        if rng_state is None:
+                            raise RuntimeError("checkpoint RNG state was not collected")
+                        checkpoint = _checkpoint(
+                            epoch=epoch,
+                            model=model,
+                            ema=ema,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            run=run,
+                            batching_plan=batching_plan,
+                            best_acc1=best_acc1,
+                            rng=rng_state,
+                        )
+                        if save_last:
+                            _atomic_torch_save(checkpoint, output / "checkpoint_last.pt")
+                        if is_best:
+                            _atomic_torch_save(checkpoint, output / "checkpoint_best.pt")
+                    except Exception as error:
+                        checkpoint_failure = f"{type(error).__name__}: {error}"
+            if state.enabled:
+                failure_payload: list[str | None] = [checkpoint_failure]
+                dist.broadcast_object_list(failure_payload, src=0)
+                checkpoint_failure = failure_payload[0]
+            if checkpoint_failure is not None:
+                raise RuntimeError(f"unable to save ImageNet checkpoint: {checkpoint_failure}")
+            if state.is_main:
                 record["best_val_acc1"] = best_acc1
                 _append_jsonl(output / "metrics.jsonl", record)
                 print(json.dumps(record), flush=True)

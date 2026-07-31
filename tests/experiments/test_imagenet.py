@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import random
 import sys
 import runpy
 from collections import Counter
@@ -10,7 +11,7 @@ from types import ModuleType
 
 import pytest
 import torch
-from torch.utils.data import DataLoader, SequentialSampler, TensorDataset
+from torch.utils.data import DataLoader, Dataset, SequentialSampler, TensorDataset
 
 import experiments.imagenet as imagenet
 from experiments.imagenet import (
@@ -18,11 +19,16 @@ from experiments.imagenet import (
     DEFAULT_CONFIG,
     DistributedState,
     ImageNetRun,
+    LoaderRandomGenerators,
     VirtualGroupSampler,
+    _atomic_torch_save,
+    _capture_resume_rng_state,
     _checkpoint,
     _load_resume,
     _recipe_fidelity,
+    _restore_resume_rng_state,
     apply_virtual_group_mixup,
+    build_loaders,
     build_optimizer,
     build_scheduler,
     checkpoint_contract_digest,
@@ -88,6 +94,38 @@ def _checkpoint_batching_plan() -> BatchingPlan:
     )
 
 
+def _loader_generators(seed: int = 0) -> LoaderRandomGenerators:
+    return LoaderRandomGenerators(
+        train=torch.Generator().manual_seed(seed),
+        validation=torch.Generator().manual_seed(seed + 1),
+    )
+
+
+class _WorkerRandomDataset(Dataset[torch.Tensor]):
+    def __len__(self) -> int:
+        return 8
+
+    def __getitem__(self, _index: int) -> torch.Tensor:
+        import numpy as np
+
+        return torch.tensor(
+            (random.random(), float(np.random.random()), float(torch.rand(()))),
+            dtype=torch.float64,
+        )
+
+
+def _worker_random_loader(generator: torch.Generator) -> DataLoader[torch.Tensor]:
+    return DataLoader(
+        _WorkerRandomDataset(),
+        batch_size=2,
+        num_workers=1,
+        persistent_workers=False,
+        multiprocessing_context="spawn",
+        worker_init_fn=imagenet._seed_worker,
+        generator=generator,
+    )
+
+
 def test_small_recipe_preserves_deit3_geometry_and_800_epoch_contract(tmp_path: Path) -> None:
     run = load_run(_args(tmp_path))
     assert run.model == {
@@ -114,11 +152,91 @@ def test_small_recipe_preserves_deit3_geometry_and_800_epoch_contract(tmp_path: 
         run.train["effective_batch"],
         run.train["augmentation_group_size"],
     ) == (256, 2048, 256)
+    assert (run.train["train_workers"], run.train["val_workers"]) == (10, 4)
     assert run.operator == {
         "core_mode": "dynamic",
         "rank_rotary": True,
         "bias": True,
         "implementation": "cuda",
+    }
+
+
+def test_worker_counts_are_independently_overridable(tmp_path: Path) -> None:
+    run = load_run(_args(tmp_path, "--train-workers", "7", "--val-workers", "0"))
+    assert (run.train["train_workers"], run.train["val_workers"]) == (7, 0)
+    assert {"train_workers", "val_workers"}.issubset(run.overrides)
+
+
+def test_loaders_recreate_workers_and_keep_independent_generators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datasets = pytest.importorskip("torchvision.datasets")
+
+    class FakeImageFolder:
+        def __init__(self, _root: Path, *, transform: object) -> None:
+            self.transform = transform
+            self.classes = tuple(f"class_{index}" for index in range(1000))
+            self.class_to_idx = {
+                name: index for index, name in enumerate(self.classes)
+            }
+
+        def __len__(self) -> int:
+            return 2048
+
+        def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+            return torch.zeros(3, 4, 4), index % 1000
+
+    data_root = tmp_path / "imagenet"
+    (data_root / "train").mkdir(parents=True)
+    (data_root / "val").mkdir()
+    monkeypatch.setattr(datasets, "ImageFolder", FakeImageFolder)
+    monkeypatch.setattr(imagenet, "build_train_transform", lambda _run: None)
+    monkeypatch.setattr(imagenet, "build_eval_transform", lambda _run: None)
+
+    train_loader, val_loader, _, _, generators = build_loaders(
+        load_run(_args(tmp_path, "--train-workers", "2", "--val-workers", "1")),
+        data_root,
+        _cpu_state(),
+        requested_grad_accum=None,
+    )
+    assert not train_loader.persistent_workers
+    assert not val_loader.persistent_workers
+    assert train_loader.generator is generators.train
+    assert val_loader.generator is generators.validation
+    assert not torch.equal(generators.train.get_state(), generators.validation.get_state())
+
+
+def test_imagenet_class_mapping_requires_identical_labels() -> None:
+    imagenet._validate_imagefolder_classes(
+        ("n014", "n015"),
+        {"n014": 0, "n015": 1},
+        ("n014", "n015"),
+        {"n014": 0, "n015": 1},
+        expected_classes=2,
+    )
+    with pytest.raises(ValueError, match="class mappings"):
+        imagenet._validate_imagefolder_classes(
+            ("n014", "n015"),
+            {"n014": 0, "n015": 1},
+            ("n014", "n016"),
+            {"n014": 0, "n016": 1},
+            expected_classes=2,
+        )
+
+
+def test_source_revision_records_a_dirty_worktree(monkeypatch: pytest.MonkeyPatch) -> None:
+    def check_output(command: tuple[str, ...], **_kwargs: object) -> str:
+        if command == ("git", "rev-parse", "HEAD"):
+            return "abc123\n"
+        if command == ("git", "status", "--porcelain"):
+            return " M experiments/imagenet.py\n"
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(imagenet.subprocess, "check_output", check_output)
+    assert imagenet._source_revision() == {
+        "git_commit": "abc123",
+        "git_dirty": True,
     }
 
 
@@ -314,7 +432,7 @@ def test_finetune_loader_interpolates_the_shared_encoder_position_key(tmp_path: 
     contract = run.checkpoint_contract(_checkpoint_batching_plan())
     torch.save(
         {
-            "format_version": 3,
+            "format_version": 4,
             "contract": contract,
             "contract_digest": checkpoint_contract_digest(contract),
             "model": source.state_dict(),
@@ -489,6 +607,28 @@ def test_gradient_accumulation_matches_one_effective_batch(
     assert (scaler.steps, scaler.updates, ema.updates) == (1, 1, 1)
 
 
+def test_evaluate_preserves_weighted_metrics_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(torch.eye(2))
+    features = torch.tensor(((4.0, 0.0), (0.0, 4.0), (-4.0, 0.0)))
+    targets = torch.tensor((0, 1, 1))
+    monkeypatch.setattr(imagenet, "_autocast", lambda: nullcontext())
+
+    loss, accuracy1, accuracy5 = imagenet.evaluate(
+        model,
+        DataLoader(TensorDataset(features, targets), batch_size=2),
+        state=_cpu_state(),
+    )
+
+    expected_loss = torch.nn.functional.cross_entropy(model(features), targets).item()
+    assert loss == pytest.approx(expected_loss)
+    assert accuracy1 == 100.0
+    assert accuracy5 == 100.0
+
+
 def test_checkpoint_round_trip_uses_timm_model_ema(
     tmp_path: Path,
 ) -> None:
@@ -505,6 +645,7 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
     source_scaler = torch.amp.GradScaler("cpu")
     run = load_run(_args(tmp_path))
     batching_plan = _checkpoint_batching_plan()
+    source_generators = _loader_generators(23)
     payload = _checkpoint(
         epoch=4,
         model=source,
@@ -515,6 +656,7 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
         run=run,
         batching_plan=batching_plan,
         best_acc1=73.5,
+        rng=_capture_resume_rng_state(_cpu_state(), source_generators),
     )
     path = tmp_path / "checkpoint.pt"
     torch.save(payload, path)
@@ -524,6 +666,7 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
     target_optimizer = torch.optim.SGD(target.parameters(), lr=0.1)
     target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=3)
     target_scaler = torch.amp.GradScaler("cpu")
+    target_generators = _loader_generators(47)
     start_epoch, best_acc1 = _load_resume(
         path,
         model=target,
@@ -533,6 +676,8 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
         scaler=target_scaler,
         run=run,
         batching_plan=batching_plan,
+        state=_cpu_state(),
+        generators=target_generators,
     )
     assert (start_epoch, best_acc1) == (5, 73.5)
     for source_parameter, target_parameter in zip(
@@ -569,7 +714,153 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
             scaler=target_scaler,
             run=run,
             batching_plan=changed_physical_plan,
+            state=_cpu_state(),
+            generators=target_generators,
         )
+
+
+def test_resume_rng_state_replays_python_numpy_torch_and_loader_generators() -> None:
+    numpy = pytest.importorskip("numpy")
+    state = _cpu_state()
+    source_generators = _loader_generators(71)
+    random.seed(13)
+    numpy.random.seed(17)
+    torch.manual_seed(19)
+    saved = _capture_resume_rng_state(state, source_generators)
+
+    expected_python = random.random()
+    expected_numpy = numpy.random.random(5)
+    expected_torch = torch.rand(5)
+    expected_train_generator = torch.rand(5, generator=source_generators.train)
+    expected_validation_generator = torch.rand(
+        5, generator=source_generators.validation
+    )
+
+    random.random()
+    numpy.random.random(5)
+    torch.rand(5)
+    torch.rand(5, generator=source_generators.train)
+    torch.rand(5, generator=source_generators.validation)
+
+    restored_generators = _loader_generators(101)
+    _restore_resume_rng_state(
+        saved,
+        state=state,
+        generators=restored_generators,
+    )
+    assert random.random() == expected_python
+    numpy.testing.assert_array_equal(numpy.random.random(5), expected_numpy)
+    assert torch.equal(torch.rand(5), expected_torch)
+    assert torch.equal(
+        torch.rand(5, generator=restored_generators.train),
+        expected_train_generator,
+    )
+    assert torch.equal(
+        torch.rand(5, generator=restored_generators.validation),
+        expected_validation_generator,
+    )
+
+
+def test_nonpersistent_worker_rng_replays_from_its_loader_generator() -> None:
+    pytest.importorskip("numpy")
+    state = _cpu_state()
+    source_generators = _loader_generators(113)
+    loader = _worker_random_loader(source_generators.train)
+    list(loader)
+    saved = _capture_resume_rng_state(state, source_generators)
+
+    expected = [batch.clone() for batch in loader]
+    restored_generators = _loader_generators(127)
+    _restore_resume_rng_state(
+        saved,
+        state=state,
+        generators=restored_generators,
+    )
+    actual = [batch.clone() for batch in _worker_random_loader(restored_generators.train)]
+
+    assert len(actual) == len(expected)
+    for actual_batch, expected_batch in zip(actual, expected, strict=True):
+        assert torch.equal(actual_batch, expected_batch)
+
+
+def test_resume_rejects_missing_rng_before_loading_model(tmp_path: Path) -> None:
+    class Ema:
+        def __init__(self, model: torch.nn.Module) -> None:
+            self.ema = copy.deepcopy(model)
+
+    run = load_run(_args(tmp_path))
+    batching_plan = _checkpoint_batching_plan()
+    source = torch.nn.Linear(2, 2)
+    source_ema = Ema(source)
+    source_optimizer = torch.optim.SGD(source.parameters(), lr=0.1)
+    source_scheduler = torch.optim.lr_scheduler.StepLR(source_optimizer, step_size=3)
+    source_scaler = torch.amp.GradScaler("cpu")
+    payload = _checkpoint(
+        epoch=0,
+        model=source,
+        ema=source_ema,
+        optimizer=source_optimizer,
+        scheduler=source_scheduler,
+        scaler=source_scaler,
+        run=run,
+        batching_plan=batching_plan,
+        best_acc1=0.0,
+        rng=_capture_resume_rng_state(_cpu_state(), _loader_generators(131)),
+    )
+    payload.pop("rng")
+    path = tmp_path / "missing_rng.pt"
+    torch.save(payload, path)
+
+    target = torch.nn.Linear(2, 2)
+    target_before = copy.deepcopy(target.state_dict())
+    target_ema = Ema(target)
+    target_optimizer = torch.optim.SGD(target.parameters(), lr=0.1)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=3)
+    target_scaler = torch.amp.GradScaler("cpu")
+    with pytest.raises(ValueError, match="RNG state"):
+        _load_resume(
+            path,
+            model=target,
+            ema=target_ema,
+            optimizer=target_optimizer,
+            scheduler=target_scheduler,
+            scaler=target_scaler,
+            run=run,
+            batching_plan=batching_plan,
+            state=_cpu_state(),
+            generators=_loader_generators(137),
+        )
+    for name, parameter in target.state_dict().items():
+        assert torch.equal(parameter, target_before[name])
+
+
+def test_atomic_checkpoint_write_preserves_the_previous_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "checkpoint.pt"
+    previous = {"value": torch.tensor((1, 2, 3))}
+    torch.save(previous, path)
+
+    def interrupted_save(_value: object, handle: object) -> None:
+        handle.write(b"partial")  # type: ignore[union-attr]
+        raise OSError("simulated preemption")
+
+    monkeypatch.setattr(imagenet.torch, "save", interrupted_save)
+    with pytest.raises(OSError, match="simulated preemption"):
+        _atomic_torch_save({"value": torch.tensor((4, 5, 6))}, path)
+
+    restored = torch.load(path, map_location="cpu", weights_only=False)
+    assert torch.equal(restored["value"], previous["value"])
+    assert not list(tmp_path.glob(".checkpoint.pt.*.tmp"))
+
+
+def test_atomic_checkpoint_write_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.pt"
+    expected = {"value": torch.tensor((4, 5, 6))}
+    _atomic_torch_save(expected, path)
+    restored = torch.load(path, map_location="cpu", weights_only=False)
+    assert torch.equal(restored["value"], expected["value"])
 
 
 def test_fused_lamb_uses_the_fixed_deit3_epsilon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
