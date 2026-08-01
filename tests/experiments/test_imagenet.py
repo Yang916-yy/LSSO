@@ -26,10 +26,12 @@ from experiments.imagenet import (
     _atomic_torch_save,
     _capture_resume_rng_state,
     _checkpoint,
+    _checkpoint_model_state,
     _load_resume,
     _recipe_fidelity,
     _restore_resume_rng_state,
     apply_virtual_group_mixup,
+    build_ema,
     build_loaders,
     build_optimizer,
     build_scheduler,
@@ -40,6 +42,7 @@ from experiments.imagenet import (
     parse_args,
     resolve_batching_plan,
     train_epoch,
+    update_ema,
 )
 
 
@@ -1029,6 +1032,48 @@ def test_gradient_accumulation_matches_one_effective_batch(
     )
     torch.testing.assert_close(model.weight, reference.weight)
     assert (scaler.steps, scaler.updates, ema.updates) == (1, 1, 1)
+
+
+def test_timm_ema_updates_lsso_tensor_state_without_averaging_contract(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("timm")
+    from lsso import LSSO, LSSOConfig
+
+    model = LSSO(LSSOConfig(16, 2, rank=4))
+    run = ImageNetRun(
+        config_path=tmp_path / "test.toml",
+        tier="test",
+        phase="test",
+        model={},
+        operator={},
+        train={"ema_decay": 0.5},
+        overrides=(),
+    )
+    ema = build_ema(model, run)
+    initial = model.core_base_raw.detach().clone()
+    with torch.no_grad():
+        model.core_base_raw.add_(2.0)
+
+    update_ema(ema, model)
+
+    torch.testing.assert_close(ema.ema.core_base_raw, initial + 1.0)
+    assert ema.ema.state_dict()["_extra_state"] == model.state_dict()["_extra_state"]
+
+
+def test_checkpoint_model_state_preserves_lsso_contract_entries() -> None:
+    from lsso import LSSO, LSSOConfig
+
+    source = LSSO(LSSOConfig(16, 2, rank=4))
+    restored = _checkpoint_model_state({"model": source.state_dict()})
+    assert isinstance(restored["_extra_state"], dict)
+
+    target = LSSO(LSSOConfig(16, 2, rank=4))
+    target.load_state_dict(restored, strict=True)
+    torch.testing.assert_close(target.core_base_raw, source.core_base_raw)
+
+    with pytest.raises(ValueError, match="LSSO _extra_state"):
+        _checkpoint_model_state({"model": {"unexpected": {}}})
 
 
 def test_evaluate_preserves_weighted_metrics_across_batches(

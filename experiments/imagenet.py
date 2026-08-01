@@ -1786,13 +1786,19 @@ def build_model(run: ImageNetRun) -> nn.Module:
     )
 
 
-def _checkpoint_model_state(checkpoint: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+def _checkpoint_model_state(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     state = checkpoint.get("model")
     if not isinstance(state, dict) or not all(
-        isinstance(key, str) and isinstance(value, torch.Tensor)
+        isinstance(key, str)
+        and (
+            isinstance(value, torch.Tensor)
+            or (key.endswith("_extra_state") and isinstance(value, dict))
+        )
         for key, value in state.items()
     ):
-        raise ValueError("checkpoint must contain a tensor state dict under 'model'")
+        raise ValueError(
+            "checkpoint must contain tensor model state and LSSO _extra_state contracts"
+        )
     return copy.deepcopy(state)
 
 
@@ -1888,7 +1894,7 @@ def load_finetune_checkpoint(model: nn.Module, path: Path, run: ImageNetRun) -> 
         )
 
 
-def _position_embedding_key(state: Mapping[str, torch.Tensor]) -> str | None:
+def _position_embedding_key(state: Mapping[str, Any]) -> str | None:
     keys = [key for key in state if key == "pos_embed" or key.endswith(".pos_embed")]
     if not keys:
         return None
@@ -2067,6 +2073,33 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DistributedDataParallel) else model
 
 
+def update_ema(ema: Any, model: nn.Module) -> None:
+    """Update timm EMA while preserving immutable non-tensor state-dict entries."""
+
+    if not hasattr(ema, "ema") or not hasattr(ema, "decay"):
+        ema.update(model)
+        return
+
+    source_state = _unwrap_model(model).state_dict()
+    ema_state = ema.ema.state_dict()
+    if source_state.keys() != ema_state.keys():
+        raise RuntimeError("EMA model state does not match the training model")
+    with torch.no_grad():
+        for key, ema_value in ema_state.items():
+            source_value = source_state[key]
+            if not isinstance(ema_value, torch.Tensor):
+                if ema_value != source_value:
+                    raise RuntimeError(f"EMA non-tensor state differs at {key!r}")
+                continue
+            if not isinstance(source_value, torch.Tensor):
+                raise RuntimeError(f"EMA tensor state differs in type at {key!r}")
+            source_value = source_value.detach()
+            device = getattr(ema, "device", "")
+            if device:
+                source_value = source_value.to(device=device)
+            ema_value.copy_(ema_value * ema.decay + source_value * (1.0 - ema.decay))
+
+
 def _reduce_metrics(
     packed: torch.Tensor, state: DistributedState
 ) -> tuple[float, float, float]:
@@ -2157,7 +2190,7 @@ def train_epoch(
             scaler.step(optimizer)
             scaler.update()
             model.zero_grad(set_to_none=True)
-            ema.update(model)
+            update_ema(ema, model)
             optimizer_updates += 1
 
         batch = images.shape[0]
