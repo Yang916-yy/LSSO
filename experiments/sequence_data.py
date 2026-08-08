@@ -35,9 +35,11 @@ GENOMIC_BENCHMARKS = (
     "human_nontata_promoters",
     "human_ocr_ensembl",
 )
-LRA_TASKS = ("listops", "text", "retrieval", "pathfinder")
+LRA_TASKS = ("listops", "text", "retrieval", "pathfinder", "pathx")
+PATHFINDER_TASKS = ("pathfinder", "pathx")
 LRA_SOURCE_REVISION = "google-research/long-range-arena@cd31e5c6"
 PATHFINDER_SPLIT_PROTOCOL = "tfds-v4.0.1-hard-md5-order-v1"
+PATHX_RESOLUTION = 128
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class DatasetBundle:
     vocab_size: int | None = None
     pad_token_id: int | None = None
     paired: bool = False
+    value_masking: Literal["length", "nonzero"] = "length"
 
 
 class TokenVocabulary:
@@ -433,17 +436,23 @@ def collate_token_pairs(
 
 def collate_values(
     rows: Sequence[tuple[torch.Tensor, int]],
+    *,
+    value_masking: Literal["length", "nonzero"] = "length",
 ) -> dict[str, torch.Tensor | float]:
+    if value_masking not in ("length", "nonzero"):
+        raise ValueError(f"unsupported value masking contract: {value_masking}")
     values, labels = zip(*rows)
     lengths = torch.tensor([value.shape[0] for value in values], dtype=torch.long)
     inputs = pad_sequence(values, batch_first=True)
     positions = torch.arange(inputs.shape[1]).unsqueeze(0)
+    mask = positions < lengths.unsqueeze(1)
+    if value_masking == "nonzero":
+        mask = mask & inputs.ne(0).any(dim=-1)
     return {
         "inputs": inputs,
-        "mask": positions < lengths.unsqueeze(1),
+        "mask": mask,
         "labels": torch.tensor(labels, dtype=torch.long),
-        "padding_ratio": 1.0
-        - float(lengths.sum()) / max(inputs.shape[0] * inputs.shape[1], 1),
+        "padding_ratio": 1.0 - float(mask.sum()) / max(mask.numel(), 1),
     }
 
 
@@ -596,24 +605,35 @@ def prepare_lra(
     revision: str | None,
     formal: bool = False,
 ) -> DatasetBundle:
-    """Prepare the four paper LRA tasks with pinned preprocessing semantics."""
+    """Prepare the public LRA tasks with pinned preprocessing semantics."""
 
     if task not in LRA_TASKS:
         raise ValueError(f"unsupported LRA task: {task}")
-    if task == "pathfinder":
+    if task in PATHFINDER_TASKS:
+        task_name = "Path-X" if task == "pathx" else "Pathfinder"
         if max_length is not None:
-            raise ValueError("Pathfinder derives max_length from its resolution")
+            raise ValueError(f"{task_name} derives max_length from its resolution")
         if validation_fraction is not None or split_seed is not None:
-            raise ValueError("Pathfinder uses the official hard 80/10/10 split")
-        if pathfinder_resolution is None or pathfinder_resolution <= 0:
-            raise ValueError("Pathfinder requires a positive resolution")
+            raise ValueError(f"{task_name} uses the official hard 80/10/10 split")
+        if task == "pathx":
+            if pathfinder_resolution is not None:
+                raise ValueError(
+                    "Path-X fixes its resolution at 128; "
+                    "use Pathfinder for a configurable resolution"
+                )
+            resolution = PATHX_RESOLUTION
+        else:
+            if pathfinder_resolution is None or pathfinder_resolution <= 0:
+                raise ValueError("Pathfinder requires a positive resolution")
+            resolution = pathfinder_resolution
         return _prepare_lra_pathfinder(
             data_root=data_root,
-            resolution=pathfinder_resolution,
+            task=task,
+            resolution=resolution,
             formal=formal,
         )
     if pathfinder_resolution is not None:
-        raise ValueError("pathfinder_resolution is only valid for Pathfinder")
+        raise ValueError("pathfinder_resolution is only valid for generic Pathfinder")
     if max_length is None:
         raise ValueError(f"LRA {task} requires max_length")
     _require_positive_length(max_length)
@@ -1177,7 +1197,7 @@ def _prepare_lra_retrieval(
 
 
 def _prepare_lra_pathfinder(
-    *, data_root: Path, resolution: int, formal: bool
+    *, data_root: Path, task: str, resolution: int, formal: bool
 ) -> DatasetBundle:
     source = _resolve_pathfinder_directory(data_root, resolution)
     full = PathfinderDataset(source)
@@ -1186,7 +1206,12 @@ def _prepare_lra_pathfinder(
         include_content_hash=formal,
     )
     source_manifest = _optional_source_manifest(data_root)
-    _verify_pathfinder_manifest(source_signature, len(full), source_manifest)
+    _verify_pathfinder_manifest(
+        source_signature,
+        len(full),
+        source_manifest,
+        resolution=resolution,
+    )
     train_indices, validation_indices, test_indices = pathfinder_split_indices(
         full.sample_keys
     )
@@ -1200,9 +1225,10 @@ def _prepare_lra_pathfinder(
         input_kind="values",
         num_classes=2,
         max_length=resolution**2,
+        value_masking="nonzero",
         metadata={
             "suite": "lra",
-            "task": "pathfinder",
+            "task": task,
             "source_definition": LRA_SOURCE_REVISION,
             "source": {
                 **source_signature,
@@ -1215,6 +1241,7 @@ def _prepare_lra_pathfinder(
                 "test": index_fingerprint(test),
             },
             "resolution": resolution,
+            "value_masking": "nonzero-pixels",
         },
     )
 
@@ -1527,11 +1554,15 @@ def _pathfinder_source_signature(
 
 
 def _verify_pathfinder_manifest(
-    signature: dict[str, Any], examples: int, manifest: dict[str, Any] | None
+    signature: dict[str, Any],
+    examples: int,
+    manifest: dict[str, Any] | None,
+    *,
+    resolution: int,
 ) -> None:
     if manifest is None:
         return
-    expected = manifest.get("pathfinder32_hard")
+    expected = manifest.get(f"pathfinder{resolution}_hard")
     if not isinstance(expected, dict):
         return
     for key, actual in (
@@ -1573,7 +1604,9 @@ __all__ = [
     "IndexedDataset",
     "LRA_TASKS",
     "NucleotideTokenizer",
+    "PATHFINDER_TASKS",
     "PATHFINDER_SPLIT_PROTOCOL",
+    "PATHX_RESOLUTION",
     "TokenVocabulary",
     "collate_token_pairs",
     "collate_tokens",

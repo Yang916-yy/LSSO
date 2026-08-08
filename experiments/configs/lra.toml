@@ -9,19 +9,3 @@ mixer = "lsso"
 implementation = "cuda"
 core_mode = "dynamic"
 rank_rotary = true
-dim = 256
-depth = 2
-heads = 8
-rank = 32
-mlp_ratio = 4.0
-dropout = 0.1
-bias = true
-
-[train]
-# The runner resolves epochs, batch sizes, learning rate, and patience from
-# the selected LRA task.  This keeps `--task pathfinder` from inheriting
-# ListOps settings when this shared configuration is used.
-weight_decay = 0.01
-warmup_ratio = 0.05
-grad_accum = 1
-grad_clip = 1.0

@@ -2,18 +2,22 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import functools
+import json
 from pathlib import Path
 
 import torch
 import pytest
 from torch.utils.data import Dataset, TensorDataset
 
+import experiments.train_transformers as train_transformers
 from experiments.sequence_data import (
     DatasetBundle,
     NucleotideTokenizer,
+    PATHFINDER_SPLIT_PROTOCOL,
     TokenVocabulary,
     build_packed_tokens,
     collate_tokens,
+    collate_values,
     pathfinder_split_indices,
     prepare_genomic_benchmarks,
     prepare_lra,
@@ -25,11 +29,13 @@ from experiments.train_transformers import (
     SequenceEncoder,
     SequencePairClassifier,
     TrainingConfig,
+    _build_collate,
     _build_run_payload,
     _runtime_metadata,
     _is_better_validation_checkpoint,
     _makes_early_stop_progress,
     _validate_formal_data_source,
+    build_model,
     parse_args,
     resolve_args,
     train,
@@ -60,6 +66,138 @@ def _encoder(mixer: str) -> SequenceEncoder:
         dropout=0.0,
         bias=True,
     )
+
+
+def _grid_encoder(mixer: str) -> SequenceEncoder:
+    return SequenceEncoder(
+        input_kind="values",
+        vocab_size=None,
+        pad_token_id=None,
+        max_length=6,
+        dim=16,
+        depth=2,
+        num_heads=2,
+        rank=4,
+        mixer=mixer,  # type: ignore[arg-type]
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        implementation="reference",
+        mlp_ratio=2.0,
+        dropout=0.0,
+        bias=True,
+        grid_shape=(2, 3),
+    )
+
+
+def test_learned_position_embedding_uses_small_normal_initialization() -> None:
+    torch.manual_seed(31)
+    weights = _encoder("mha").position_embedding.weight.detach()
+    assert abs(float(weights.mean())) < 0.006
+    assert float(weights.std(unbiased=False)) == pytest.approx(0.02, abs=0.004)
+
+
+def test_grid_peg_uses_factorized_coordinates_at_the_flat_position_scale() -> None:
+    torch.manual_seed(31)
+    encoder = _grid_encoder("mha")
+    assert encoder.position_embedding is None
+    assert encoder.row_embedding is not None
+    assert encoder.column_embedding is not None
+    coordinates = encoder._position_features(length=6, device=torch.device("cpu"))
+    torch.testing.assert_close(
+        coordinates[5], encoder.row_embedding.weight[1] + encoder.column_embedding.weight[2]
+    )
+    assert float(coordinates.detach().std(unbiased=False)) == pytest.approx(0.02, abs=0.006)
+
+
+def test_grid_peg_rejects_non_grid_inputs() -> None:
+    with pytest.raises(ValueError, match="value inputs"):
+        SequenceEncoder(
+            input_kind="tokens",
+            vocab_size=8,
+            pad_token_id=0,
+            max_length=6,
+            dim=8,
+            depth=1,
+            num_heads=2,
+            rank=4,
+            mixer="mha",
+            core_mode=CoreMode.DYNAMIC,
+            rank_rotary=False,
+            implementation="reference",
+            mlp_ratio=2.0,
+            dropout=0.0,
+            bias=True,
+            grid_shape=(2, 3),
+        )
+    with pytest.raises(ValueError, match="exactly cover"):
+        SequenceEncoder(
+            input_kind="values",
+            vocab_size=None,
+            pad_token_id=None,
+            max_length=8,
+            dim=8,
+            depth=1,
+            num_heads=2,
+            rank=4,
+            mixer="mha",
+            core_mode=CoreMode.DYNAMIC,
+            rank_rotary=False,
+            implementation="reference",
+            mlp_ratio=2.0,
+            dropout=0.0,
+            bias=True,
+            grid_shape=(2, 3),
+        )
+    with pytest.raises(ValueError, match="full 2x3 grid"):
+        _grid_encoder("mha")(torch.ones(1, 5, 1), torch.ones(1, 5, dtype=torch.bool))
+
+
+def test_pathx_length_is_covered_by_the_learned_position_table() -> None:
+    encoder = SequenceEncoder(
+        input_kind="values",
+        vocab_size=None,
+        pad_token_id=None,
+        max_length=128**2,
+        dim=8,
+        depth=1,
+        num_heads=2,
+        rank=4,
+        mixer="mha",
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=False,
+        implementation="reference",
+        mlp_ratio=2.0,
+        dropout=0.0,
+        bias=True,
+    )
+    last_position = torch.tensor([128**2 - 1])
+    assert encoder.position_embedding(last_position).shape == (1, 8)
+
+
+def test_pathx_full_length_reference_forward_and_backward_are_finite() -> None:
+    encoder = SequenceEncoder(
+        input_kind="values",
+        vocab_size=None,
+        pad_token_id=None,
+        max_length=128**2,
+        dim=8,
+        depth=1,
+        num_heads=2,
+        rank=4,
+        mixer="lsso",
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        implementation="reference",
+        mlp_ratio=2.0,
+        dropout=0.0,
+        bias=True,
+    )
+    inputs = torch.rand(1, 128**2, 1, requires_grad=True)
+    valid_mask = torch.ones(1, 128**2, dtype=torch.bool)
+    loss = encoder(inputs, valid_mask).float().square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
 
 
 def test_byte_vocabulary_preserves_utf8_bytes_and_eos() -> None:
@@ -116,13 +254,43 @@ def test_collate_uses_lengths_not_the_token_value() -> None:
 
 
 @pytest.mark.parametrize("mixer", ("mha", "lsso"))
-def test_sequence_classifier_masks_padding_for_both_mixers(mixer: str) -> None:
+@pytest.mark.parametrize("pooling", ("mean", "meanmax"))
+def test_sequence_classifier_masks_padding_for_both_mixers(
+    mixer: str, pooling: str
+) -> None:
     torch.manual_seed(4)
-    model = SequenceClassifier(_encoder(mixer), 3).eval()
+    model = SequenceClassifier(_encoder(mixer), 3, pooling=pooling).eval()  # type: ignore[arg-type]
     mask = torch.tensor([[True, True, False, False], [True, False, False, False]])
     first = torch.tensor([[2, 3, 0, 0], [4, 0, 0, 0]])
     second = torch.tensor([[2, 3, 10, 9], [4, 8, 7, 6]])
     torch.testing.assert_close(model(first, mask), model(second, mask), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mixer", ("mha", "lsso"))
+def test_grid_peg_masks_invalid_pixels_for_both_mixers(mixer: str) -> None:
+    torch.manual_seed(17)
+    model = SequenceClassifier(_grid_encoder(mixer), 3, pooling="meanmax").eval()  # type: ignore[arg-type]
+    valid = torch.tensor([[True, False, True, False, True, False]])
+    first = torch.tensor([[[1.0], [0.0], [2.0], [0.0], [3.0], [0.0]]])
+    second = torch.tensor([[[1.0], [8.0], [2.0], [7.0], [3.0], [6.0]]])
+    torch.testing.assert_close(model(first, valid), model(second, valid), rtol=0, atol=0)
+
+
+def test_meanmax_readout_handles_an_empty_valid_set() -> None:
+    model = SequenceClassifier(_encoder("mha"), 3, pooling="meanmax")
+    encoded = torch.randn(2, 3, 16)
+    valid = torch.tensor([[False, False, False], [True, False, False]])
+    pooled = model._pool(encoded, valid)
+    assert pooled.shape == (2, 16)
+    assert torch.isfinite(pooled).all()
+    assert model.meanmax_projection is not None
+    assert model.readout_projection is not None
+
+
+def test_mean_readout_keeps_the_existing_parameterization() -> None:
+    model = SequenceClassifier(_encoder("mha"), 3)
+    assert model.meanmax_projection is None
+    assert model.readout_projection is None
 
 
 def test_pair_classifier_accepts_independent_lengths() -> None:
@@ -136,6 +304,29 @@ def test_pair_classifier_accepts_independent_lengths() -> None:
     assert torch.isfinite(logits).all()
 
 
+def test_meanmax_pooling_is_rejected_for_paired_tasks() -> None:
+    args = resolve_args(
+        parse_args(["--suite", "lra", "--task", "retrieval", "--pooling", "meanmax"])
+    )
+    dataset = TensorDataset(
+        torch.ones(1, 4, dtype=torch.long), torch.zeros(1, dtype=torch.long)
+    )
+    bundle = DatasetBundle(
+        train=dataset,
+        validation=dataset,
+        test=dataset,
+        input_kind="tokens",
+        num_classes=2,
+        max_length=4,
+        metadata={},
+        vocab_size=8,
+        pad_token_id=0,
+        paired=True,
+    )
+    with pytest.raises(ValueError, match="not supported for paired"):
+        build_model(args, bundle)
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mha_baseline_accepts_fp16_autocast_with_padding() -> None:
@@ -144,6 +335,45 @@ def test_mha_baseline_accepts_fp16_autocast_with_padding() -> None:
     mask = inputs.ne(0)
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         loss = model(inputs, mask).square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_lsso_meanmax_readout_is_finite_with_masked_values() -> None:
+    cuda.load()
+    encoder = SequenceEncoder(
+        input_kind="values",
+        vocab_size=None,
+        pad_token_id=None,
+        max_length=8,
+        dim=16,
+        depth=1,
+        num_heads=2,
+        rank=16,
+        mixer="lsso",
+        core_mode=CoreMode.DYNAMIC,
+        rank_rotary=True,
+        implementation="cuda",
+        mlp_ratio=2.0,
+        dropout=0.0,
+        bias=True,
+        grid_shape=(2, 4),
+    )
+    model = SequenceClassifier(encoder, 2, pooling="meanmax").cuda().train()
+    inputs = torch.rand(2, 8, 1, device="cuda")
+    valid = torch.tensor(
+        [[True, True, False, False, False, False, False, False],
+         [True, True, True, False, False, False, False, False]],
+        device="cuda",
+    )
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        loss = model(inputs, valid).square().mean()
     loss.backward()
     assert torch.isfinite(loss)
     assert all(
@@ -406,21 +636,213 @@ def test_pathfinder_bundle_uses_value_tokens_and_official_split(tmp_path) -> Non
     )
     values, label = bundle.train[0]
     assert bundle.input_kind == "values"
+    assert bundle.value_masking == "nonzero"
+    assert bundle.metadata["value_masking"] == "nonzero-pixels"
     assert bundle.max_length == 4
     assert values.shape == (4, 1)
     assert label in (0, 1)
 
 
+def test_collate_values_can_exclude_zero_valued_pixels() -> None:
+    batch = collate_values(
+        [
+            (torch.tensor([[0.0], [1.0], [0.0]]), 0),
+            (torch.tensor([[2.0], [0.0]]), 1),
+        ],
+        value_masking="nonzero",
+    )
+    assert torch.equal(
+        batch["mask"],
+        torch.tensor([[False, True, False], [True, False, False]]),
+    )
+    assert batch["padding_ratio"] == pytest.approx(2.0 / 3.0)
+
+
+def test_value_masking_contract_reaches_the_training_loader() -> None:
+    dataset = TensorDataset(torch.zeros(1, 2, 1), torch.zeros(1, dtype=torch.long))
+    bundle = DatasetBundle(
+        train=dataset,
+        validation=dataset,
+        test=dataset,
+        input_kind="values",
+        num_classes=2,
+        max_length=2,
+        metadata={},
+        value_masking="nonzero",
+    )
+    batch = _build_collate(bundle)([(torch.tensor([[0.0], [3.0]]), 1)])
+    assert torch.equal(batch["mask"], torch.tensor([[False, True]]))
+
+
+def test_pathfinder_manifest_is_scoped_to_its_resolution(tmp_path) -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    root = tmp_path / "pathfinder" / "pathfinder2" / "curv_contour_length_14"
+    metadata = root / "metadata"
+    metadata.mkdir(parents=True)
+    lines = []
+    for index in range(10):
+        folder = root / f"group_{index}"
+        folder.mkdir()
+        filename = f"sample_{index}.png"
+        pil_image.new("L", (2, 2), color=index).save(folder / filename)
+        lines.append(f"group_{index} {filename} unused {index % 2}")
+    (metadata / "0.npy").write_text("\n".join(lines), encoding="utf-8")
+    (tmp_path / "source-manifest.json").write_text(
+        json.dumps(
+            {
+                "pathfinder32_hard": {
+                    "metadata_files": 200,
+                    "metadata_sha256": "32-only-signature",
+                    "usable_rows": 200000,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = prepare_lra(
+        "pathfinder",
+        data_root=tmp_path,
+        cache_root=tmp_path / "cache",
+        max_length=None,
+        validation_fraction=None,
+        split_seed=None,
+        pathfinder_resolution=2,
+        allow_download=False,
+        revision=None,
+    )
+    assert bundle.metadata["resolution"] == 2
+
+
+def test_pathx_is_fixed_to_pathfinder_128_with_its_own_identity(tmp_path) -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    root = tmp_path / "pathfinder" / "pathfinder128" / "curv_contour_length_14"
+    metadata = root / "metadata"
+    metadata.mkdir(parents=True)
+    lines = []
+    for index in range(10):
+        folder = root / f"group_{index}"
+        folder.mkdir()
+        filename = f"sample_{index}.png"
+        pil_image.new("L", (128, 128), color=index).save(folder / filename)
+        lines.append(f"group_{index} {filename} unused {index % 2}")
+    (metadata / "0.npy").write_text("\n".join(lines), encoding="utf-8")
+    bundle = prepare_lra(
+        "pathx",
+        data_root=tmp_path,
+        cache_root=tmp_path / "cache",
+        max_length=None,
+        validation_fraction=None,
+        split_seed=None,
+        pathfinder_resolution=None,
+        allow_download=False,
+        revision=None,
+    )
+    values, label = bundle.train[0]
+    assert bundle.metadata["task"] == "pathx"
+    assert bundle.metadata["resolution"] == 128
+    assert bundle.metadata["split_protocol"] == PATHFINDER_SPLIT_PROTOCOL
+    assert Path(bundle.metadata["source"]["path"]).name == "pathfinder128"
+    assert (len(bundle.train), len(bundle.validation), len(bundle.test)) == (8, 1, 1)
+    assert bundle.max_length == 128**2
+    assert values.shape == (128**2, 1)
+    assert label in (0, 1)
+
+
+def test_resolved_pathx_delegates_its_fixed_resolution_to_the_data_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = resolve_args(parse_args(["--suite", "lra", "--task", "pathx"]))
+    marker = object()
+    observed: dict[str, object] = {}
+
+    def fake_prepare_lra(task: str, **kwargs: object) -> object:
+        observed["task"] = task
+        observed.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(train_transformers, "prepare_lra", fake_prepare_lra)
+    assert train_transformers.build_bundle(args) is marker
+    assert observed["task"] == "pathx"
+    assert observed["pathfinder_resolution"] is None
+
+
 def test_lra_defaults_preserve_the_requested_learning_rates_and_burn_in() -> None:
     pathfinder = resolve_args(parse_args(["--suite", "lra", "--task", "pathfinder"]))
+    pathfinder_custom = resolve_args(
+        parse_args(
+            [
+                "--suite",
+                "lra",
+                "--task",
+                "pathfinder",
+                "--pathfinder-resolution",
+                "16",
+            ]
+        )
+    )
+    pathx = resolve_args(parse_args(["--suite", "lra", "--task", "pathx"]))
     listops = resolve_args(parse_args(["--suite", "lra", "--task", "listops"]))
+    text = resolve_args(parse_args(["--suite", "lra", "--task", "text"]))
     assert pathfinder.lr == 2e-4
+    assert (
+        pathfinder.dim,
+        pathfinder.depth,
+        pathfinder.heads,
+        pathfinder.mlp_ratio,
+        pathfinder.dropout,
+        pathfinder.batch_size,
+        pathfinder.eval_batch_size,
+        pathfinder.grad_accum,
+        pathfinder.pooling,
+        pathfinder.pathfinder_shell,
+    ) == (
+        256,
+        6,
+        4,
+        2.0,
+        0.0,
+        32,
+        256,
+        4,
+        "meanmax",
+        "grid-peg",
+    )
     assert pathfinder.early_stop_min_epochs == 150
     assert pathfinder.pathfinder_resolution == 32
+    assert pathfinder_custom.pathfinder_resolution == 16
     assert pathfinder.max_length is None
     assert pathfinder.validation_fraction is None
     assert pathfinder.split_seed is None
+    assert pathx.pathfinder_resolution == 128
+    assert pathx.max_length is None
+    assert (pathx.dim, pathx.depth, pathx.batch_size, pathx.grad_accum) == (128, 6, 12, 10)
     assert listops.lr == 5e-4
+    assert (
+        listops.dim,
+        listops.depth,
+        listops.batch_size,
+        listops.eval_batch_size,
+        listops.grad_accum,
+        listops.mlp_ratio,
+        listops.pooling,
+        listops.pathfinder_shell,
+    ) == (
+        128,
+        6,
+        25,
+        25,
+        2,
+        4.0,
+        "mean",
+        "flat",
+    )
+    assert (
+        text.dim,
+        text.depth,
+        text.batch_size,
+        text.eval_batch_size,
+        text.grad_accum,
+    ) == (256, 6, 16, 16, 2)
     assert listops.early_stop_min_epochs == 30
 
 
@@ -444,8 +866,42 @@ def test_pathfinder_rejects_inactive_data_options(
         )
 
 
+@pytest.mark.parametrize("task", ("listops", "pathx"))
+def test_grid_peg_is_rejected_outside_generic_pathfinder(task: str) -> None:
+    with pytest.raises(ValueError, match="only supported for LRA Pathfinder"):
+        resolve_args(
+            parse_args(
+                ["--suite", "lra", "--task", task, "--pathfinder-shell", "grid-peg"]
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    (
+        (("--max-length", "1024"), "--max-length is not supported for LRA Path-X"),
+        (
+            ("--pathfinder-resolution", "32"),
+            "--pathfinder-resolution is not supported for LRA Path-X",
+        ),
+        (
+            ("--validation-fraction", "0.2"),
+            "--validation-fraction is not supported for LRA Path-X",
+        ),
+        (("--split-seed", "7"), "--split-seed is not supported for LRA Path-X"),
+    ),
+)
+def test_pathx_rejects_data_overrides(
+    arguments: tuple[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        resolve_args(parse_args(["--suite", "lra", "--task", "pathx", *arguments]))
+
+
 def test_pathfinder_metadata_excludes_inactive_data_options() -> None:
-    args = resolve_args(parse_args(["--suite", "lra", "--task", "pathfinder"]))
+    args = resolve_args(
+        parse_args(["--suite", "lra", "--task", "pathfinder", "--pooling", "meanmax"])
+    )
     dataset = TensorDataset(torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))
     bundle = DatasetBundle(
         train=dataset,
@@ -466,7 +922,77 @@ def test_pathfinder_metadata_excludes_inactive_data_options() -> None:
     )
     resolved = payload["resolved_arguments"]
     assert resolved["pathfinder_resolution"] == 32
+    assert resolved["pooling"] == "meanmax"
+    assert payload["model"]["pooling"] == "meanmax"
     assert {"max_length", "validation_fraction", "split_seed"}.isdisjoint(resolved)
+
+
+def test_grid_peg_model_uses_pathfinder_resolution_and_records_its_contract() -> None:
+    args = resolve_args(
+        parse_args(
+            [
+                "--suite", "lra", "--task", "pathfinder", "--pathfinder-resolution", "2",
+                "--pathfinder-shell", "grid-peg", "--mixer", "mha",
+            ]
+        )
+    )
+    dataset = TensorDataset(torch.zeros(1, 4, 1), torch.zeros(1, dtype=torch.long))
+    bundle = DatasetBundle(
+        train=dataset,
+        validation=dataset,
+        test=dataset,
+        input_kind="values",
+        num_classes=2,
+        max_length=4,
+        metadata={"resolution": 2},
+    )
+    model = build_model(args, bundle)
+    assert isinstance(model, SequenceClassifier)
+    assert model.encoder.grid_shape == (2, 2)
+    payload = _build_run_payload(
+        args,
+        bundle,
+        {"train": 1, "validation": 1, "test": 1},
+        model,
+        torch.device("cpu"),
+        cuda_enabled=False,
+    )
+    assert payload["model"]["pathfinder_shell"] == "grid-peg"
+    assert payload["model"]["mlp_ratio"] == 2.0
+    assert payload["model"]["dropout"] == 0.0
+    assert payload["model"]["bias"] is True
+    assert payload["model"]["position_encoding"] == (
+        "factorized-grid-absolute-plus-depthwise-grid-peg"
+    )
+    assert payload["model"]["position_initialization"] == "factorized-normal-0.02"
+
+
+def test_pathx_run_metadata_keeps_the_fixed_task_identity() -> None:
+    args = resolve_args(parse_args(["--suite", "lra", "--task", "pathx"]))
+    dataset = TensorDataset(torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))
+    bundle = DatasetBundle(
+        train=dataset,
+        validation=dataset,
+        test=dataset,
+        input_kind="values",
+        num_classes=2,
+        max_length=128**2,
+        metadata={"task": "pathx", "resolution": 128},
+    )
+    payload = _build_run_payload(
+        args,
+        bundle,
+        {"train": 1, "validation": 1, "test": 1},
+        torch.nn.Linear(1, 1),
+        torch.device("cpu"),
+        cuda_enabled=False,
+    )
+    resolved = payload["resolved_arguments"]
+    assert resolved["task"] == "pathx"
+    assert resolved["pathfinder_resolution"] == 128
+    assert {"max_length", "validation_fraction", "split_seed"}.isdisjoint(resolved)
+    assert payload["data_contract"]["value_masking"] == "length"
+    assert payload["model"]["position_initialization"] == "normal-0.02"
 
 
 def test_formal_download_requires_an_immutable_revision() -> None:
@@ -516,10 +1042,38 @@ def test_shared_lra_config_resolves_the_selected_task_defaults() -> None:
             ]
         )
     )
-    assert (pathfinder.lr, pathfinder.epochs, pathfinder.batch_size) == (
+    assert (
+        pathfinder.lr,
+        pathfinder.epochs,
+        pathfinder.dim,
+        pathfinder.batch_size,
+        pathfinder.grad_accum,
+        pathfinder.pooling,
+        pathfinder.pathfinder_shell,
+    ) == (
         2e-4,
         200,
-        64,
+        256,
+        32,
+        4,
+        "meanmax",
+        "grid-peg",
+    )
+    retrieval = resolve_args(
+        parse_args(
+            [
+                "--config",
+                str(root / "experiments/configs/lra.toml"),
+                "--task",
+                "retrieval",
+            ]
+        )
+    )
+    assert (retrieval.dim, retrieval.depth, retrieval.batch_size, retrieval.grad_accum) == (
+        128,
+        6,
+        16,
+        4,
     )
 
 

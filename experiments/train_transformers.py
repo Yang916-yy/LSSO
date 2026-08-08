@@ -34,6 +34,8 @@ from experiments.sequence_data import (
     DatasetBundle,
     GENOMIC_BENCHMARKS,
     LRA_TASKS,
+    PATHFINDER_TASKS,
+    PATHX_RESOLUTION,
     collate_token_pairs,
     collate_tokens,
     collate_values,
@@ -57,6 +59,7 @@ class TaskDefaults:
     epochs: int
     batch_size: int
     eval_batch_size: int
+    grad_accum: int
     lr: float
     warmup_ratio: float
     patience: int
@@ -64,17 +67,59 @@ class TaskDefaults:
     depth: int
     heads: int
     rank: int
+    mlp_ratio: float
     dropout: float
     weight_decay: float
+    pooling: Literal["mean", "meanmax"]
+    pathfinder_shell: Literal["flat", "grid-peg"]
+
+
+PATHFINDER_DEFAULTS = TaskDefaults(
+    max_length=None, epochs=200, batch_size=32, eval_batch_size=256, grad_accum=4,
+    lr=2e-4, warmup_ratio=0.05, patience=10, dim=256, depth=6, heads=4,
+    rank=32, mlp_ratio=2.0, dropout=0.0, weight_decay=0.01,
+    pooling="meanmax", pathfinder_shell="grid-peg",
+)
+
+
+# Path-X is deliberately not a formal recipe. Its inherited defaults provide a
+# runnable local probe only and are not part of the four-task formal panel.
+PATHX_DEFAULTS = TaskDefaults(
+    max_length=None, epochs=200, batch_size=12, eval_batch_size=12, grad_accum=10,
+    lr=2e-4, warmup_ratio=0.05, patience=20, dim=128, depth=6, heads=8,
+    rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
+    pooling="mean", pathfinder_shell="flat",
+)
 
 
 LRA_DEFAULTS = {
-    "listops": TaskDefaults(2048, 40, 50, 50, 5e-4, 0.05, 8, 256, 2, 8, 32, 0.1, 0.01),
-    "text": TaskDefaults(4096, 32, 32, 32, 5e-4, 0.05, 6, 256, 2, 8, 32, 0.1, 0.01),
-    "retrieval": TaskDefaults(4000, 20, 64, 64, 5e-4, 0.05, 5, 256, 2, 8, 32, 0.1, 0.01),
-    "pathfinder": TaskDefaults(None, 200, 64, 64, 2e-4, 0.05, 20, 256, 2, 8, 32, 0.1, 0.01),
+    "listops": TaskDefaults(
+        max_length=2048, epochs=40, batch_size=25, eval_batch_size=25, grad_accum=2,
+        lr=5e-4, warmup_ratio=0.05, patience=8, dim=128, depth=6, heads=8,
+        rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
+        pooling="mean", pathfinder_shell="flat",
+    ),
+    "text": TaskDefaults(
+        max_length=4096, epochs=32, batch_size=16, eval_batch_size=16, grad_accum=2,
+        lr=5e-4, warmup_ratio=0.05, patience=6, dim=256, depth=6, heads=8,
+        rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
+        pooling="mean", pathfinder_shell="flat",
+    ),
+    "retrieval": TaskDefaults(
+        max_length=4000, epochs=20, batch_size=16, eval_batch_size=16, grad_accum=4,
+        lr=5e-4, warmup_ratio=0.05, patience=5, dim=128, depth=6, heads=8,
+        rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
+        pooling="mean", pathfinder_shell="flat",
+    ),
+    "pathfinder": PATHFINDER_DEFAULTS,
+    "pathx": PATHX_DEFAULTS,
 }
-GENOMIC_DEFAULTS = TaskDefaults(0, 40, 128, 256, 3e-4, 0.05, 8, 128, 4, 4, 16, 0.1, 0.01)
+GENOMIC_DEFAULTS = TaskDefaults(
+    max_length=0, epochs=40, batch_size=128, eval_batch_size=256, grad_accum=1,
+    lr=3e-4, warmup_ratio=0.05, patience=8, dim=128, depth=4, heads=4,
+    rank=16, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
+    pooling="mean", pathfinder_shell="flat",
+)
 DEFAULT_PATHFINDER_RESOLUTION = 32
 DEFAULT_VALIDATION_FRACTION = 0.1
 DEFAULT_SPLIT_SEED = 2026
@@ -205,6 +250,7 @@ class SequenceEncoder(nn.Module):
         mlp_ratio: float,
         dropout: float,
         bias: bool,
+        grid_shape: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         if max_length <= 0:
@@ -222,7 +268,28 @@ class SequenceEncoder(nn.Module):
             )
         else:
             self.input_embedding = nn.Linear(1, dim, bias=bias)
-        self.position_embedding = nn.Embedding(max_length, dim)
+        self.grid_shape = grid_shape
+        if grid_shape is None:
+            self.position_embedding: nn.Embedding | None = nn.Embedding(max_length, dim)
+            self.row_embedding: nn.Embedding | None = None
+            self.column_embedding: nn.Embedding | None = None
+            self.peg: nn.Conv2d | None = None
+            nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+        else:
+            rows, columns = grid_shape
+            if input_kind != "values":
+                raise ValueError("grid-peg requires value inputs")
+            if rows <= 0 or columns <= 0 or rows * columns != max_length:
+                raise ValueError("grid-peg shape must exactly cover max_length")
+            self.position_embedding = None
+            self.row_embedding = nn.Embedding(rows, dim)
+            self.column_embedding = nn.Embedding(columns, dim)
+            self.peg = nn.Conv2d(
+                dim, dim, kernel_size=3, padding=1, groups=dim, bias=False
+            )
+            position_std = 0.02 / math.sqrt(2.0)
+            nn.init.normal_(self.row_embedding.weight, mean=0.0, std=position_std)
+            nn.init.normal_(self.column_embedding.weight, mean=0.0, std=position_std)
         self.embedding_dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
             SequenceBlock(
@@ -241,6 +308,42 @@ class SequenceEncoder(nn.Module):
         )
         self.norm = nn.LayerNorm(dim)
 
+    def _position_features(self, *, length: int, device: torch.device) -> torch.Tensor:
+        if self.grid_shape is None:
+            assert self.position_embedding is not None
+            positions = torch.arange(length, device=device)
+            return self.position_embedding(positions)
+        rows, columns = self.grid_shape
+        if length != rows * columns:
+            raise ValueError(
+                f"grid-peg requires a full {rows}x{columns} grid, got length={length}"
+            )
+        assert self.row_embedding is not None
+        assert self.column_embedding is not None
+        row_positions = torch.arange(rows, device=device)
+        column_positions = torch.arange(columns, device=device)
+        return (
+            self.row_embedding(row_positions)[:, None, :]
+            + self.column_embedding(column_positions)[None, :, :]
+        ).reshape(length, -1)
+
+    def _apply_grid_peg(
+        self, x: torch.Tensor, valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        if self.grid_shape is None:
+            return x
+        rows, columns = self.grid_shape
+        assert self.peg is not None
+        batch, length, dim = x.shape
+        if length != rows * columns:
+            raise ValueError(
+                f"grid-peg requires a full {rows}x{columns} grid, got length={length}"
+            )
+        grid = x.transpose(1, 2).reshape(batch, dim, rows, columns)
+        generated = self.peg(grid).reshape(batch, dim, length).transpose(1, 2)
+        output = x + generated
+        return torch.where(valid_mask[:, :, None], output, torch.zeros_like(output))
+
     def forward(self, inputs: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         if inputs.ndim not in (2, 3):
             raise ValueError("sequence inputs must be [B, N] tokens or [B, N, 1] values")
@@ -256,8 +359,9 @@ class SequenceEncoder(nn.Module):
                 raise TypeError("token inputs must be torch.long [B, N]")
         elif inputs.ndim != 3 or inputs.shape[-1] != 1 or not inputs.is_floating_point():
             raise TypeError("value inputs must be floating [B, N, 1]")
-        positions = torch.arange(length, device=inputs.device)
-        x = self.input_embedding(inputs) + self.position_embedding(positions)[None]
+        x = self.input_embedding(inputs) + self._position_features(
+            length=length, device=inputs.device
+        )[None]
         if inputs.device.type == "cuda" and torch.is_autocast_enabled():
             amp_dtype = torch.get_autocast_dtype("cuda")
             if self._cuda_lsso and amp_dtype != torch.float16:
@@ -265,6 +369,7 @@ class SequenceEncoder(nn.Module):
             x = x.to(dtype=amp_dtype)
         x = self.embedding_dropout(x)
         x = torch.where(valid_mask[:, :, None], x, torch.zeros_like(x))
+        x = self._apply_grid_peg(x, valid_mask)
         for block in self.blocks:
             x = block(x, valid_mask)
         return torch.where(valid_mask[:, :, None], self.norm(x), torch.zeros_like(x))
@@ -276,13 +381,46 @@ class SequenceEncoder(nn.Module):
 
 
 class SequenceClassifier(nn.Module):
-    def __init__(self, encoder: SequenceEncoder, num_classes: int) -> None:
+    def __init__(
+        self,
+        encoder: SequenceEncoder,
+        num_classes: int,
+        *,
+        pooling: Literal["mean", "meanmax"] = "mean",
+    ) -> None:
         super().__init__()
+        if pooling not in {"mean", "meanmax"}:
+            raise ValueError(f"unsupported pooling {pooling!r}")
         self.encoder = encoder
-        self.classifier = nn.Linear(encoder.norm.normalized_shape[0], num_classes)
+        self.pooling = pooling
+        dim = encoder.norm.normalized_shape[0]
+        self.meanmax_projection = (
+            nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU())
+            if pooling == "meanmax"
+            else None
+        )
+        self.readout_projection = (
+            nn.Linear(dim, dim, bias=False) if pooling == "meanmax" else None
+        )
+        self.classifier = nn.Linear(dim, num_classes)
+
+    def _pool(self, encoded: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        mean = self.encoder.pooled(encoded, valid_mask)
+        if self.pooling == "mean":
+            return mean
+        maximum = encoded.masked_fill(
+            ~valid_mask[:, :, None], torch.finfo(encoded.dtype).min
+        ).amax(dim=1)
+        maximum = torch.where(
+            valid_mask.any(dim=1, keepdim=True), maximum, torch.zeros_like(maximum)
+        )
+        assert self.meanmax_projection is not None
+        assert self.readout_projection is not None
+        features = self.meanmax_projection(torch.cat((mean, maximum), dim=-1))
+        return self.readout_projection(features)
 
     def forward(self, inputs: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.encoder.pooled(self.encoder(inputs, valid_mask), valid_mask))
+        return self.classifier(self._pool(self.encoder(inputs, valid_mask), valid_mask))
 
 
 class SequencePairClassifier(nn.Module):
@@ -389,6 +527,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--data-revision")
     parser.add_argument("--pathfinder-resolution", type=int)
+    parser.add_argument("--pathfinder-shell", choices=("flat", "grid-peg"))
     parser.add_argument("--validation-fraction", type=float)
     parser.add_argument("--split-seed", type=int)
     parser.add_argument("--mixer", choices=("mha", "lsso"), default="lsso")
@@ -400,8 +539,9 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth", type=int)
     parser.add_argument("--heads", type=int)
     parser.add_argument("--max-length", type=int)
-    parser.add_argument("--mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--mlp-ratio", type=float)
     parser.add_argument("--dropout", type=float)
+    parser.add_argument("--pooling", choices=("mean", "meanmax"))
     parser.add_argument("--bias", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -410,7 +550,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--warmup-ratio", type=float)
     parser.add_argument("--min-lr-ratio", type=float, default=0.0)
-    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int)
     parser.add_argument("--early-stop-min-epochs", type=int, default=-1)
@@ -458,7 +598,8 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         if args.task not in LRA_TASKS:
             raise ValueError(f"unsupported LRA task {args.task!r}")
         defaults = LRA_DEFAULTS[args.task]
-    pathfinder = args.suite == "lra" and args.task == "pathfinder"
+    pathfinder = args.suite == "lra" and args.task in PATHFINDER_TASKS
+    pathx = args.suite == "lra" and args.task == "pathx"
     uses_validation_split = args.suite == "genomic" or (
         args.suite == "lra" and args.task == "text"
     )
@@ -467,10 +608,14 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         "dim",
         "depth",
         "heads",
+        "mlp_ratio",
         "dropout",
+        "pooling",
+        "pathfinder_shell",
         "epochs",
         "batch_size",
         "eval_batch_size",
+        "grad_accum",
         "lr",
         "weight_decay",
         "warmup_ratio",
@@ -480,15 +625,29 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
             setattr(args, name, getattr(defaults, name))
     if pathfinder:
         if args.max_length is not None:
+            if pathx:
+                raise ValueError(
+                    "--max-length is not supported for LRA Path-X; "
+                    "its resolution is fixed at 128"
+                )
             raise ValueError(
                 "--max-length is not supported for LRA Pathfinder; "
                 "use --pathfinder-resolution"
             )
-        if args.pathfinder_resolution is None:
+        if pathx:
+            if args.pathfinder_resolution is not None:
+                raise ValueError(
+                    "--pathfinder-resolution is not supported for LRA Path-X; "
+                    "it is fixed at 128"
+                )
+            args.pathfinder_resolution = PATHX_RESOLUTION
+        elif args.pathfinder_resolution is None:
             args.pathfinder_resolution = DEFAULT_PATHFINDER_RESOLUTION
     else:
         if args.pathfinder_resolution is not None:
-            raise ValueError("--pathfinder-resolution is only supported for LRA Pathfinder")
+            raise ValueError(
+                "--pathfinder-resolution is only supported for generic LRA Pathfinder"
+            )
         if args.max_length is None:
             if defaults.max_length is None:
                 raise RuntimeError("task has no default max_length")
@@ -505,8 +664,9 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     else:
         if args.validation_fraction is not None:
             if pathfinder:
+                task_name = "Path-X" if pathx else "Pathfinder"
                 raise ValueError(
-                    "--validation-fraction is not supported for LRA Pathfinder; "
+                    f"--validation-fraction is not supported for LRA {task_name}; "
                     "it uses the official hard 80/10/10 split"
                 )
             raise ValueError(
@@ -514,8 +674,9 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
             )
         if args.split_seed is not None:
             if pathfinder:
+                task_name = "Path-X" if pathx else "Pathfinder"
                 raise ValueError(
-                    "--split-seed is not supported for LRA Pathfinder; "
+                    f"--split-seed is not supported for LRA {task_name}; "
                     "it uses the official hard 80/10/10 split"
                 )
             raise ValueError(
@@ -548,6 +709,10 @@ def _validate_resolved_args(args: argparse.Namespace) -> None:
         raise ValueError("validation_fraction must be in (0, 1)")
     if args.pathfinder_resolution is not None and args.pathfinder_resolution <= 0:
         raise ValueError("pathfinder_resolution must be positive")
+    if args.pathfinder_shell == "grid-peg" and not (
+        args.suite == "lra" and args.task == "pathfinder"
+    ):
+        raise ValueError("--pathfinder-shell=grid-peg is only supported for LRA Pathfinder")
     if args.grad_accum <= 0:
         raise ValueError("grad_accum must be positive")
     if args.grad_clip < 0.0:
@@ -596,7 +761,10 @@ def build_bundle(args: argparse.Namespace) -> DatasetBundle:
         max_length=args.max_length,
         validation_fraction=args.validation_fraction,
         split_seed=args.split_seed,
-        pathfinder_resolution=args.pathfinder_resolution,
+        # ``128`` is the resolved public identity for Path-X.  The data
+        # loader owns that fixed resolution and uses ``None`` to distinguish
+        # it from a caller attempting to override generic Pathfinder.
+        pathfinder_resolution=None if args.task == "pathx" else args.pathfinder_resolution,
         allow_download=args.allow_download,
         revision=args.data_revision,
         formal=args.formal,
@@ -605,6 +773,12 @@ def build_bundle(args: argparse.Namespace) -> DatasetBundle:
 
 def build_model(args: argparse.Namespace, bundle: DatasetBundle) -> nn.Module:
     implementation: Literal["reference", "cuda"] = args.implementation
+    grid_shape = None
+    if args.pathfinder_shell == "grid-peg":
+        resolution = bundle.metadata.get("resolution")
+        if not isinstance(resolution, int):
+            raise ValueError("grid-peg requires a Pathfinder bundle with integer resolution")
+        grid_shape = (resolution, resolution)
     encoder = SequenceEncoder(
         input_kind=bundle.input_kind,
         vocab_size=bundle.vocab_size,
@@ -621,10 +795,13 @@ def build_model(args: argparse.Namespace, bundle: DatasetBundle) -> nn.Module:
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         bias=args.bias,
+        grid_shape=grid_shape,
     )
     if bundle.paired:
+        if args.pooling != "mean":
+            raise ValueError("--pooling=meanmax is not supported for paired tasks")
         return SequencePairClassifier(encoder, bundle.num_classes)
-    return SequenceClassifier(encoder, bundle.num_classes)
+    return SequenceClassifier(encoder, bundle.num_classes, pooling=args.pooling)
 
 
 def _choose_device(value: str) -> torch.device:
@@ -638,7 +815,7 @@ def _choose_device(value: str) -> torch.device:
 
 def _build_collate(bundle: DatasetBundle):
     if bundle.input_kind == "values":
-        return collate_values
+        return functools.partial(collate_values, value_masking=bundle.value_masking)
     if bundle.paired:
         assert bundle.pad_token_id is not None
         return functools.partial(collate_token_pairs, pad_token_id=bundle.pad_token_id)
@@ -864,6 +1041,14 @@ def _build_run_payload(
 ) -> dict[str, Any]:
     parameters = sum(parameter.numel() for parameter in model.parameters())
     inactive_data_arguments = _inactive_data_argument_names(args)
+    if args.pathfinder_shell == "grid-peg":
+        position_encoding = "factorized-grid-absolute-plus-depthwise-grid-peg"
+        if args.mixer == "lsso" and args.rank_rotary:
+            position_encoding += "-plus-flat-rank-rotary"
+    elif args.mixer == "lsso" and args.rank_rotary:
+        position_encoding = "learned-absolute-plus-rank-rotary"
+    else:
+        position_encoding = "learned-absolute"
     return {
         "schema": 1,
         "resolved_arguments": {
@@ -877,6 +1062,9 @@ def _build_run_payload(
             "max_length": bundle.max_length,
             "vocab_size": bundle.vocab_size,
             "paired": bundle.paired,
+            "value_masking": bundle.value_masking
+            if bundle.input_kind == "values"
+            else None,
         },
         "split_sizes": sizes,
         "model": {
@@ -885,12 +1073,18 @@ def _build_run_payload(
             "depth": args.depth,
             "heads": args.heads,
             "rank": args.rank,
+            "mlp_ratio": args.mlp_ratio,
+            "dropout": args.dropout,
+            "bias": args.bias,
             "core_mode": args.core_mode,
             "rank_rotary": args.rank_rotary,
+            "pooling": args.pooling,
+            "pathfinder_shell": args.pathfinder_shell,
             "implementation": args.implementation if args.mixer == "lsso" else "torch-mha",
-            "position_encoding": "learned-absolute-plus-rank-rotary"
-            if args.mixer == "lsso" and args.rank_rotary
-            else "learned-absolute",
+            "position_encoding": position_encoding,
+            "position_initialization": "normal-0.02"
+            if args.pathfinder_shell == "flat"
+            else "factorized-normal-0.02",
             "parameters": parameters,
         },
         "runtime": _runtime_metadata(device, cuda_enabled=cuda_enabled),
@@ -904,7 +1098,7 @@ def _build_run_payload(
 
 
 def _inactive_data_argument_names(args: argparse.Namespace) -> frozenset[str]:
-    pathfinder = args.suite == "lra" and args.task == "pathfinder"
+    pathfinder = args.suite == "lra" and args.task in PATHFINDER_TASKS
     uses_validation_split = args.suite == "genomic" or (
         args.suite == "lra" and args.task == "text"
     )
@@ -913,6 +1107,8 @@ def _inactive_data_argument_names(args: argparse.Namespace) -> frozenset[str]:
         inactive.add("pathfinder_resolution")
     else:
         inactive.add("max_length")
+    if not (args.suite == "lra" and args.task == "pathfinder"):
+        inactive.add("pathfinder_shell")
     if not uses_validation_split:
         inactive.update(("validation_fraction", "split_seed"))
     return frozenset(inactive)
