@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import pytest
 from torch.utils.data import Dataset, TensorDataset
 
@@ -96,12 +97,13 @@ def test_learned_position_embedding_uses_small_normal_initialization() -> None:
     assert float(weights.std(unbiased=False)) == pytest.approx(0.02, abs=0.004)
 
 
-def test_grid_peg_uses_factorized_coordinates_at_the_flat_position_scale() -> None:
+def test_factorized_grid_positions_use_flat_position_scale() -> None:
     torch.manual_seed(31)
     encoder = _grid_encoder("mha")
     assert encoder.position_embedding is None
     assert encoder.row_embedding is not None
     assert encoder.column_embedding is not None
+    assert not any(isinstance(module, nn.Conv2d) for module in encoder.modules())
     coordinates = encoder._position_features(length=6, device=torch.device("cpu"))
     torch.testing.assert_close(
         coordinates[5], encoder.row_embedding.weight[1] + encoder.column_embedding.weight[2]
@@ -109,7 +111,7 @@ def test_grid_peg_uses_factorized_coordinates_at_the_flat_position_scale() -> No
     assert float(coordinates.detach().std(unbiased=False)) == pytest.approx(0.02, abs=0.006)
 
 
-def test_grid_peg_rejects_non_grid_inputs() -> None:
+def test_factorized_grid_positions_reject_invalid_grids() -> None:
     with pytest.raises(ValueError, match="value inputs"):
         SequenceEncoder(
             input_kind="tokens",
@@ -267,7 +269,7 @@ def test_sequence_classifier_masks_padding_for_both_mixers(
 
 
 @pytest.mark.parametrize("mixer", ("mha", "lsso"))
-def test_grid_peg_masks_invalid_pixels_for_both_mixers(mixer: str) -> None:
+def test_factorized_grid_positions_mask_invalid_pixels_for_both_mixers(mixer: str) -> None:
     torch.manual_seed(17)
     model = SequenceClassifier(_grid_encoder(mixer), 3, pooling="meanmax").eval()  # type: ignore[arg-type]
     valid = torch.tensor([[True, False, True, False, True, False]])
@@ -794,18 +796,16 @@ def test_lra_defaults_preserve_the_requested_learning_rates_and_burn_in() -> Non
         pathfinder.eval_batch_size,
         pathfinder.grad_accum,
         pathfinder.pooling,
-        pathfinder.pathfinder_shell,
     ) == (
         256,
         6,
         4,
         2.0,
         0.0,
-        32,
+        64,
         256,
-        4,
+        2,
         "meanmax",
-        "grid-peg",
     )
     assert pathfinder.early_stop_min_epochs == 150
     assert pathfinder.pathfinder_resolution == 32
@@ -825,7 +825,6 @@ def test_lra_defaults_preserve_the_requested_learning_rates_and_burn_in() -> Non
         listops.grad_accum,
         listops.mlp_ratio,
         listops.pooling,
-        listops.pathfinder_shell,
     ) == (
         128,
         6,
@@ -834,7 +833,6 @@ def test_lra_defaults_preserve_the_requested_learning_rates_and_burn_in() -> Non
         2,
         4.0,
         "mean",
-        "flat",
     )
     assert (
         text.dim,
@@ -844,6 +842,69 @@ def test_lra_defaults_preserve_the_requested_learning_rates_and_burn_in() -> Non
         text.grad_accum,
     ) == (256, 6, 16, 16, 2)
     assert listops.early_stop_min_epochs == 30
+
+
+def test_pilot_epochs_preserves_the_scheduler_horizon_and_is_not_formal() -> None:
+    args = resolve_args(
+        parse_args(
+            [
+                "--suite",
+                "lra",
+                "--task",
+                "pathfinder",
+                "--epochs",
+                "200",
+                "--pilot-epochs",
+                "50",
+                "--validation-only",
+            ]
+        )
+    )
+    assert (args.epochs, args.pilot_epochs) == (200, 50)
+    with pytest.raises(ValueError, match="requires --validation-only"):
+        resolve_args(
+            parse_args(
+                [
+                    "--suite",
+                    "lra",
+                    "--task",
+                    "pathfinder",
+                    "--pilot-epochs",
+                    "1",
+                ]
+            )
+        )
+    with pytest.raises(ValueError, match="rejects --pilot-epochs"):
+        resolve_args(
+            parse_args(
+                [
+                    "--suite",
+                    "lra",
+                    "--task",
+                    "pathfinder",
+                    "--pilot-epochs",
+                    "1",
+                    "--validation-only",
+                    "--formal",
+                ]
+            )
+        )
+    with pytest.raises(ValueError, match="must not exceed epochs"):
+        resolve_args(
+            parse_args(
+                [
+                    "--suite",
+                    "lra",
+                    "--task",
+                    "pathfinder",
+                    "--epochs",
+                    "2",
+                    "--pilot-epochs",
+                    "3",
+                    "--validation-only",
+                ]
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -863,16 +924,6 @@ def test_pathfinder_rejects_inactive_data_options(
     with pytest.raises(ValueError, match=message):
         resolve_args(
             parse_args(["--suite", "lra", "--task", "pathfinder", *arguments])
-        )
-
-
-@pytest.mark.parametrize("task", ("listops", "pathx"))
-def test_grid_peg_is_rejected_outside_generic_pathfinder(task: str) -> None:
-    with pytest.raises(ValueError, match="only supported for LRA Pathfinder"):
-        resolve_args(
-            parse_args(
-                ["--suite", "lra", "--task", task, "--pathfinder-shell", "grid-peg"]
-            )
         )
 
 
@@ -927,12 +978,12 @@ def test_pathfinder_metadata_excludes_inactive_data_options() -> None:
     assert {"max_length", "validation_fraction", "split_seed"}.isdisjoint(resolved)
 
 
-def test_grid_peg_model_uses_pathfinder_resolution_and_records_its_contract() -> None:
+def test_pathfinder_model_uses_factorized_grid_positions_and_records_its_contract() -> None:
     args = resolve_args(
         parse_args(
             [
                 "--suite", "lra", "--task", "pathfinder", "--pathfinder-resolution", "2",
-                "--pathfinder-shell", "grid-peg", "--mixer", "mha",
+                "--mixer", "mha",
             ]
         )
     )
@@ -949,6 +1000,9 @@ def test_grid_peg_model_uses_pathfinder_resolution_and_records_its_contract() ->
     model = build_model(args, bundle)
     assert isinstance(model, SequenceClassifier)
     assert model.encoder.grid_shape == (2, 2)
+    assert model.encoder.position_embedding is None
+    assert model.encoder.row_embedding is not None
+    assert model.encoder.column_embedding is not None
     payload = _build_run_payload(
         args,
         bundle,
@@ -957,13 +1011,10 @@ def test_grid_peg_model_uses_pathfinder_resolution_and_records_its_contract() ->
         torch.device("cpu"),
         cuda_enabled=False,
     )
-    assert payload["model"]["pathfinder_shell"] == "grid-peg"
     assert payload["model"]["mlp_ratio"] == 2.0
     assert payload["model"]["dropout"] == 0.0
     assert payload["model"]["bias"] is True
-    assert payload["model"]["position_encoding"] == (
-        "factorized-grid-absolute-plus-depthwise-grid-peg"
-    )
+    assert payload["model"]["position_encoding"] == "factorized-grid-absolute"
     assert payload["model"]["position_initialization"] == "factorized-normal-0.02"
 
 
@@ -1049,15 +1100,13 @@ def test_shared_lra_config_resolves_the_selected_task_defaults() -> None:
         pathfinder.batch_size,
         pathfinder.grad_accum,
         pathfinder.pooling,
-        pathfinder.pathfinder_shell,
     ) == (
         2e-4,
         200,
         256,
-        32,
-        4,
+        64,
+        2,
         "meanmax",
-        "grid-peg",
     )
     retrieval = resolve_args(
         parse_args(
@@ -1093,6 +1142,76 @@ class _TinyTokenDataset(Dataset):
     def __getitem__(self, index: int):
         values = (torch.tensor([2, 3, 4]), torch.tensor([3, 4]))[index % 2]
         return values, self.labels[index]
+
+
+def test_pilot_epochs_caps_the_outer_loop_without_shortening_cosine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = _TinyTokenDataset()
+    device = torch.device("cpu")
+    loader = make_loader(
+        dataset,
+        batch_size=2,
+        workers=0,
+        device=device,
+        collate_fn=functools.partial(collate_tokens, pad_token_id=0),
+        train=True,
+        seed=17,
+    )
+    validation = make_loader(
+        dataset,
+        batch_size=2,
+        workers=0,
+        device=device,
+        collate_fn=functools.partial(collate_tokens, pad_token_id=0),
+        train=False,
+        seed=17,
+    )
+    recorded_total_steps: list[int] = []
+    scheduler_lambda = train_transformers._scheduler_lambda
+
+    def record_scheduler_horizon(
+        step: int, warmup_steps: int, total_steps: int, min_lr_ratio: float
+    ) -> float:
+        recorded_total_steps.append(total_steps)
+        return scheduler_lambda(step, warmup_steps, total_steps, min_lr_ratio)
+
+    monkeypatch.setattr(train_transformers, "_scheduler_lambda", record_scheduler_horizon)
+    config = TrainingConfig(
+        output=tmp_path / "run",
+        epochs=4,
+        lr=1e-3,
+        weight_decay=0.0,
+        warmup_ratio=0.0,
+        min_lr_ratio=0.0,
+        grad_accum=1,
+        grad_clip=0.0,
+        patience=0,
+        early_stop_min_epochs=4,
+        early_stop_accuracy_delta=0.0,
+        early_stop_loss_relative_delta=0.0,
+        seed=17,
+        resume=False,
+        validation_only=True,
+        max_train_batches=0,
+        max_eval_batches=0,
+        amp=False,
+        pilot_epochs=2,
+    )
+    result = train(
+        SequenceClassifier(_encoder("mha"), 2),
+        loader,
+        validation,
+        validation,
+        num_classes=2,
+        config=config,
+        run_payload={"case": "pilot"},
+        device=device,
+    )
+    metrics = (config.output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(metrics) == 2
+    assert set(recorded_total_steps) == {len(loader) * config.epochs}
+    assert result["target"] == "validation"
 
 
 def test_checkpoint_refuses_configuration_mismatch_without_rewriting_manifest(tmp_path) -> None:

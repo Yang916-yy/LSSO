@@ -64,12 +64,12 @@ MHA is PyTorch MHA.  The frozen recipes are:
 | ListOps | `D128/L6/H8`, MLP 4, dropout .1, learned absolute PE + mean | `25 x 2` | 50 | `5e-4` / 40 |
 | Text | `D256/L6/H8`, MLP 4, dropout .1, learned absolute PE + mean | `16 x 2` | 32 | `5e-4` / 32 |
 | Retrieval | `D128/L6/H8`, MLP 4, dropout .1, learned absolute PE + mean | `16 x 4` | 64 | `5e-4` / 20 |
-| Pathfinder-32 | `D256/L6/H4`, MLP 2, dropout 0, factorized 2D PE + depthwise 3x3 Grid-PEG + meanmax | `32 x 4` | 128 | `2e-4` / 200 |
+| Pathfinder-32 | `D256/L6/H4`, MLP 2, dropout 0, factorized row/column learned absolute PE (no PEG) + meanmax | `64 x 2` | 128 | `2e-4` / 200 |
 
 All four use AdamW, weight decay `.01`, 5% linear warmup followed by cosine
-decay, and gradient clip `1.0`.  Pathfinder reapplies its official nonzero
-pixel mask after Grid-PEG; LSSO then adds its flat rank-space Rank-Rotary
-coordinate transform.  Pathfinder's earliest possible stop is epoch 150 with
+decay, and gradient clip `1.0`. Pathfinder uses its official nonzero pixel
+mask after the row/column position features are added; LSSO then adds its flat
+rank-space Rank-Rotary coordinate transform. Pathfinder's earliest possible stop is epoch 150 with
 patience 10; the remaining tasks keep their task defaults with no stop before
 75% of the declared budget.  The runner picks the best checkpoint on validation
 accuracy (then validation loss), evaluates the held-out test exactly once, and

@@ -71,14 +71,13 @@ class TaskDefaults:
     dropout: float
     weight_decay: float
     pooling: Literal["mean", "meanmax"]
-    pathfinder_shell: Literal["flat", "grid-peg"]
 
 
 PATHFINDER_DEFAULTS = TaskDefaults(
-    max_length=None, epochs=200, batch_size=32, eval_batch_size=256, grad_accum=4,
+    max_length=None, epochs=200, batch_size=64, eval_batch_size=256, grad_accum=2,
     lr=2e-4, warmup_ratio=0.05, patience=10, dim=256, depth=6, heads=4,
     rank=32, mlp_ratio=2.0, dropout=0.0, weight_decay=0.01,
-    pooling="meanmax", pathfinder_shell="grid-peg",
+    pooling="meanmax",
 )
 
 
@@ -88,7 +87,7 @@ PATHX_DEFAULTS = TaskDefaults(
     max_length=None, epochs=200, batch_size=12, eval_batch_size=12, grad_accum=10,
     lr=2e-4, warmup_ratio=0.05, patience=20, dim=128, depth=6, heads=8,
     rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
-    pooling="mean", pathfinder_shell="flat",
+    pooling="mean",
 )
 
 
@@ -97,19 +96,19 @@ LRA_DEFAULTS = {
         max_length=2048, epochs=40, batch_size=25, eval_batch_size=25, grad_accum=2,
         lr=5e-4, warmup_ratio=0.05, patience=8, dim=128, depth=6, heads=8,
         rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
-        pooling="mean", pathfinder_shell="flat",
+        pooling="mean",
     ),
     "text": TaskDefaults(
         max_length=4096, epochs=32, batch_size=16, eval_batch_size=16, grad_accum=2,
         lr=5e-4, warmup_ratio=0.05, patience=6, dim=256, depth=6, heads=8,
         rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
-        pooling="mean", pathfinder_shell="flat",
+        pooling="mean",
     ),
     "retrieval": TaskDefaults(
         max_length=4000, epochs=20, batch_size=16, eval_batch_size=16, grad_accum=4,
         lr=5e-4, warmup_ratio=0.05, patience=5, dim=128, depth=6, heads=8,
         rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
-        pooling="mean", pathfinder_shell="flat",
+        pooling="mean",
     ),
     "pathfinder": PATHFINDER_DEFAULTS,
     "pathx": PATHX_DEFAULTS,
@@ -118,7 +117,7 @@ GENOMIC_DEFAULTS = TaskDefaults(
     max_length=0, epochs=40, batch_size=128, eval_batch_size=256, grad_accum=1,
     lr=3e-4, warmup_ratio=0.05, patience=8, dim=128, depth=4, heads=4,
     rank=16, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
-    pooling="mean", pathfinder_shell="flat",
+    pooling="mean",
 )
 DEFAULT_PATHFINDER_RESOLUTION = 32
 DEFAULT_VALIDATION_FRACTION = 0.1
@@ -225,7 +224,7 @@ class SequenceBlock(nn.Module):
 
 
 class SequenceEncoder(nn.Module):
-    """One learned absolute position embedding plus current mixer blocks.
+    """Learned absolute coordinate features plus current mixer blocks.
 
     Rank-Rotary remains an internal rank-space coordinate choice.  The learned
     position embedding is deliberately shared by MHA and LSSO and is the model
@@ -273,20 +272,16 @@ class SequenceEncoder(nn.Module):
             self.position_embedding: nn.Embedding | None = nn.Embedding(max_length, dim)
             self.row_embedding: nn.Embedding | None = None
             self.column_embedding: nn.Embedding | None = None
-            self.peg: nn.Conv2d | None = None
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
         else:
             rows, columns = grid_shape
             if input_kind != "values":
-                raise ValueError("grid-peg requires value inputs")
+                raise ValueError("factorized grid positions require value inputs")
             if rows <= 0 or columns <= 0 or rows * columns != max_length:
-                raise ValueError("grid-peg shape must exactly cover max_length")
+                raise ValueError("factorized grid shape must exactly cover max_length")
             self.position_embedding = None
             self.row_embedding = nn.Embedding(rows, dim)
             self.column_embedding = nn.Embedding(columns, dim)
-            self.peg = nn.Conv2d(
-                dim, dim, kernel_size=3, padding=1, groups=dim, bias=False
-            )
             position_std = 0.02 / math.sqrt(2.0)
             nn.init.normal_(self.row_embedding.weight, mean=0.0, std=position_std)
             nn.init.normal_(self.column_embedding.weight, mean=0.0, std=position_std)
@@ -316,7 +311,7 @@ class SequenceEncoder(nn.Module):
         rows, columns = self.grid_shape
         if length != rows * columns:
             raise ValueError(
-                f"grid-peg requires a full {rows}x{columns} grid, got length={length}"
+                f"factorized grid positions require a full {rows}x{columns} grid, got length={length}"
             )
         assert self.row_embedding is not None
         assert self.column_embedding is not None
@@ -326,23 +321,6 @@ class SequenceEncoder(nn.Module):
             self.row_embedding(row_positions)[:, None, :]
             + self.column_embedding(column_positions)[None, :, :]
         ).reshape(length, -1)
-
-    def _apply_grid_peg(
-        self, x: torch.Tensor, valid_mask: torch.Tensor
-    ) -> torch.Tensor:
-        if self.grid_shape is None:
-            return x
-        rows, columns = self.grid_shape
-        assert self.peg is not None
-        batch, length, dim = x.shape
-        if length != rows * columns:
-            raise ValueError(
-                f"grid-peg requires a full {rows}x{columns} grid, got length={length}"
-            )
-        grid = x.transpose(1, 2).reshape(batch, dim, rows, columns)
-        generated = self.peg(grid).reshape(batch, dim, length).transpose(1, 2)
-        output = x + generated
-        return torch.where(valid_mask[:, :, None], output, torch.zeros_like(output))
 
     def forward(self, inputs: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         if inputs.ndim not in (2, 3):
@@ -369,7 +347,6 @@ class SequenceEncoder(nn.Module):
             x = x.to(dtype=amp_dtype)
         x = self.embedding_dropout(x)
         x = torch.where(valid_mask[:, :, None], x, torch.zeros_like(x))
-        x = self._apply_grid_peg(x, valid_mask)
         for block in self.blocks:
             x = block(x, valid_mask)
         return torch.where(valid_mask[:, :, None], self.norm(x), torch.zeros_like(x))
@@ -466,6 +443,8 @@ class TrainingConfig:
     max_train_batches: int
     max_eval_batches: int
     amp: bool
+    # A non-formal diagnostic cap. The scheduler horizon remains ``epochs``.
+    pilot_epochs: int = 0
 
 
 _SEQUENCE_CHECKPOINT_FORMAT = 2
@@ -527,7 +506,6 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--data-revision")
     parser.add_argument("--pathfinder-resolution", type=int)
-    parser.add_argument("--pathfinder-shell", choices=("flat", "grid-peg"))
     parser.add_argument("--validation-fraction", type=float)
     parser.add_argument("--split-seed", type=int)
     parser.add_argument("--mixer", choices=("mha", "lsso"), default="lsso")
@@ -544,6 +522,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pooling", choices=("mean", "meanmax"))
     parser.add_argument("--bias", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--pilot-epochs", type=int, default=0)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--eval-batch-size", type=int)
     parser.add_argument("--lr", type=float)
@@ -611,7 +590,6 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         "mlp_ratio",
         "dropout",
         "pooling",
-        "pathfinder_shell",
         "epochs",
         "batch_size",
         "eval_batch_size",
@@ -709,12 +687,17 @@ def _validate_resolved_args(args: argparse.Namespace) -> None:
         raise ValueError("validation_fraction must be in (0, 1)")
     if args.pathfinder_resolution is not None and args.pathfinder_resolution <= 0:
         raise ValueError("pathfinder_resolution must be positive")
-    if args.pathfinder_shell == "grid-peg" and not (
-        args.suite == "lra" and args.task == "pathfinder"
-    ):
-        raise ValueError("--pathfinder-shell=grid-peg is only supported for LRA Pathfinder")
     if args.grad_accum <= 0:
         raise ValueError("grad_accum must be positive")
+    if args.pilot_epochs < 0:
+        raise ValueError("pilot_epochs must be non-negative")
+    if args.pilot_epochs > args.epochs:
+        raise ValueError("pilot_epochs must not exceed epochs")
+    if args.pilot_epochs:
+        if args.formal:
+            raise ValueError("--formal rejects --pilot-epochs")
+        if not args.validation_only:
+            raise ValueError("--pilot-epochs requires --validation-only")
     if args.grad_clip < 0.0:
         raise ValueError("grad_clip must be non-negative")
     if not 0.0 <= args.warmup_ratio < 1.0:
@@ -774,10 +757,10 @@ def build_bundle(args: argparse.Namespace) -> DatasetBundle:
 def build_model(args: argparse.Namespace, bundle: DatasetBundle) -> nn.Module:
     implementation: Literal["reference", "cuda"] = args.implementation
     grid_shape = None
-    if args.pathfinder_shell == "grid-peg":
+    if args.suite == "lra" and args.task == "pathfinder":
         resolution = bundle.metadata.get("resolution")
         if not isinstance(resolution, int):
-            raise ValueError("grid-peg requires a Pathfinder bundle with integer resolution")
+            raise ValueError("factorized grid positions require integer Pathfinder resolution")
         grid_shape = (resolution, resolution)
     encoder = SequenceEncoder(
         input_kind=bundle.input_kind,
@@ -1041,8 +1024,8 @@ def _build_run_payload(
 ) -> dict[str, Any]:
     parameters = sum(parameter.numel() for parameter in model.parameters())
     inactive_data_arguments = _inactive_data_argument_names(args)
-    if args.pathfinder_shell == "grid-peg":
-        position_encoding = "factorized-grid-absolute-plus-depthwise-grid-peg"
+    if args.suite == "lra" and args.task == "pathfinder":
+        position_encoding = "factorized-grid-absolute"
         if args.mixer == "lsso" and args.rank_rotary:
             position_encoding += "-plus-flat-rank-rotary"
     elif args.mixer == "lsso" and args.rank_rotary:
@@ -1079,11 +1062,10 @@ def _build_run_payload(
             "core_mode": args.core_mode,
             "rank_rotary": args.rank_rotary,
             "pooling": args.pooling,
-            "pathfinder_shell": args.pathfinder_shell,
             "implementation": args.implementation if args.mixer == "lsso" else "torch-mha",
             "position_encoding": position_encoding,
             "position_initialization": "normal-0.02"
-            if args.pathfinder_shell == "flat"
+            if not (args.suite == "lra" and args.task == "pathfinder")
             else "factorized-normal-0.02",
             "parameters": parameters,
         },
@@ -1107,8 +1089,6 @@ def _inactive_data_argument_names(args: argparse.Namespace) -> frozenset[str]:
         inactive.add("pathfinder_resolution")
     else:
         inactive.add("max_length")
-    if not (args.suite == "lra" and args.task == "pathfinder"):
-        inactive.add("pathfinder_shell")
     if not uses_validation_split:
         inactive.update(("validation_fraction", "split_seed"))
     return frozenset(inactive)
@@ -1191,7 +1171,8 @@ def train(
         json.dumps(run_record, indent=2, sort_keys=True, default=str), encoding="utf-8"
     )
     metrics_path = output / "metrics.jsonl"
-    for epoch in range(start_epoch, config.epochs):
+    run_epochs = min(config.epochs, config.pilot_epochs or config.epochs)
+    for epoch in range(start_epoch, run_epochs):
         started = time.perf_counter()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -1378,6 +1359,7 @@ def main(argv: list[str] | None = None) -> None:
         max_train_batches=args.max_train_batches,
         max_eval_batches=args.max_eval_batches,
         amp=not args.no_amp and device.type == "cuda",
+        pilot_epochs=args.pilot_epochs,
     )
     train(
         model,
