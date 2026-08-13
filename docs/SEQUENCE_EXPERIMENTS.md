@@ -80,6 +80,20 @@ for every task, LSSO has 33,264 fewer parameters than MHA. For example, the
 200-position Human-or-Worm models contain 786,834 and 820,098 parameters,
 respectively; task-dependent position-table sizes shift both totals equally.
 
+The runner also exposes four matched-shell global-mixer baselines for the DNA
+panel: `linear_transformer`, `performer`, `nystromformer`, and `cosformer`.
+Linear Transformer uses the original bidirectional ELU+1 feature map. Performer
+follows the FAVOR+ random-feature implementation in `performer-pytorch==1.1.4`
+with a fixed projection matrix. Nystrom attention follows
+`nystrom-attention==0.0.14` with
+64 landmarks and six pseudoinverse iterations; its optional depthwise residual
+convolution is disabled so it does not add a local prior. cosFormer follows the
+official OpenNLPLab bidirectional ReLU/cosine formulation. The adaptations live
+in the experiment runner to enforce its boolean padding contract and, for
+variable-length batches, compute position- or landmark-dependent quantities at
+each sample's true length. On CUDA all four execute as ordinary PyTorch CUDA
+tensor programs; none has a separate vendor CUDA extension.
+
 Some MHA `config.json` files retain generic parser fields such as
 `core_mode=dynamic`, `rank=32`, `rank_rotary=true`, and
 `implementation=cuda` under `resolved_arguments`. Those fields are inactive
@@ -124,8 +138,9 @@ The underlying test accuracies are:
 
 - Seeds: `0, 1, 2` for every task and mixer.
 - Source commit: `bec1f18750ca4ad364b9d2a5b2ac63359b5cf6c9`.
-- Internal run-set identifier: `sequence-r32-v063`. Raw run artifacts are not
-  distributed with the repository.
+- Internal run-set identifier: `sequence-r32-v063`. Compact per-seed metrics
+  and sanitized provenance are published in [`results/genomic`](../results/genomic/);
+  checkpoints, caches, and verbose logs are omitted.
 - Every included run records `formal=true`, `git_dirty=false`, and
   `validation_only=false`.
 - Recorded runtime: Python 3.12.3, PyTorch 2.11.0+cu128, CUDA runtime 12.8,
@@ -200,8 +215,9 @@ The formal LRA panel excludes all exploratory artifacts. In particular:
 - Pathfinder source commit:
   `3d40f2c9c068ba6e984c54b12691dec343184d63`.
 - Its internal run-set identifier is
-  `lra-pathfinder-factorized-formal-20260812`. Raw run artifacts are not
-  distributed with the repository.
+  `lra-pathfinder-factorized-formal-20260812`. Compact per-seed metrics and
+  sanitized provenance are published in [`results/lra`](../results/lra/);
+  checkpoints, caches, and verbose logs are omitted.
 - Every included run uses seeds `0, 1, 2` and records `formal=true`,
   `git_dirty=false`, and `validation_only=false`.
 - Recorded runtime: Python 3.12.3, PyTorch 2.11.0+cu128, CUDA runtime 12.8,
@@ -258,7 +274,48 @@ for task in listops text retrieval pathfinder; do
 done
 ~~~
 
+To run the four additional matched-shell DNA baselines, reuse the same loop
+and replace the mixer loop with:
+
+~~~bash
+for mixer in linear_transformer performer nystromformer cosformer; do
+  for seed in 0 1 2; do
+    python -m experiments.train_transformers \
+      --config experiments/configs/genomic.toml \
+      --task "$task" --mixer "$mixer" --seed "$seed" --formal \
+      "${batch_args[@]}" \
+      --data-root "$DNA_DATA_ROOT" --cache-root "$SEQUENCE_CACHE" \
+      --output "$RUN_ROOT/genomic/$task/$mixer/s$seed"
+  done
+done
+~~~
+
+These baseline names are deliberately rejected for LRA: their registration is
+part of the matched GenomicBenchmarks experiment, not a new repository-wide
+mixer API.
+
 The selected task resolves its frozen defaults after the TOML template is
 loaded, while explicit command-line values such as `--task`, `--mixer`, and
 the paths above take precedence. Do not add `--pilot-epochs`, sample caps, or
 batch caps to a formal reproduction; the runner rejects these combinations.
+
+## Reproducing the Certificate Stress Test
+
+`experiments/certificate_diagnostics.py` measures the exact realized gain,
+monotonicity margin, solved-state ratio, and deterministic adjoint-probe ratio
+from trained LRA Text checkpoints. The default lengths are 1K, 2K, 4K, and 8K.
+The 8K result is an operator-level stress test, not a task-accuracy evaluation;
+the learned 4K absolute-position table is repeated rather than extrapolated.
+
+~~~bash
+python -m experiments.certificate_diagnostics \
+  --checkpoint /path/to/text/lsso/s0/best.pt \
+  --checkpoint /path/to/text/lsso/s1/best.pt \
+  --checkpoint /path/to/text/lsso/s2/best.pt \
+  --output /path/outside/the/repository/certificate-length-depth
+~~~
+
+The command requires CUDA because it advances the trained encoder through its
+native mixer path. Diagnostics themselves use FP64 compact linear algebra and
+never construct an `N x N` token operator. The output directory contains raw
+observations, percentile summaries, complete protocol metadata, and the plot.

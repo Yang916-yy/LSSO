@@ -115,12 +115,15 @@ the current task-specific shared shells:
 | Pathfinder-32 | 78.79 +/- 0.34 |
 
 Published LRA values are split into two architectural groups in the paper:
-global token mixers without an explicit locality or recurrent-state module,
-and models that add a structured state-space or locality prior. This matters
-because explicit locality can account for a substantial fraction of LRA gains.
-Within the first group, LSSO reports the strongest Retrieval result in the
-displayed panel and is competitive on ListOps, Text, and Pathfinder. These are
-still cross-paper results with different shells and training protocols, so they
+general-purpose global mixers and efficient-attention approximations, and
+models centered on structured recurrence or state-space dynamics. This is a
+mechanism-level grouping, not a claim that every implementation in the first
+group is free of auxiliary local operations. Within the first group, LSSO
+reports the strongest displayed Retrieval and Pathfinder results and is within
+0.38 points on ListOps and 0.71 points on Text of the strongest displayed
+result. Its unweighted average over those four tasks is the highest in the
+group. These are still cross-paper results with different shells and training
+protocols, so they
 provide context rather than an apples-to-apples leaderboard.
 
 After placing the datasets at the roots recorded in the config files, the full
@@ -172,7 +175,9 @@ done
 The runner pins source and split provenance, keeps the compared DNA backbones
 matched, and refuses dirty or mutable formal inputs. See
 [docs/SEQUENCE_EXPERIMENTS.md](docs/SEQUENCE_EXPERIMENTS.md) for per-task
-results, exact recipes, data layout, and protocol boundaries.
+results, exact recipes, data layout, and protocol boundaries. The final
+per-seed metrics, dataset fingerprints, certificate summaries, and wall-clock
+protocol are published as machine-readable artifacts in [`results/`](results/README.md).
 
 ImageNet-1K uses the official DeiT III S/B/L training recipes with LSSO ranks
 32/48/64; see [docs/IMAGENET_DEIT3.md](docs/IMAGENET_DEIT3.md). COCO 2017
