@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lsso-operator"
 version = "0.6.3"
-description = "Accretive-equilibrium low-rank token mixing in PyTorch."
+description = "Solved contextual adaptation with certified global mixing and native CUDA."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = "Apache-2.0"

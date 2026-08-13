@@ -1,11 +1,26 @@
 # LSSO
 
-LSSO is a low-rank global token mixer with one PyTorch reference operator and
-one reserved CUDA boundary. It contains no legacy compatibility path.
+LSSO turns contextual adaptation into a solved global operator. Each sample
+generates a compact strictly accretive system; one direct solve returns its
+equilibrium without an inner learning rate, unrolling, fixed-point iteration,
+or a materialized token-to-token map.
 
-The default operator builds a QR soft frame, forms one shared compact state,
-generates a sample-conditioned accretive generator, and evaluates the resulting
-equilibrium directly. It does not materialize a compact transition matrix.
+The construction scales linearly with sequence length at fixed rank. Its
+compact parameterization spans the open real matrix ball, and every realized
+token mixer, after its sample-conditioned quantities are fixed, is a strict
+L2 contraction around a learned scalar complement. This is a per-mixer
+certificate, not an end-to-end Lipschitz claim for the surrounding network.
+
+The default DYNAMIC + Rank-Rotary operator has native CUDA inference and an
+analytic first-order backward. On the measured RTX 5070 Ti long-sequence
+workloads, the complete mixer reaches up to 1.79x the forward speed and 2.30x
+the forward-backward speed of PyTorch MHA backed by Flash SDPA.
+
+Read the current paper: **[LSSO: Solving Contextual Adaptation with Certified
+Global Mixing](paper/main.pdf)**. The LaTeX source is in
+[`paper/main.tex`](paper/main.tex).
+
+## Quick start
 
 ~~~python
 import torch
@@ -16,7 +31,7 @@ x = torch.randn(8, 65, 192, device="cuda")
 y = layer(x)
 ~~~
 
-The explicit CUDA fast path covers only the complete DYNAMIC + Rank-Rotary
+The native CUDA path covers only the complete DYNAMIC + Rank-Rotary
 operator, with rank 16, 32, 48, or 64 and any positive practical head dimension.
 It accepts the current operator's optional boolean `valid_mask` and shared or
 per-sample position IDs without falling back to another implementation. It
@@ -52,7 +67,29 @@ The timm adapter keeps the backend explicit for the ImageNet and downstream
 workflows.
 
 The only supported ablations are DYNAMIC, STATIC, and ZERO core ownership, plus
-the Rank-Rotary on/off switch. See docs/CORE_CONTRACT.md.
+the Rank-Rotary on/off switch. See
+[`docs/CORE_CONTRACT.md`](docs/CORE_CONTRACT.md) for the canonical mathematical
+and numerical contract.
+
+## CUDA wall clock
+
+The table below measures the complete mixer boundary, including input and
+output projections, at `B=64, D=256, H=8`, FP16 AMP, and rank 32 for LSSO.
+Values are synchronized host wall-clock milliseconds per batch, reported as
+the median of seven repetitions of 100 iterations after 50 warmup iterations.
+MHA uses `nn.MultiheadAttention(..., need_weights=False)` and profiler-confirmed
+Flash SDPA. Forward-backward includes the scalar loss and gradient reset.
+
+| Length | LSSO native forward | MHA forward | LSSO native forward-backward | MHA forward-backward |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 2.539 | 2.131 | **7.512** | 8.487 |
+| 2048 | **5.577** | 5.888 | **15.260** | 22.940 |
+| 4096 | **10.135** | 18.173 | **29.160** | 67.195 |
+
+These are single-device RTX 5070 Ti measurements under WSL2, PyTorch
+2.11.0+cu128, and CUDA 12.8. They are not a cross-architecture or end-to-end
+training-throughput claim. The paper appendix records the full protocol and
+the comparison with the canonical PyTorch LSSO implementation.
 
 ## Sequence results
 
@@ -77,10 +114,14 @@ the current task-specific shared shells:
 | Retrieval | 82.88 +/- 0.08 |
 | Pathfinder-32 | 78.79 +/- 0.34 |
 
-Published LRA, Transformer, and S4 numbers are useful external context only.
-They use different model shells and training protocols, so they are not an
-apples-to-apples comparison with this table and are not pooled or ranked here.
-No sequence result above is presented as a state-of-the-art claim.
+Published LRA values are split into two architectural groups in the paper:
+global token mixers without an explicit locality or recurrent-state module,
+and models that add a structured state-space or locality prior. This matters
+because explicit locality can account for a substantial fraction of LRA gains.
+Within the first group, LSSO reports the strongest Retrieval result in the
+displayed panel and is competitive on ListOps, Text, and Pathfinder. These are
+still cross-paper results with different shells and training protocols, so they
+provide context rather than an apples-to-apples leaderboard.
 
 After placing the datasets at the roots recorded in the config files, the full
 three-seed panels can be reproduced on Linux with the CUDA runtime loaded:
