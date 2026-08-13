@@ -122,6 +122,9 @@ GENOMIC_DEFAULTS = TaskDefaults(
 DEFAULT_PATHFINDER_RESOLUTION = 32
 DEFAULT_VALIDATION_FRACTION = 0.1
 DEFAULT_SPLIT_SEED = 2026
+MixerName = Literal[
+    "mha", "lsso", "linear_transformer", "performer", "nystromformer", "cosformer"
+]
 
 
 class MaskedMultiheadAttention(nn.Module):
@@ -156,6 +159,224 @@ class MaskedMultiheadAttention(nn.Module):
         return torch.where(valid_mask[:, :, None], result, torch.zeros_like(result))
 
 
+def _orthogonal_random_matrix(rows: int, columns: int) -> torch.Tensor:
+    """Gaussian orthogonal features used by the official Performer implementation."""
+    blocks = []
+    for _ in range(rows // columns):
+        q, _ = torch.linalg.qr(torch.randn(columns, columns), mode="reduced")
+        blocks.append(q.T)
+    remainder = rows % columns
+    if remainder:
+        q, _ = torch.linalg.qr(torch.randn(columns, columns), mode="reduced")
+        blocks.append(q.T[:remainder])
+    matrix = torch.cat(blocks, dim=0)
+    return matrix * torch.randn(rows, columns).norm(dim=1, keepdim=True)
+
+
+class MaskedPerformerAttention(nn.Module):
+    """Bidirectional FAVOR+ attention adapted from performer-pytorch 1.1.4."""
+
+    def __init__(self, dim: int, num_heads: int, *, bias: bool) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.num_features = max(1, int(self.head_dim * math.log(self.head_dim)))
+        self.q_proj = nn.Linear(dim, dim, bias=bias)
+        self.k_proj = nn.Linear(dim, dim, bias=bias)
+        self.v_proj = nn.Linear(dim, dim, bias=bias)
+        self.out_proj = nn.Linear(dim, dim, bias=bias)
+        self.register_buffer(
+            "projection_matrix",
+            _orthogonal_random_matrix(self.num_features, self.head_dim),
+        )
+
+    def _feature_map(self, x: torch.Tensor, *, query: bool) -> torch.Tensor:
+        projection = self.projection_matrix.to(dtype=x.dtype)
+        data_normalizer = self.head_dim ** -0.25
+        ratio = self.num_features ** -0.5
+        projected = torch.einsum("bhnd,md->bhnm", x * data_normalizer, projection)
+        diagonal = (x.square().sum(dim=-1, keepdim=True) * data_normalizer**2) / 2
+        if query:
+            maximum = projected.amax(dim=-1, keepdim=True).detach()
+        else:
+            maximum = projected.amax(dim=(-2, -1), keepdim=True).detach()
+        return ratio * (torch.exp(projected - diagonal - maximum) + 1e-4)
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        if valid_mask.shape != x.shape[:2] or valid_mask.dtype != torch.bool:
+            raise ValueError("valid_mask must be bool [B, N] for Performer")
+        batch, length, _ = x.shape
+        reshape = lambda value: value.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self._feature_map(reshape(self.q_proj(x)), query=True)
+        k = self._feature_map(reshape(self.k_proj(x)), query=False)
+        v = reshape(self.v_proj(x))
+        key_mask = valid_mask[:, None, :, None]
+        k = k * key_mask
+        v = v * key_mask
+        denominator = torch.einsum("bhnm,bhm->bhn", q, k.sum(dim=2)).clamp_min(1e-6)
+        context = torch.einsum("bhnm,bhnd->bhmd", k, v)
+        output = torch.einsum("bhnm,bhmd,bhn->bhnd", q, context, denominator.reciprocal())
+        output = output.transpose(1, 2).reshape(batch, length, -1)
+        output = self.out_proj(output)
+        return torch.where(valid_mask[:, :, None], output, torch.zeros_like(output))
+
+
+class MaskedLinearTransformerAttention(nn.Module):
+    """Bidirectional ELU+1 linear attention from the Linear Transformer."""
+
+    def __init__(self, dim: int, num_heads: int, *, bias: bool) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim, bias=bias)
+        self.k_proj = nn.Linear(dim, dim, bias=bias)
+        self.v_proj = nn.Linear(dim, dim, bias=bias)
+        self.out_proj = nn.Linear(dim, dim, bias=bias)
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        if valid_mask.shape != x.shape[:2] or valid_mask.dtype != torch.bool:
+            raise ValueError("valid_mask must be bool [B, N] for Linear Transformer")
+        batch, length, _ = x.shape
+        reshape = lambda value: value.reshape(
+            batch, length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        q = F.elu(reshape(self.q_proj(x))) + 1
+        k = F.elu(reshape(self.k_proj(x))) + 1
+        v = reshape(self.v_proj(x))
+        key_mask = valid_mask[:, None, :, None]
+        # Projections use AMP; global reductions accumulate in FP32 on CUDA.
+        if q.dtype in (torch.float16, torch.bfloat16):
+            q, k, v = (value.float() for value in (q, k, v))
+        k = k * key_mask
+        v = v * key_mask
+        context = torch.einsum("bhnm,bhnd->bhmd", k, v)
+        denominator = torch.einsum("bhnm,bhm->bhn", q, k.sum(dim=2)).clamp_min(1e-6)
+        output = torch.einsum(
+            "bhnm,bhmd,bhn->bhnd", q, context, denominator.reciprocal()
+        )
+        output = output.transpose(1, 2).reshape(batch, length, -1).to(x.dtype)
+        output = self.out_proj(output)
+        return torch.where(valid_mask[:, :, None], output, torch.zeros_like(output))
+
+
+def _iterative_pinv(matrix: torch.Tensor, iterations: int = 6) -> torch.Tensor:
+    absolute = matrix.abs()
+    scale = absolute.sum(dim=-1).amax() * absolute.sum(dim=-2).amax()
+    estimate = matrix.transpose(-1, -2) / scale.clamp_min(torch.finfo(matrix.dtype).tiny)
+    identity = torch.eye(matrix.shape[-1], device=matrix.device, dtype=matrix.dtype)
+    for _ in range(iterations):
+        product = matrix @ estimate
+        estimate = 0.25 * estimate @ (
+            13 * identity - product @ (15 * identity - product @ (7 * identity - product))
+        )
+    return estimate
+
+
+class MaskedNystromAttention(nn.Module):
+    """Nyströmformer attention with the official approximation and no local residual conv."""
+
+    def __init__(self, dim: int, num_heads: int, *, bias: bool, landmarks: int = 64) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.landmarks = landmarks
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
+        self.out_proj = nn.Linear(dim, dim, bias=bias)
+
+    def _fixed_length(self, x: torch.Tensor) -> torch.Tensor:
+        batch, length, dim = x.shape
+        heads, head_dim = self.num_heads, self.head_dim
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        reshape = lambda value: value.reshape(batch, length, heads, head_dim).transpose(1, 2)
+        q, k, v = map(reshape, (q, k, v))
+        # The iterative inverse is unstable in FP16. Projections still use AMP;
+        # only the approximation and its reductions use the public FP32 path.
+        q, k, v = (value.float() for value in (q, k, v))
+        q = q * self.scale
+        landmarks = min(self.landmarks, length)
+        padded_length = math.ceil(length / landmarks) * landmarks
+        padding = padded_length - length
+        if padding:
+            q, k, v = (F.pad(value, (0, 0, padding, 0)) for value in (q, k, v))
+        chunk = padded_length // landmarks
+        landmark_counts = torch.ones(padded_length, device=x.device, dtype=q.dtype)
+        if padding:
+            landmark_counts[:padding] = 0
+        landmark_counts = landmark_counts.reshape(landmarks, chunk).sum(dim=1).clamp_min(1)
+        landmark_counts = landmark_counts[None, None, :, None]
+        q_landmarks = q.reshape(batch, heads, landmarks, chunk, head_dim).sum(dim=3) / landmark_counts
+        k_landmarks = k.reshape(batch, heads, landmarks, chunk, head_dim).sum(dim=3) / landmark_counts
+        sim1 = torch.einsum("bhnd,bhmd->bhnm", q, k_landmarks).softmax(dim=-1)
+        sim2 = torch.einsum("bhnd,bhmd->bhnm", q_landmarks, k_landmarks).softmax(dim=-1)
+        sim3 = torch.einsum("bhnd,bhmd->bhnm", q_landmarks, k).softmax(dim=-1)
+        output = (sim1 @ _iterative_pinv(sim2)) @ (sim3 @ v)
+        return output[:, :, -length:].transpose(1, 2).reshape(batch, length, dim)
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        if valid_mask.shape != x.shape[:2] or valid_mask.dtype != torch.bool:
+            raise ValueError("valid_mask must be bool [B, N] for Nyströmformer")
+        output = torch.zeros_like(x)
+        lengths = valid_mask.sum(dim=1)
+        for length in lengths.unique(sorted=True):
+            size = int(length)
+            if size == 0:
+                continue
+            selected = lengths == length
+            value = self.out_proj(self._fixed_length(x[selected, :size]).to(x.dtype))
+            output[selected, :size] = value.to(output.dtype)
+        return torch.where(valid_mask[:, :, None], output, torch.zeros_like(output))
+
+
+class MaskedCosformerAttention(nn.Module):
+    """Bidirectional cosFormer attention adapted from OpenNLPLab/cosFormer."""
+
+    def __init__(self, dim: int, num_heads: int, *, bias: bool) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim, bias=bias)
+        self.k_proj = nn.Linear(dim, dim, bias=bias)
+        self.v_proj = nn.Linear(dim, dim, bias=bias)
+        self.out_proj = nn.Linear(dim, dim, bias=bias)
+
+    def _forward_fp32(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = x.shape
+        reshape = lambda value: value.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+        q = F.relu(reshape(self.q_proj(x)))
+        k = F.relu(reshape(self.k_proj(x)))
+        v = reshape(self.v_proj(x))
+        positions = torch.arange(1, length + 1, device=x.device, dtype=q.dtype)[None, None, :, None]
+        lengths = valid_mask.sum(dim=1).clamp_min(1).to(q.dtype)[:, None, None, None]
+        angles = (math.pi / 2) * positions / lengths
+        q = torch.cat((q * angles.sin(), q * angles.cos()), dim=-1)
+        k = torch.cat((k * angles.sin(), k * angles.cos()), dim=-1)
+        key_mask = valid_mask[:, None, :, None]
+        k = k * key_mask
+        v = v * key_mask
+        context = torch.einsum("bhnm,bhnd->bhmd", k, v)
+        denominator = torch.einsum("bhnm,bhm->bhn", q, k.sum(dim=2)).clamp_min(1e-6)
+        output = torch.einsum("bhnm,bhmd,bhn->bhnd", q, context, denominator.reciprocal())
+        output = output.transpose(1, 2).reshape(batch, length, -1)
+        output = self.out_proj(output)
+        return torch.where(valid_mask[:, :, None], output, torch.zeros_like(output))
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        if valid_mask.shape != x.shape[:2] or valid_mask.dtype != torch.bool:
+            raise ValueError("valid_mask must be bool [B, N] for cosFormer")
+        # The official 1e-6 denominator is finite in FP32 but can overflow the
+        # FP16 backward when a ReLU feature head is initially all zero.
+        context = (
+            torch.autocast(device_type="cuda", enabled=False)
+            if x.device.type == "cuda"
+            else contextlib.nullcontext()
+        )
+        with context:
+            output = self._forward_fp32(x.float(), valid_mask)
+        output = output.to(x.dtype)
+        return torch.where(valid_mask[:, :, None], output, torch.zeros_like(output))
+
+
 class SequenceBlock(nn.Module):
     """A pre-norm residual encoder block shared by both mixer families."""
 
@@ -165,7 +386,7 @@ class SequenceBlock(nn.Module):
         dim: int,
         num_heads: int,
         rank: int,
-        mixer: Literal["mha", "lsso"],
+        mixer: MixerName,
         core_mode: CoreMode,
         rank_rotary: bool,
         implementation: Literal["reference", "cuda"],
@@ -188,8 +409,16 @@ class SequenceBlock(nn.Module):
                     bias=bias,
                 )
             )
-        else:
+        elif mixer == "mha":
             self.mixer = MaskedMultiheadAttention(dim, num_heads, bias=bias)
+        elif mixer == "performer":
+            self.mixer = MaskedPerformerAttention(dim, num_heads, bias=bias)
+        elif mixer == "linear_transformer":
+            self.mixer = MaskedLinearTransformerAttention(dim, num_heads, bias=bias)
+        elif mixer == "nystromformer":
+            self.mixer = MaskedNystromAttention(dim, num_heads, bias=bias)
+        else:
+            self.mixer = MaskedCosformerAttention(dim, num_heads, bias=bias)
         self.norm2 = nn.LayerNorm(dim)
         hidden_dim = int(round(dim * mlp_ratio))
         if hidden_dim <= 0:
@@ -242,7 +471,7 @@ class SequenceEncoder(nn.Module):
         depth: int,
         num_heads: int,
         rank: int,
-        mixer: Literal["mha", "lsso"],
+        mixer: MixerName,
         core_mode: CoreMode,
         rank_rotary: bool,
         implementation: Literal["reference", "cuda"],
@@ -508,7 +737,13 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pathfinder-resolution", type=int)
     parser.add_argument("--validation-fraction", type=float)
     parser.add_argument("--split-seed", type=int)
-    parser.add_argument("--mixer", choices=("mha", "lsso"), default="lsso")
+    parser.add_argument(
+        "--mixer",
+        choices=(
+            "mha", "lsso", "linear_transformer", "performer", "nystromformer", "cosformer"
+        ),
+        default="lsso",
+    )
     parser.add_argument("--implementation", choices=("reference", "cuda"), default="cuda")
     parser.add_argument("--core-mode", choices=[mode.value for mode in CoreMode], default="dynamic")
     parser.add_argument("--rank-rotary", action=argparse.BooleanOptionalAction, default=True)
@@ -680,6 +915,10 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def _validate_resolved_args(args: argparse.Namespace) -> None:
+    if args.mixer in {
+        "linear_transformer", "performer", "nystromformer", "cosformer"
+    } and args.suite != "genomic":
+        raise ValueError(f"{args.mixer} is a GenomicBenchmarks-only baseline")
     for name in ("rank", "dim", "depth", "heads", "epochs", "batch_size", "eval_batch_size"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
@@ -1070,7 +1309,17 @@ def _build_run_payload(
             "core_mode": args.core_mode,
             "rank_rotary": args.rank_rotary,
             "pooling": args.pooling,
-            "implementation": args.implementation if args.mixer == "lsso" else "torch-mha",
+            "implementation": (
+                args.implementation
+                if args.mixer == "lsso"
+                else {
+                    "mha": "torch-sdpa",
+                    "linear_transformer": "linear-transformer-elu-plus-one-adapted",
+                    "performer": "performer-pytorch-1.1.4-adapted",
+                    "nystromformer": "nystrom-attention-0.0.14-adapted-no-conv",
+                    "cosformer": "opennlplab-cosformer-official-adapted",
+                }[args.mixer]
+            ),
             "position_encoding": position_encoding,
             "position_initialization": "normal-0.02"
             if not (args.suite == "lra" and args.task == "pathfinder")

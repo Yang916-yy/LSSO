@@ -3,14 +3,17 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import functools
 import json
+import math
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytest
 from torch.utils.data import Dataset, TensorDataset
 
 import experiments.train_transformers as train_transformers
+from experiments.certificate_diagnostics import summarize
 from experiments.sequence_data import (
     DatasetBundle,
     NucleotideTokenizer,
@@ -47,6 +50,45 @@ from lsso.ball import cuda
 
 
 pytestmark = pytest.mark.experiment
+
+
+def test_certificate_summary_groups_length_layer_and_reports_percentiles() -> None:
+    records = []
+    for length in (1024, 2048):
+        for layer in (1, 2):
+            for index, value in enumerate((0.2, 0.4, 0.6)):
+                record: dict[str, float | int] = {
+                    "length": length,
+                    "layer": layer,
+                    "checkpoint": 0,
+                    "seed": 0,
+                    "probe": index,
+                    "head": 0,
+                }
+                for metric in (
+                    "q",
+                    "contraction_slack",
+                    "mu",
+                    "state_ratio",
+                    "adjoint_ratio",
+                    "state_bound_usage",
+                    "adjoint_bound_usage",
+                ):
+                    record[metric] = value
+                records.append(record)
+
+    rows = summarize(records)
+
+    assert len(rows) == 4 * 7
+    q_row = next(
+        row
+        for row in rows
+        if row["length"] == 1024 and row["layer"] == 1 and row["metric"] == "q"
+    )
+    assert q_row["count"] == 3
+    assert q_row["min"] == pytest.approx(0.2)
+    assert q_row["median"] == pytest.approx(0.4)
+    assert q_row["max"] == pytest.approx(0.6)
 
 
 def _encoder(mixer: str) -> SequenceEncoder:
@@ -255,7 +297,9 @@ def test_collate_uses_lengths_not_the_token_value() -> None:
     assert batch["mask"].tolist() == [[True, True], [True, False]]
 
 
-@pytest.mark.parametrize("mixer", ("mha", "lsso"))
+@pytest.mark.parametrize(
+    "mixer", ("mha", "lsso", "linear_transformer", "performer", "nystromformer", "cosformer")
+)
 @pytest.mark.parametrize("pooling", ("mean", "meanmax"))
 def test_sequence_classifier_masks_padding_for_both_mixers(
     mixer: str, pooling: str
@@ -276,6 +320,333 @@ def test_factorized_grid_positions_mask_invalid_pixels_for_both_mixers(mixer: st
     first = torch.tensor([[[1.0], [0.0], [2.0], [0.0], [3.0], [0.0]]])
     second = torch.tensor([[[1.0], [8.0], [2.0], [7.0], [3.0], [6.0]]])
     torch.testing.assert_close(model(first, valid), model(second, valid), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+)
+def test_dna_baseline_forward_backward_is_finite(mixer: str) -> None:
+    torch.manual_seed(23)
+    model = SequenceClassifier(_encoder(mixer), 3).train()
+    inputs = torch.tensor([[2, 3, 4, 0], [5, 6, 0, 0]])
+    valid = inputs.ne(0)
+    loss = model(inputs, valid).square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+)
+def test_dna_baseline_accepts_fp16_cuda_autocast(mixer: str) -> None:
+    torch.manual_seed(23)
+    model = SequenceClassifier(_encoder(mixer), 3).cuda().train()
+    inputs = torch.tensor([[2, 3, 4, 0], [5, 6, 0, 0]], device="cuda")
+    valid = inputs.ne(0)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        loss = model(inputs, valid).float().square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
+@pytest.mark.parametrize(
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+)
+def test_variable_length_baseline_is_independent_of_batch_padding(mixer: str) -> None:
+    torch.manual_seed(29)
+    model = SequenceClassifier(_encoder(mixer), 3).eval()
+    short = torch.tensor([[2, 3]])
+    short_mask = torch.ones_like(short, dtype=torch.bool)
+    padded = torch.tensor([[2, 3, 9, 8]])
+    padded_mask = torch.tensor([[True, True, False, False]])
+    torch.testing.assert_close(
+        model(short, short_mask),
+        model(padded, padded_mask),
+        rtol=2e-5,
+        atol=2e-6,
+    )
+
+
+def test_linear_transformer_matches_explicit_quadratic_form() -> None:
+    torch.manual_seed(41)
+    layer = train_transformers.MaskedLinearTransformerAttention(16, 2, bias=True).double()
+    inputs = torch.randn(2, 7, 16, dtype=torch.double)
+    valid = torch.tensor(
+        [[True, True, True, True, True, False, False],
+         [True, True, True, False, False, False, False]]
+    )
+    actual = layer(inputs, valid)
+    batch, length, _ = inputs.shape
+    reshape = lambda value: value.reshape(batch, length, 2, 8).transpose(1, 2)
+    q = F.elu(reshape(layer.q_proj(inputs))) + 1
+    k = F.elu(reshape(layer.k_proj(inputs))) + 1
+    v = reshape(layer.v_proj(inputs))
+    k = k * valid[:, None, :, None]
+    v = v * valid[:, None, :, None]
+    weights = torch.einsum("bhid,bhjd->bhij", q, k)
+    expected = torch.einsum("bhij,bhjd->bhid", weights, v)
+    expected = expected / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    expected = layer.out_proj(expected.transpose(1, 2).reshape(batch, length, -1))
+    expected = torch.where(valid[:, :, None], expected, torch.zeros_like(expected))
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+def _cloned_parameters(module: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: parameter.detach().clone().requires_grad_()
+        for name, parameter in module.named_parameters()
+    }
+
+
+def _projection(
+    inputs: torch.Tensor,
+    parameters: dict[str, torch.Tensor],
+    name: str,
+) -> torch.Tensor:
+    return F.linear(
+        inputs,
+        parameters[f"{name}.weight"],
+        parameters.get(f"{name}.bias"),
+    )
+
+
+def _assert_upstream_forward_and_gradients(
+    module: nn.Module,
+    oracle: Any,
+    inputs: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    actual_inputs = inputs.detach().clone().requires_grad_()
+    actual = module(actual_inputs, valid)
+    cotangent = torch.randn_like(actual)
+    actual_parameters = tuple(module.parameters())
+    actual_gradients = torch.autograd.grad(
+        (actual * cotangent).sum(), (actual_inputs, *actual_parameters)
+    )
+
+    expected_inputs = inputs.detach().clone().requires_grad_()
+    expected_parameters = _cloned_parameters(module)
+    expected = oracle(expected_inputs, valid, expected_parameters)
+    expected_gradients = torch.autograd.grad(
+        (expected * cotangent).sum(),
+        (expected_inputs, *expected_parameters.values()),
+    )
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(
+            actual_gradient,
+            expected_gradient,
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+def _performer_114_oracle(
+    inputs: torch.Tensor,
+    valid: torch.Tensor,
+    parameters: dict[str, torch.Tensor],
+    projection_matrix: torch.Tensor,
+    *,
+    num_heads: int,
+) -> torch.Tensor:
+    """performer-pytorch 1.1.4, commit fc8b784, noncausal FastAttention."""
+    batch, length, dim = inputs.shape
+    head_dim = dim // num_heads
+    reshape = lambda value: value.reshape(batch, length, num_heads, head_dim).transpose(1, 2)
+    q = reshape(_projection(inputs, parameters, "q_proj"))
+    k = reshape(_projection(inputs, parameters, "k_proj"))
+    v = reshape(_projection(inputs, parameters, "v_proj"))
+    normalizer = head_dim ** -0.25
+    ratio = projection_matrix.shape[0] ** -0.5
+
+    def feature_map(value: torch.Tensor, *, query: bool) -> torch.Tensor:
+        projected = torch.einsum(
+            "bhnd,md->bhnm", value * normalizer, projection_matrix.to(value)
+        )
+        diagonal = value.square().sum(dim=-1, keepdim=True) * normalizer**2 / 2
+        dimensions = -1 if query else (-2, -1)
+        maximum = projected.amax(dim=dimensions, keepdim=True).detach()
+        return ratio * (torch.exp(projected - diagonal - maximum) + 1e-4)
+
+    q = feature_map(q, query=True)
+    k = feature_map(k, query=False)
+    key_mask = valid[:, None, :, None]
+    k = k * key_mask
+    v = v * key_mask
+    inverse = torch.einsum("bhnm,bhm->bhn", q, k.sum(dim=2)).reciprocal()
+    context = torch.einsum("bhnm,bhnd->bhmd", k, v)
+    output = torch.einsum("bhmd,bhnm,bhn->bhnd", context, q, inverse)
+    output = output.transpose(1, 2).reshape(batch, length, dim)
+    output = _projection(output, parameters, "out_proj")
+    return torch.where(valid[:, :, None], output, torch.zeros_like(output))
+
+
+def test_performer_matches_upstream_114_forward_and_gradients() -> None:
+    torch.manual_seed(53)
+    layer = train_transformers.MaskedPerformerAttention(16, 2, bias=True).double()
+    inputs = torch.randn(2, 7, 16, dtype=torch.double)
+    valid = torch.ones(2, 7, dtype=torch.bool)
+    oracle = functools.partial(
+        _performer_114_oracle,
+        projection_matrix=layer.projection_matrix.detach().clone(),
+        num_heads=2,
+    )
+    _assert_upstream_forward_and_gradients(
+        layer, oracle, inputs, valid, rtol=1e-11, atol=1e-12
+    )
+
+
+def _nystrom_attention_0014_oracle(
+    inputs: torch.Tensor,
+    valid: torch.Tensor,
+    parameters: dict[str, torch.Tensor],
+    *,
+    num_heads: int,
+    landmarks: int,
+) -> torch.Tensor:
+    """nystrom-attention 0.0.14, commit fbe9eba, residual=False."""
+    batch, length, dim = inputs.shape
+    assert length % landmarks == 0 and bool(valid.all())
+    head_dim = dim // num_heads
+    q, k, v = _projection(inputs, parameters, "qkv").chunk(3, dim=-1)
+    reshape = lambda value: value.reshape(batch, length, num_heads, head_dim).transpose(1, 2)
+    q, k, v = map(reshape, (q, k, v))
+    q = q * head_dim ** -0.5
+    chunk = length // landmarks
+    q_landmarks = q.reshape(batch, num_heads, landmarks, chunk, head_dim).mean(dim=3)
+    k_landmarks = k.reshape(batch, num_heads, landmarks, chunk, head_dim).mean(dim=3)
+    similarity = lambda left, right: torch.einsum("bhnd,bhmd->bhnm", left, right)
+    attention1 = similarity(q, k_landmarks).softmax(dim=-1)
+    attention2 = similarity(q_landmarks, k_landmarks).softmax(dim=-1)
+    attention3 = similarity(q_landmarks, k).softmax(dim=-1)
+    absolute = attention2.abs()
+    estimate = attention2.transpose(-1, -2) / (
+        absolute.sum(dim=-1).amax() * absolute.sum(dim=-2).amax()
+    )
+    identity = torch.eye(landmarks, device=inputs.device, dtype=inputs.dtype)
+    for _ in range(6):
+        product = attention2 @ estimate
+        estimate = 0.25 * estimate @ (
+            13 * identity
+            - product @ (15 * identity - product @ (7 * identity - product))
+        )
+    output = (attention1 @ estimate) @ (attention3 @ v)
+    output = output.transpose(1, 2).reshape(batch, length, dim)
+    output = _projection(output, parameters, "out_proj")
+    return output
+
+
+def test_nystromformer_matches_upstream_0014_forward_and_gradients() -> None:
+    torch.manual_seed(59)
+    layer = train_transformers.MaskedNystromAttention(
+        16, 2, bias=True, landmarks=4
+    ).float()
+    inputs = torch.randn(2, 8, 16)
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    oracle = functools.partial(
+        _nystrom_attention_0014_oracle, num_heads=2, landmarks=4
+    )
+    _assert_upstream_forward_and_gradients(
+        layer, oracle, inputs, valid, rtol=3e-4, atol=3e-6
+    )
+
+
+def _opennlplab_cosformer_oracle(
+    inputs: torch.Tensor,
+    valid: torch.Tensor,
+    parameters: dict[str, torch.Tensor],
+    *,
+    num_heads: int,
+) -> torch.Tensor:
+    """OpenNLPLab/cosFormer commit 8e12da1, noncausal forward."""
+    batch, length, dim = inputs.shape
+    assert bool(valid.all())
+    head_dim = dim // num_heads
+    reshape = lambda value: value.reshape(batch, length, num_heads, head_dim).transpose(1, 2)
+    q = F.relu(reshape(_projection(inputs, parameters, "q_proj")))
+    k = F.relu(reshape(_projection(inputs, parameters, "k_proj")))
+    v = reshape(_projection(inputs, parameters, "v_proj"))
+    index = (math.pi / 2) * torch.arange(
+        1, length + 1, device=inputs.device, dtype=inputs.dtype
+    )[None, None, :, None]
+    q = torch.cat((q * (index / length).sin(), q * (index / length).cos()), dim=-1)
+    k = torch.cat((k * (index / length).sin(), k * (index / length).cos()), dim=-1)
+    context = torch.einsum("bhnm,bhnd->bhmd", k, v)
+    inverse = torch.einsum("bhnm,bhm->bhn", q, k.sum(dim=2)).clamp_min(1e-6).reciprocal()
+    output = torch.einsum("bhnm,bhmd,bhn->bhnd", q, context, inverse)
+    output = output.transpose(1, 2).reshape(batch, length, dim)
+    return _projection(output, parameters, "out_proj")
+
+
+def test_cosformer_matches_upstream_forward_and_gradients() -> None:
+    torch.manual_seed(61)
+    layer = train_transformers.MaskedCosformerAttention(16, 2, bias=True).float()
+    inputs = torch.randn(2, 7, 16)
+    valid = torch.ones(2, 7, dtype=torch.bool)
+    oracle = functools.partial(_opennlplab_cosformer_oracle, num_heads=2)
+    _assert_upstream_forward_and_gradients(
+        layer, oracle, inputs, valid, rtol=2e-5, atol=2e-6
+    )
+
+
+@pytest.mark.parametrize(
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+)
+def test_dna_baselines_are_rejected_for_lra(mixer: str) -> None:
+    with pytest.raises(ValueError, match="GenomicBenchmarks-only"):
+        resolve_args(parse_args(["--suite", "lra", "--task", "listops", "--mixer", mixer]))
+
+
+@pytest.mark.parametrize(
+    ("mixer", "implementation"),
+    (
+        ("linear_transformer", "linear-transformer-elu-plus-one-adapted"),
+        ("performer", "performer-pytorch-1.1.4-adapted"),
+        ("nystromformer", "nystrom-attention-0.0.14-adapted-no-conv"),
+        ("cosformer", "opennlplab-cosformer-official-adapted"),
+    ),
+)
+def test_dna_baseline_metadata_records_implementation(mixer: str, implementation: str) -> None:
+    args = resolve_args(
+        parse_args(["--suite", "genomic", "--task", "demo_human_or_worm", "--mixer", mixer])
+    )
+    dataset = TensorDataset(torch.ones(1, 4, dtype=torch.long), torch.zeros(1, dtype=torch.long))
+    bundle = DatasetBundle(
+        train=dataset,
+        validation=dataset,
+        test=dataset,
+        input_kind="tokens",
+        num_classes=2,
+        max_length=4,
+        metadata={},
+        vocab_size=8,
+        pad_token_id=0,
+    )
+    model = build_model(args, bundle)
+    payload = _build_run_payload(
+        args,
+        bundle,
+        {"train": 1, "validation": 1, "test": 1},
+        model,
+        torch.device("cpu"),
+        cuda_enabled=False,
+    )
+    assert payload["model"]["mixer"] == mixer
+    assert payload["model"]["implementation"] == implementation
+    assert "lsso_cuda_contract" not in payload["runtime"]
 
 
 def test_meanmax_readout_handles_an_empty_valid_set() -> None:
