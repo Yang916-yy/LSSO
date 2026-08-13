@@ -123,8 +123,7 @@ reports the strongest displayed Retrieval and Pathfinder results and is within
 0.38 points on ListOps and 0.71 points on Text of the strongest displayed
 result. Its unweighted average over those four tasks is the highest in the
 group. These are still cross-paper results with different shells and training
-protocols, so they
-provide context rather than an apples-to-apples leaderboard.
+protocols, so they provide context rather than an apples-to-apples leaderboard.
 
 After placing the datasets at the roots recorded in the config files, the full
 three-seed panels can be reproduced on Linux with the CUDA runtime loaded:
@@ -171,6 +170,13 @@ for task in listops text retrieval pathfinder; do
   done
 done
 ~~~
+
+The GenomicBenchmarks runner also supports `linear_transformer`, `performer`,
+`nystromformer`, and `cosformer` through the same `--mixer` argument. They use
+the same data protocol and encoder shell as the matched MHA/LSSO panel and run
+as ordinary PyTorch CUDA tensor programs. Their implementations and upstream
+parity tests are included, but formal three-seed results have not yet been
+reported.
 
 The runner pins source and split provenance, keeps the compared DNA backbones
 matched, and refuses dirty or mutable formal inputs. See

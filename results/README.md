@@ -15,8 +15,9 @@ runtime used by each formal panel.
 Accuracies in the CSV files are percentages. `selected_epoch` is the epoch of
 the validation-selected checkpoint evaluated once on the held-out test split.
 Each `config_digest` is the SHA-256 digest stored by the formal runner for the
-fully resolved run configuration. Dataset hashes and split fingerprints are
-included in the corresponding provenance table.
+fully resolved run configuration. Dataset content hashes and recorded protocol
+metadata are included in the corresponding provenance table; split
+fingerprints are included where the formal artifact records them.
 
 The repository intentionally omits checkpoints, caches, and verbose training
 logs. Those files are large and are not needed to audit the reported numbers.
