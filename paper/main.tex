@@ -3,6 +3,7 @@
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb,amsthm,mathtools}
 \usepackage{booktabs}
+\usepackage{float}
 \usepackage{microtype}
 \usepackage[hidelinks]{hyperref}
 
@@ -43,8 +44,13 @@ a learned scalar complement then lifts it to token space without fixing the
 unmodeled subspace to the identity.  In exact arithmetic, every frozen
 input-conditioned token mixer is strictly contractive in $\ell_2$, and its
 deviation from the scalar complement has rank at most the compact rank.  The
-equilibrium is evaluated by one small direct solve, so no fixed-point iteration
-or test-time gradient updates are part of the forward pass.
+equilibrium is the exact infinite-time limit of a globally convergent contextual
+inner flow, but is evaluated by one small direct solve.  No fixed-point
+iteration, inner learning rate, unrolling, or test-time gradient update is part
+of the forward pass.  In a matched eight-task GenomicBenchmarks comparison,
+LSSO is higher than multi-head attention on seven tasks and improves unweighted
+macro accuracy from $75.37$ to $78.53$.  Four Long Range Arena tasks further
+test the operator on sequences of up to $4096$ positions.
 \end{abstract}
 
 \section{Introduction}
@@ -72,8 +78,14 @@ or splitting solver.  Meanwhile, test-time training (TTT) builds a compact
 inner model from the current sequence through online optimization
 \cite{sun2025ttt}; ViT$^3$ makes the associated inner-model design space
 explicit for visual sequence modeling \cite{han2026vit3}.  These are useful
-perspectives, but an unrolled inner optimizer introduces choices of objective,
-step size, and update count.
+perspectives, but ViT$^3$ also documents the practical cost of inner training:
+loss, learning rate, update schedule, and inner architecture all matter, while
+deeper inner models face both outer-loop initialization and inner-loop gradient
+difficulties.  More complete test-time optimization can improve sequence
+models, but iterative solvers spend additional inference computation
+\cite{vonoswald2026mesanet}.  This motivates a complementary question: when
+the desired contextual state is structured, can its optimum be solved exactly
+rather than approximated by a finite update rule?
 
 We ask a narrower question:
 \begin{quote}
@@ -100,21 +112,28 @@ complement $\eta$ lift $M$ to
 The complement is essential: on the token subspace not represented by $P$, the
 mixer acts as $\eta\I$ rather than as a hard-coded identity.
 
-The paper makes three technical contributions.
+The paper makes four contributions.
 \begin{enumerate}
     \item We define a content-conditioned global mixer with a QR soft frame,
     an accretive compact equilibrium, and a scalar-complement token lift.  The
     only public ablations are the compact-core ownership modes
     \textsc{Dynamic}, \textsc{Static}, and \textsc{Zero}, together with an
     optional rank-space phase rotation.
+    \item We prove that the contextual inner flow converges globally and
+    exponentially to the state returned by the direct solve.  We give the
+    corresponding discrete gradient-descent limit, exact implicit derivative,
+    and perturbation bounds; the production forward has no inner optimizer.
     \item We prove that the compact parameterization covers all real strictly
     accretive matrices and, through the Cayley map, all real strict compact
-    contractions.  The direct solve is the unique closed-form equilibrium of a
-    strongly monotone linear system.
-    \item We prove that every frozen, sample-conditioned token mixer is a
+    contractions, and that every frozen, sample-conditioned token mixer is a
     strict $\ell_2$ contraction and satisfies
     $\rank(T-\eta\I)\leq r$.  We state precisely why this does \emph{not}
     imply a global Lipschitz bound for the complete dynamic neural block.
+    \item In a three-seed matched comparison on eight genomic classification
+    tasks, LSSO exceeds MHA on seven tasks and improves unweighted macro
+    accuracy by $3.16$ percentage points.  We also report a four-task LRA
+    panel, while separating our task-specific protocol from external
+    literature values rather than treating them as an apples-to-apples rank.
 \end{enumerate}
 
 \section{Related Work and Positioning}
@@ -136,12 +155,19 @@ arbitrary attention matrix.
 \paragraph{Inner adaptation and test-time training.}
 TTT interprets sequence processing through a compact inner model learned from
 the sequence \cite{sun2025ttt}; ViT$^3$ shows that the choices inside that
-inner model remain consequential in vision \cite{han2026vit3}.  LSSO shares
-the useful idea that a sequence can produce compact, context-specific
-quantities.  It differs in the mechanism: $Z$ directly generates an
-accretive system and $U^\star=(\I+K)^{-1}Z$ is evaluated by a small solve.
-There is no inference-time gradient descent, no learned inner-model weights
-updated per sequence, and no claim of literal equivalence to a TTT layer.
+inner model remain consequential in vision \cite{han2026vit3}.  Linear
+attention also admits a fast-weight interpretation \cite{schlag2021fastweights},
+and recent work derives recurrent updates from online or test-time regression
+objectives \cite{liu2024longhorn,wang2025testtimeregression}.  Longhorn already
+uses a closed-form associative-recall update, while MesaNet approximately
+optimizes a causal in-context objective at every time point with a parallel
+conjugate-gradient solver \cite{vonoswald2026mesanet}.  LSSO therefore does not
+claim the first closed-form inner update or literal equivalence to a TTT layer.
+Its contribution is a different combination for noncausal encoders: the whole
+sample generates a complete strictly accretive compact system,
+$U^\star=(\I+K)^{-1}Z$ is evaluated by a direct solve, and the resulting frozen
+token kernel carries an explicit spectral certificate.  No learned inner-model
+weights are updated per sequence.
 
 \paragraph{Certified and implicit networks.}
 Monotone operator equilibrium networks obtain well-posedness from monotone
@@ -202,6 +228,7 @@ The QR soft frame maps unconstrained relation coordinates to a strict column
 contraction.  Form the reduced QR factorization
 \begin{equation}
     \begin{bmatrix}P\\E\end{bmatrix}R_{\mathrm{qr}}
+    =
     \begin{bmatrix}A\\\I_r\end{bmatrix},
     \qquad
     \begin{bmatrix}P\\E\end{bmatrix}^{\!\T}
@@ -254,7 +281,10 @@ equilibrium and the pre-output token coordinates are
     \qquad \eta=\tanh(\eta_{\mathrm{raw}})\in(-1,1).
 \label{eq:equilibrium-readout}
 \end{align}
-The complement is learned independently for each head.  In \textsc{Zero},
+This is the exact-real map.  The floating-point implementation evaluates a
+stable logistic identity and multiplies by one minus the calculation-dtype
+machine epsilon, reserving one ULP from $\{-1,1\}$.  The complement is learned
+independently for each head and is initialized nominally to $0.9$.  In \textsc{Zero},
 we set the compact term to $M=0$, which gives
 \begin{equation}
     Y=\eta(C-PZ).
@@ -278,18 +308,15 @@ token-mixing form
 \label{eq:token-mixer}
 \end{equation}
 
-\paragraph{Closed form, not unrolled TTT.}
+\paragraph{Solved contextual inner state.}
 Equation~\eqref{eq:equilibrium-readout} is the exact solution of a small
-linear system.  It is also the unique minimizer of the residual objective
-\begin{equation}
-    \min_U \; \frac{1}{2}\norm{(\I_r+K)U-Z}_F^2,
-\label{eq:residual-objective}
-\end{equation}
-whose gradient descent converges to $U^\star$ for a sufficiently small fixed
-step size.  This supplies an optional inner-adaptation interpretation, but it
-is not the computation performed by LSSO.  In particular, when
-$\Omega\neq0$, the original equation $(\I_r+K)U=Z$ is not the first-order
-condition of a ridge or other symmetric convex energy in $U$.
+linear system.  Section~\ref{sec:solved-inner-process} proves that it is the
+infinite-time limit of a globally convergent contextual flow and, separately,
+the infinite-step limit of gradient descent on a residual objective.  These
+are mathematical interpretations, not the computation performed by LSSO.
+In particular, when $\Omega\neq0$, the original equation
+$(\I_r+K)U=Z$ is not the first-order condition of a ridge or other symmetric
+convex energy in $U$.
 
 \paragraph{Cost.}
 For fixed $r$ and $d$, frame formation costs
@@ -440,6 +467,111 @@ which proves \eqref{eq:solve-bound}.  Applying the inverse to each column of
 $Z$ gives the unique equilibrium.
 \end{proof}
 
+\subsection{The direct solve is an infinite inner-process limit}
+\label{sec:solved-inner-process}
+
+Let $A_K=\I_r+K$.  The following result states precisely in what sense the
+forward pass replaces an infinite contextual inner process.  It does not
+identify LSSO with an arbitrary TTT objective or nonlinear inner model.
+
+\begin{theorem}[Solved contextual inner process]
+\label{thm:inner-process}
+For fixed contextual quantities $K$ and $Z$, consider the continuous dynamics
+\begin{equation}
+    \dot U(t)=Z-A_KU(t).
+\label{eq:contextual-flow}
+\end{equation}
+From every initial state $U(0)$, the dynamics converge to
+$U^\star=A_K^{-1}Z$ and obey
+\begin{equation}
+    \norm{U(t)-U^\star}_F
+    \leq e^{-t}\norm{U(0)-U^\star}_F.
+\label{eq:flow-rate}
+\end{equation}
+The rate lower bound is independent of the skew-symmetric part of $K$.
+
+The same state uniquely minimizes the residual objective
+\begin{equation}
+    J(U)=\frac12\norm{A_KU-Z}_F^2.
+\label{eq:residual-objective}
+\end{equation}
+Let $s_{\min}$ and $s_{\max}$ be the extreme singular values of $A_K$.
+Gradient descent on $J$ with a fixed step
+$0<\alpha<2/s_{\max}^2$ satisfies
+\begin{equation}
+    \norm{U_{j}-U^\star}_F
+    \leq \rho^j\norm{U_0-U^\star}_F,
+    \qquad
+    \rho=\max_i\left|1-\alpha\sigma_i(A_K)^2\right|<1.
+\label{eq:residual-gd-rate}
+\end{equation}
+Thus the direct solve returns both the infinite-time limit of
+\eqref{eq:contextual-flow} and the infinite-step limit of every such residual
+gradient descent run, without choosing $\alpha$ or an update count in the
+implemented forward pass.
+\end{theorem}
+
+\begin{proof}
+Write $E(t)=U(t)-U^\star$.  Since $A_KU^\star=Z$,
+$\dot E=-A_KE$.  The skew part vanishes in the Frobenius inner product, so
+\begin{equation}
+    \frac{d}{dt}\frac12\norm{E}_F^2
+    =-\inner{E}{A_KE}_F
+    =-\inner{E}{\sym(A_K)E}_F
+    \leq-\norm{E}_F^2,
+\end{equation}
+because $\sym(A_K)=\I_r+LL^\T\succeq\I_r$.  Gronwall's inequality gives
+\eqref{eq:flow-rate}.
+
+The Hessian of $J$ is $A_K^\T A_K\succ0$, so its unique stationary point
+solves $A_K^\T(A_KU-Z)=0$ and hence equals $U^\star$.  For
+$E_j=U_j-U^\star$, gradient descent gives
+$E_{j+1}=(\I_r-\alpha A_K^\T A_K)E_j$.  Diagonalizing the symmetric positive
+definite matrix $A_K^\T A_K$ proves \eqref{eq:residual-gd-rate} and the stated
+step-size interval.
+\end{proof}
+
+\begin{proposition}[Exact implicit derivative and sensitivity]
+\label{prop:implicit-gradient}
+For perturbations of $A_K$ and $Z$, the equilibrium differential is
+\begin{equation}
+    dU^\star=A_K^{-1}\left(dZ-dA_K\,U^\star\right).
+\label{eq:equilibrium-differential}
+\end{equation}
+If $G=\partial\mathcal L/\partial U^\star$ for a scalar outer loss and
+$V=A_K^{-\T}G$, then
+\begin{equation}
+    \frac{\partial\mathcal L}{\partial Z}=V,
+    \qquad
+    \frac{\partial\mathcal L}{\partial A_K}=-VU^{\star\T}.
+\label{eq:implicit-vjp}
+\end{equation}
+Moreover,
+\begin{equation}
+    \norm{A_K^{-1}}_2\leq1,
+    \quad
+    \norm{U^\star}_F\leq\norm{Z}_F,
+    \quad
+    \norm{dU^\star}_F
+    \leq\norm{dZ}_F+\norm{dA_K}_2\norm{Z}_F.
+\label{eq:equilibrium-sensitivity}
+\end{equation}
+The direct-solve backward therefore computes the exact implicit gradient of
+the converged equilibrium rather than a finite-unroll gradient.
+\end{proposition}
+
+\begin{proof}
+Differentiating $A_KU^\star=Z$ gives
+$dA_K\,U^\star+A_KdU^\star=dZ$, which proves
+\eqref{eq:equilibrium-differential}.  Substitution into the Frobenius
+differential of $\mathcal L$ and cyclicity of the trace give
+\eqref{eq:implicit-vjp}.  Corollary~\ref{cor:equilibrium} gives
+$\sigma_{\min}(A_K)\geq1$, hence $\norm{A_K^{-1}}_2\leq1$; applying this
+bound to $U^\star=A_K^{-1}Z$ and
+\eqref{eq:equilibrium-differential} yields
+\eqref{eq:equilibrium-sensitivity}.
+\end{proof}
+
 \subsection{Defect completion lifts the certificate to tokens}
 
 \begin{theorem}[Conditional contraction and low-rank structure]
@@ -512,6 +644,32 @@ $A$ produces a zero row of $P$.  With $C_i=0$, the $i$th row of
 retains that value after the feature projection.
 \end{proof}
 
+\begin{proposition}[Noncausal permutation equivariance]
+\label{prop:permutation-equivariance}
+Let $\Pi$ be a permutation of token rows.  If tokens, validity mask, and
+position identifiers are permuted together, then one LSSO head obeys
+\begin{equation}
+    \operatorname{LSSO}(\Pi X,\Pi m,\Pi p)
+    =\Pi\operatorname{LSSO}(X,m,p).
+\label{eq:permutation-equivariance}
+\end{equation}
+Thus the global compact statistic has no causal scan order or inner-mini-batch
+ordering.  Position identifiers still carry whatever absolute or relative
+coordinate semantics the caller assigns to them.
+\end{proposition}
+
+\begin{proof}
+All rowwise projections, masking, normalization, and rank-space rotations
+commute with the synchronized permutation, so $A'=\Pi A$ and $C'=\Pi C$.
+The positive-diagonal reduced QR factorization is unique.  Applying the block
+orthogonal matrix $\operatorname{diag}(\Pi,\I_r)$ to
+$[A^\T\;\I_r]^\T$ therefore gives $P'=\Pi P$ with the same lower block and
+$R_{\mathrm{qr}}$.  Consequently
+$Z'=P'^{\T}C'=P^\T C=Z$, so the dynamic compact coordinates, $K$, $M$, and
+$\eta$ are unchanged.  Equation~\eqref{eq:token-mixer} then gives
+$Y'=\Pi Y$; the rowwise output projection preserves the relation.
+\end{proof}
+
 \subsection{Scope of the certificate}
 \label{sec:theory-scope}
 
@@ -537,10 +695,148 @@ for validation.  The exact theorems explain the intended normal-training
 geometry; they are not a bitwise statement about arbitrarily extreme
 floating-point raw coordinates.
 
-% Experimental sections, tables, and empirical conclusions are deliberately
-% added after the DNA, LRA, ImageNet, COCO, and ADE20K runs are complete.
+\section{Sequence Classification Evidence}
+\label{sec:sequence-experiments}
 
+We first test whether the certified mixer remains trainable and useful when it
+replaces attention in otherwise ordinary bidirectional encoders.  All reported
+LSSO runs use the default \textsc{Dynamic} core, Rank-Rotary, rank $32$, FP16
+automatic mixed precision, and the CUDA implementation.  Checkpoints are
+selected only by validation accuracy, with validation loss breaking an exact
+tie; the held-out test split is evaluated once after selection.  Reported
+uncertainties are sample standard deviations over seeds $0$, $1$, and $2$.
+
+\subsection{Matched genomic mixer comparison}
+
+GenomicBenchmarks collects binary DNA sequence-classification tasks with
+official train and test partitions \cite{gresova2023genomicbenchmarks}.  We
+derive a deterministic stratified validation set only from each training
+partition.  MHA and LSSO use the same $D=128$, four-layer, four-head encoder,
+learned absolute position embeddings, MLP ratio $4$, mean readout, optimizer,
+data order, and $40$-epoch budget; only the token mixer changes.  The usual
+physical batch is $128$.  Mouse Enhancers Ensembl uses physical batch $64$ and
+two-step accumulation, preserving the same effective batch.  LSSO has $33{,}264$
+fewer parameters than MHA in every task because the mixer parameterizations
+differ; for the 200-position tasks the totals are $786{,}834$ and $820{,}098$.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\caption{GenomicBenchmarks held-out test accuracy (\%), mean $\pm$ sample
+standard deviation over three seeds.  $\Delta$ is LSSO minus MHA.  This is a
+matched mixer comparison, not a state-of-the-art claim.}
+\label{tab:genomic-results}
+\begin{tabular}{lrrr}
+\toprule
+Task & MHA & LSSO & $\Delta$ \\
+\midrule
+Coding vs. intergenomic       & $80.34\pm1.99$ & $83.23\pm2.46$ & $+2.89$ \\
+Human or worm                 & $65.87\pm0.35$ & $81.57\pm1.18$ & $+15.70$ \\
+Mouse enhancers Ensembl       & $71.07\pm1.65$ & $70.25\pm0.83$ & $-0.83$ \\
+Human enhancers Cohn          & $66.83\pm0.17$ & $67.24\pm0.26$ & $+0.41$ \\
+Human enhancers Ensembl       & $76.37\pm0.20$ & $78.91\pm0.05$ & $+2.54$ \\
+Human Ensembl regulatory      & $92.14\pm0.05$ & $93.10\pm0.02$ & $+0.96$ \\
+Human non-TATA promoters      & $84.71\pm0.15$ & $85.41\pm0.17$ & $+0.70$ \\
+Human OCR Ensembl             & $65.61\pm0.54$ & $68.55\pm0.31$ & $+2.93$ \\
+\midrule
+Unweighted task macro         & $75.37$         & $78.53$         & $+3.16$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:genomic-results} shows that LSSO is higher on seven of eight
+tasks.  The macro result first averages seeds within each task and then gives
+all eight tasks equal weight.  The largest gain occurs on Human or Worm, while
+Mouse Enhancers Ensembl is the one negative result.  With only three seeds, we
+do not attach per-task significance claims to these differences.
+
+\subsection{Long Range Arena context}
+
+Long Range Arena (LRA) tests structured reasoning and long-context
+classification \cite{tay2021lra}.  We report four completed LSSO tasks.  The
+shell is selected per task: ListOps uses $D=128,L=6$; Text uses
+$D=256,L=6$; Retrieval uses $D=128,L=6$; and Pathfinder-32 uses
+$D=256,L=6$ with factorized learned row/column position embeddings, no PEG,
+and a mean--maximum readout.  The first three use learned one-dimensional
+absolute position embeddings and mean readout.  Maximum token lengths are
+$2048$, $4096$, $4000$, and $1024$, respectively.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{LRA test accuracy (\%).  Literature values are copied from the cited
+papers and were not reproduced here.  LSSO is mean $\pm$ sample standard
+deviation over three seeds under our task-specific protocol.  Differences in
+model shell, position encoding, readout, training budget, and checkpoint
+protocol make the literature rows reference points, not an apples-to-apples
+ranking.}
+\label{tab:lra-results}
+\begin{tabular}{lrrrr}
+\toprule
+Model and source & ListOps & Text & Retrieval & Pathfinder \\
+\midrule
+Transformer \cite{tay2021lra} & $36.37$ & $64.27$ & $57.46$ & $71.40$ \\
+Performer \cite{tay2021lra}   & $18.01$ & $65.40$ & $53.82$ & $77.05$ \\
+S4, original \cite{gu2022s4}  & $58.35$ & $76.02$ & $87.09$ & $86.05$ \\
+S4-LegS, updated \cite{gu2022hippo}
+    & $59.60\pm0.07$ & $86.82\pm0.13$ & $90.90\pm0.15$ & $94.20\pm0.25$ \\
+\midrule
+LSSO, three seeds
+    & $37.60\pm0.65$ & $65.19\pm0.46$ & $82.88\pm0.08$ & $78.79\pm0.34$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The official LRA repository distinguishes constrained apples-to-apples runs
+from free-form model shells.  Our task-specific LSSO recipes belong to the
+latter category.  Table~\ref{tab:lra-results} therefore contains no pooled
+average or cross-protocol best-value emphasis.  Its defensible conclusion is
+narrower: one fixed operator contract trains across symbolic, byte-level,
+paired-retrieval, and two-dimensional path tasks, including sequence lengths
+far beyond the genomic panel.  Path-X and an exploratory Pathfinder run with
+Grid-PEG are excluded because they are not part of the completed three-seed
+protocol.
+
+\section{Limitations and Required Validation}
+\label{sec:limitations}
+
+The current theory certifies each sample-conditioned token kernel after its
+contextual quantities are frozen.  It does not certify the full nonlinear
+network, guarantee task improvement, recover arbitrary dense attention, or
+provide causal constant-state decoding.  The genomic comparison supports a
+matched replacement claim, whereas the LRA literature table does not support
+a cross-paper ranking.
+
+Several empirical questions remain necessary for a complete evaluation.
+First, the three core ownership modes and the Rank-Rotary switch must be
+ablated under one fixed shell.  Second, finite unrolls of
+\eqref{eq:contextual-flow} or \eqref{eq:residual-objective} should be compared
+with the direct solve in forward error, gradient error, wall time, and peak
+memory; this directly tests the solved-inner-process interpretation.  Third,
+sequence-length and rank sweeps should report wall time and memory against MHA,
+together with training-time measurements of the generated contraction margin,
+$\sigma_{\min}(\I+K)$, and solve residual.  Finally, the planned ImageNet,
+COCO, and ADE20K experiments are needed before making a broad vision-backbone
+claim.  These are evidence requirements, not additional operator variants.
+
+\section{Conclusion}
+
+LSSO replaces an unrolled contextual adaptation process with the direct
+solution of a compact strictly accretive system.  The construction combines
+noncausal global conditioning, a complete chart of strict compact
+contractions, and a per-sample frozen-kernel certificate while retaining
+linear sequence scaling at fixed rank.  The exact solve is both the
+infinite-time limit of a globally convergent inner flow and the infinite-step
+limit of stable residual gradient descent, but requires neither process in the
+implemented forward pass.  Initial sequence results show that this structure
+is trainable and can improve a matched attention baseline; the remaining
+experiments above delimit what must still be established empirically.
+
+{\small
 \bibliographystyle{plain}
 \bibliography{references}
+}
 
 \end{document}

@@ -54,16 +54,84 @@ workflows.
 The only supported ablations are DYNAMIC, STATIC, and ZERO core ownership, plus
 the Rank-Rotary on/off switch. See docs/CORE_CONTRACT.md.
 
-GenomicBenchmarks and LRA use the shared PyTorch sequence runner:
+## Sequence results
+
+GenomicBenchmarks and LRA use the same sequence runner, validation-based
+checkpoint selection, and one final test evaluation. Formal GenomicBenchmarks
+runs compare MHA and LSSO in the same `D128/L4/H4` shell over three seeds. LSSO
+is higher on 7 of 8 tasks; its unweighted macro accuracy is 78.53%, versus
+75.37% for MHA (+3.16 percentage points).
+
+| GenomicBenchmarks panel | MHA | LSSO |
+| --- | ---: | ---: |
+| 8-task macro test accuracy | 75.37 | **78.53** |
+| Tasks with higher accuracy | 1/8 | **7/8** |
+
+The formal LRA panel reports three-seed, validation-selected test accuracy for
+the current task-specific shared shells:
+
+| Task | LSSO accuracy (mean +/- std) |
+| --- | ---: |
+| ListOps | 37.60 +/- 0.65 |
+| Text | 65.19 +/- 0.46 |
+| Retrieval | 82.88 +/- 0.08 |
+| Pathfinder-32 | 78.79 +/- 0.34 |
+
+Published LRA, Transformer, and S4 numbers are useful external context only.
+They use different model shells and training protocols, so they are not an
+apples-to-apples comparison with this table and are not pooled or ranked here.
+No sequence result above is presented as a state-of-the-art claim.
+
+After placing the datasets at the roots recorded in the config files, the full
+three-seed panels can be reproduced on Linux with the CUDA runtime loaded:
 
 ~~~bash
-python -m experiments.train_transformers --config experiments/configs/genomic.toml \
-  --output runs/sequence/genomic-pilot --validation-only
+DNA_DATA_ROOT=/path/to/genomic_benchmarks
+LRA_DATA_ROOT=/path/to/lra
+SEQUENCE_CACHE=/path/to/sequence_cache
+
+genomic_tasks=(
+  dummy_mouse_enhancers_ensembl
+  demo_coding_vs_intergenomic_seqs
+  demo_human_or_worm
+  human_enhancers_cohn
+  human_enhancers_ensembl
+  human_ensembl_regulatory
+  human_nontata_promoters
+  human_ocr_ensembl
+)
+for task in "${genomic_tasks[@]}"; do
+  batch_args=(--batch-size 128 --grad-accum 1)
+  if [[ "$task" == dummy_mouse_enhancers_ensembl ]]; then
+    batch_args=(--batch-size 64 --grad-accum 2)
+  fi
+  for mixer in mha lsso; do
+    for seed in 0 1 2; do
+      python -m experiments.train_transformers \
+        --config experiments/configs/genomic.toml \
+        --task "$task" --mixer "$mixer" --seed "$seed" --formal \
+        "${batch_args[@]}" \
+        --data-root "$DNA_DATA_ROOT" --cache-root "$SEQUENCE_CACHE" \
+        --output "runs/sequence/genomic/$task/$mixer/s$seed"
+    done
+  done
+done
+
+for task in listops text retrieval pathfinder; do
+  for seed in 0 1 2; do
+    python -m experiments.train_transformers \
+      --config experiments/configs/lra.toml \
+      --task "$task" --mixer lsso --seed "$seed" --formal \
+      --data-root "$LRA_DATA_ROOT" --cache-root "$SEQUENCE_CACHE" \
+      --output "runs/sequence/lra/$task/lsso/s$seed"
+  done
+done
 ~~~
 
-The runner keeps MHA and LSSO backbones matched, pins split/provenance metadata,
-selects checkpoints from validation only, and evaluates test once after
-selection. See docs/SEQUENCE_EXPERIMENTS.md for the data contract.
+The runner pins source and split provenance, keeps the compared DNA backbones
+matched, and refuses dirty or mutable formal inputs. See
+[docs/SEQUENCE_EXPERIMENTS.md](docs/SEQUENCE_EXPERIMENTS.md) for per-task
+results, exact recipes, data layout, and protocol boundaries.
 
 ImageNet-1K uses the official DeiT III S/B/L training recipes with LSSO ranks
 32/48/64; see [docs/IMAGENET_DEIT3.md](docs/IMAGENET_DEIT3.md). COCO 2017
