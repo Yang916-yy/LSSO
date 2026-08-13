@@ -120,6 +120,41 @@ def test_default_is_the_complete_dynamic_variant() -> None:
     assert config.rank_rotary
 
 
+def test_model_diagnostics_follow_masked_reference_problem() -> None:
+    torch.manual_seed(71)
+    layer = LSSO(
+        LSSOConfig(dim=24, num_heads=3, rank=6, bias=True)
+    ).double().eval()
+    with torch.no_grad():
+        assert layer.core_base_raw is not None
+        assert layer.core_drive_weight is not None
+        layer.core_base_raw.normal_(std=0.1)
+        layer.core_drive_weight.normal_(std=0.1)
+        layer.eta_raw.normal_(std=0.3)
+    x = torch.randn(2, 11, 24, dtype=torch.float64)
+    mask = torch.tensor(
+        [[True] * 9 + [False] * 2, [True] * 7 + [False] * 4]
+    )
+    rhs = torch.randn(2, 3, 6, 8, dtype=torch.float64)
+
+    diagnostics = layer.diagnostics(x, valid_mask=mask, adjoint_rhs=rhs)
+
+    assert set(diagnostics) == {
+        "q",
+        "contraction_slack",
+        "mu",
+        "state_ratio",
+        "adjoint_ratio",
+        "state_bound_usage",
+        "adjoint_bound_usage",
+    }
+    assert all(value.shape == (2, 3) for value in diagnostics.values())
+    assert all(torch.isfinite(value).all() for value in diagnostics.values())
+    assert torch.all(diagnostics["q"] < 1.0)
+    assert torch.all(diagnostics["state_bound_usage"] <= 1.0 + 2e-12)
+    assert torch.all(diagnostics["adjoint_bound_usage"] <= 1.0 + 2e-12)
+
+
 @pytest.mark.parametrize(
     ("mode", "present", "absent"),
     [

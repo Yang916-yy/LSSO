@@ -10,6 +10,7 @@ from lsso.ball.reference import (
     accretive_equilibrium_mix,
     accretive_generator,
     bounded_complement,
+    compact_equilibrium_diagnostics,
     qr_soft_frame,
     tensor_core_linear,
     tensor_core_matmul,
@@ -415,6 +416,61 @@ def test_direct_equilibrium_has_normal_range_gradients() -> None:
         for gradient in gradients
     )
     assert torch.count_nonzero(gradients[1]) > 0
+
+
+def test_compact_diagnostics_match_dense_operator_and_certificate_bounds() -> None:
+    torch.manual_seed(70)
+    batch, heads, length, rank, head_dim = 2, 3, 9, 4, 5
+    frame = qr_soft_frame(
+        torch.randn(batch, heads, length, rank, dtype=torch.float64)
+    )
+    raw = torch.randn(batch, heads, rank, rank, dtype=torch.float64)
+    generator = accretive_generator(raw)
+    content = torch.randn(batch, heads, length, head_dim, dtype=torch.float64)
+    compact_state = frame.mT @ content
+    eta = bounded_complement(torch.linspace(-0.4, 0.7, heads, dtype=torch.float64))
+    adjoint_rhs = torch.randn_like(compact_state)
+
+    diagnostics = compact_equilibrium_diagnostics(
+        frame,
+        generator,
+        compact_state,
+        eta,
+        adjoint_rhs,
+    )
+
+    identity_r = torch.eye(rank, dtype=torch.float64)
+    identity_n = torch.eye(length, dtype=torch.float64)
+    system = identity_r + generator
+    reflected = 2.0 * torch.linalg.solve(system, identity_r) - identity_r
+    eta_batch = eta.view(1, heads, 1, 1)
+    dense = eta_batch * identity_n + frame @ (reflected - eta_batch * identity_r) @ frame.mT
+    expected_q = torch.linalg.matrix_norm(dense, ord=2)
+    torch.testing.assert_close(diagnostics["q"], expected_q, rtol=2e-11, atol=2e-12)
+
+    symmetric_system = 0.5 * (system + system.mT)
+    expected_mu = torch.linalg.eigvalsh(symmetric_system)[..., 0]
+    torch.testing.assert_close(diagnostics["mu"], expected_mu)
+    assert torch.all(diagnostics["q"] < 1.0)
+    assert torch.all(diagnostics["mu"] > 1.0)
+    assert torch.all(diagnostics["state_bound_usage"] <= 1.0 + 2e-12)
+    assert torch.all(diagnostics["adjoint_bound_usage"] <= 1.0 + 2e-12)
+
+
+def test_compact_diagnostics_reject_sequence_shorter_than_rank() -> None:
+    frame = qr_soft_frame(torch.randn(1, 1, 3, 4, dtype=torch.float64))
+    generator = accretive_generator(torch.randn(1, 4, 4, dtype=torch.float64))
+    compact_state = torch.randn(1, 1, 4, 2, dtype=torch.float64)
+    with pytest.raises(ValueError, match="N >= rank R"):
+        compact_equilibrium_diagnostics(
+            frame,
+            generator,
+            compact_state,
+            torch.tensor([0.5], dtype=torch.float64),
+            torch.randn_like(compact_state),
+        )
+
+
 def test_direct_equilibrium_passes_first_and_second_order_gradcheck() -> None:
     torch.manual_seed(8)
     frame = qr_soft_frame(torch.randn(1, 1, 5, 3, dtype=torch.float64))

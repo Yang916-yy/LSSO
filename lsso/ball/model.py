@@ -10,6 +10,7 @@ from .reference import (
     accretive_equilibrium_mix,
     accretive_generator,
     bounded_complement,
+    compact_equilibrium_diagnostics,
     qr_soft_frame,
     rank_rotary,
     tensor_core_linear,
@@ -400,41 +401,24 @@ class LSSO(nn.Module):
             output = torch.where(mask[:, :, None], output, torch.zeros_like(output))
         return output.to(dtype=x.dtype)
 
-    def forward(
+    def _reference_compact_problem(
         self,
         x: torch.Tensor,
-        valid_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        *,
-        implementation: str = "reference",
-    ) -> torch.Tensor:
+        valid_mask: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """Construct the canonical compact problem for reference evaluation."""
+
         config = self.config
-        if x.ndim != 3 or x.shape[-1] != config.dim:
-            raise ValueError(
-                f"x must have shape [B, N, {config.dim}], got {tuple(x.shape)}"
-            )
-        if not x.is_floating_point():
-            raise TypeError("x must be a floating-point tensor")
-        if x.dtype not in _SUPPORTED_ACTIVATION_DTYPES:
-            raise TypeError(
-                f"LSSO does not support x with dtype {x.dtype}; use "
-                "torch.float16, torch.float32, or torch.float64"
-            )
-
         batch, length, _dim = x.shape
-        if batch == 0:
-            raise ValueError("batch size must be positive")
-        if length == 0:
-            raise ValueError("sequence length must be positive")
-
-        if implementation == "cuda":
-            return self._forward_cuda(x, valid_mask, position_ids)
-        if implementation != "reference":
-            raise ValueError(
-                "implementation must be 'reference' or 'cuda', "
-                f"got {implementation!r}"
-            )
-
         all_valid = valid_mask is None
         mask = (
             None
@@ -446,12 +430,11 @@ class LSSO(nn.Module):
                 device=x.device,
             )
         )
-
-        if all_valid:
-            safe_x = x
-        else:
-            assert mask is not None
-            safe_x = torch.where(mask[:, :, None], x, torch.zeros_like(x))
+        safe_x = (
+            x
+            if all_valid
+            else torch.where(mask[:, :, None], x, torch.zeros_like(x))
+        )
         projected = tf32_fp32_linear(
             safe_x,
             self.w_bc.weight,
@@ -488,26 +471,94 @@ class LSSO(nn.Module):
                 )
                 relation = rank_rotary(relation, centered)
 
-            if all_valid:
-                valid_count = torch.full(
+            valid_count = (
+                torch.full(
                     (batch,),
                     float(length),
                     dtype=calc_dtype,
                     device=x.device,
                 )
-            else:
-                assert mask is not None
-                valid_count = mask.sum(dim=-1).to(dtype=calc_dtype).clamp_min(1.0)
+                if all_valid
+                else mask.sum(dim=-1).to(dtype=calc_dtype).clamp_min(1.0)
+            )
             relation = relation / valid_count.sqrt().view(batch, 1, 1, 1)
             frame = qr_soft_frame(relation)
             compact_state = tensor_core_matmul(frame.mT, content)
             coordinates = self._compact_coordinates(compact_state, valid_count)
             generator = (
-                None
-                if coordinates is None
-                else accretive_generator(coordinates)
+                None if coordinates is None else accretive_generator(coordinates)
             )
             eta = self.complement().to(device=x.device, dtype=calc_dtype)
+        return projected, frame, compact_state, content, generator, eta, mask
+
+    @torch.no_grad()
+    def diagnostics(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        *,
+        adjoint_rhs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return per-sample, per-head certificates for the realized operator."""
+
+        self._validate_input(x)
+        if self.config.core_mode is CoreMode.ZERO:
+            raise ValueError("compact diagnostics require a nonzero compact core")
+        _projected, frame, compact_state, _content, generator, eta, _mask = (
+            self._reference_compact_problem(x, valid_mask, position_ids)
+        )
+        assert generator is not None
+        return compact_equilibrium_diagnostics(
+            frame,
+            generator,
+            compact_state,
+            eta,
+            adjoint_rhs.to(device=x.device, dtype=compact_state.dtype),
+        )
+
+    def _validate_input(self, x: torch.Tensor) -> None:
+        config = self.config
+        if x.ndim != 3 or x.shape[-1] != config.dim:
+            raise ValueError(
+                f"x must have shape [B, N, {config.dim}], got {tuple(x.shape)}"
+            )
+        if not x.is_floating_point():
+            raise TypeError("x must be a floating-point tensor")
+        if x.dtype not in _SUPPORTED_ACTIVATION_DTYPES:
+            raise TypeError(
+                f"LSSO does not support x with dtype {x.dtype}; use "
+                "torch.float16, torch.float32, or torch.float64"
+            )
+        if x.shape[0] == 0:
+            raise ValueError("batch size must be positive")
+        if x.shape[1] == 0:
+            raise ValueError("sequence length must be positive")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        *,
+        implementation: str = "reference",
+    ) -> torch.Tensor:
+        self._validate_input(x)
+        config = self.config
+        batch, length, _dim = x.shape
+
+        if implementation == "cuda":
+            return self._forward_cuda(x, valid_mask, position_ids)
+        if implementation != "reference":
+            raise ValueError(
+                "implementation must be 'reference' or 'cuda', "
+                f"got {implementation!r}"
+            )
+
+        projected, frame, compact_state, content, generator, eta, mask = (
+            self._reference_compact_problem(x, valid_mask, position_ids)
+        )
+        with torch.autocast(device_type=x.device.type, enabled=False):
             output = accretive_equilibrium_mix(
                 frame,
                 generator,
@@ -521,7 +572,7 @@ class LSSO(nn.Module):
         )
         output = tensor_core_linear(output, self.w_o.weight, self.w_o.bias)
         output = output.to(dtype=x.dtype)
-        if all_valid:
+        if mask is None:
             return output
         assert mask is not None
         return torch.where(mask[:, :, None], output, torch.zeros_like(output))

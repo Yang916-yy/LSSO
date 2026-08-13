@@ -562,6 +562,122 @@ def accretive_equilibrium_mix(
     return eta_batch * content + tensor_core_matmul(frame, compact)
 
 
+def compact_equilibrium_diagnostics(
+    frame: torch.Tensor,
+    generator: torch.Tensor,
+    compact_state: torch.Tensor,
+    eta: torch.Tensor,
+    adjoint_rhs: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    r"""Measure the exact realized gain and solve/adjoint certificate ratios.
+
+    The returned tensors have shape ``[B, H]``.  Calculations use FP64 on the
+    realized compact factors so diagnostics measure the mathematical operator
+    without adding low-precision eigensolver or norm error.  For the supported
+    training envelope ``N >= R``, the token gain is recovered from the full
+    ``R x R`` certificate block and never materializes an ``N x N`` map.
+    """
+
+    if frame.ndim != 4:
+        raise ValueError("frame must have shape [B, H, N, R]")
+    if generator.ndim not in (3, 4):
+        raise ValueError("generator must have shape [H, R, R] or [B, H, R, R]")
+    if compact_state.ndim != 4 or adjoint_rhs.ndim != 4:
+        raise ValueError("compact_state and adjoint_rhs must have shape [B, H, R, D]")
+
+    batch, heads, length, rank = frame.shape
+    if length < rank:
+        raise ValueError(
+            "compact diagnostics require sequence length N >= rank R, got "
+            f"N={length}, R={rank}"
+        )
+    expected_state_shape = (batch, heads, rank, compact_state.shape[-1])
+    if compact_state.shape != expected_state_shape:
+        raise ValueError(
+            f"compact_state must have shape {expected_state_shape}, "
+            f"got {tuple(compact_state.shape)}"
+        )
+    if adjoint_rhs.shape != compact_state.shape:
+        raise ValueError(
+            "adjoint_rhs must match compact_state, got "
+            f"{tuple(adjoint_rhs.shape)} and {tuple(compact_state.shape)}"
+        )
+    if eta.shape != (heads,):
+        raise ValueError(f"eta must have shape [{heads}], got {tuple(eta.shape)}")
+    if generator.ndim == 3:
+        if generator.shape != (heads, rank, rank):
+            raise ValueError(
+                f"static generator must have shape {(heads, rank, rank)}, "
+                f"got {tuple(generator.shape)}"
+            )
+        generator = generator.unsqueeze(0).expand(batch, -1, -1, -1)
+    elif generator.shape != (batch, heads, rank, rank):
+        raise ValueError(
+            f"dynamic generator must have shape {(batch, heads, rank, rank)}, "
+            f"got {tuple(generator.shape)}"
+        )
+    tensors = (generator, compact_state, eta, adjoint_rhs)
+    if any(value.device != frame.device for value in tensors):
+        raise ValueError("all diagnostic inputs must share a device")
+    if any(not value.is_floating_point() for value in (frame, *tensors)):
+        raise TypeError("all diagnostic inputs must be floating-point tensors")
+
+    with torch.autocast(device_type=frame.device.type, enabled=False):
+        frame64 = frame.to(dtype=torch.float64)
+        generator64 = generator.to(dtype=torch.float64)
+        compact64 = compact_state.to(dtype=torch.float64)
+        rhs64 = adjoint_rhs.to(dtype=torch.float64)
+        eta64 = eta.to(dtype=torch.float64).view(1, heads)
+
+        identity = torch.eye(rank, dtype=torch.float64, device=frame.device)
+        system = generator64 + identity
+        equilibrium = torch.linalg.solve(system, compact64)
+        adjoint = torch.linalg.solve(system.mT, rhs64)
+
+        symmetric_system = 0.5 * (system + system.mT)
+        mu = torch.linalg.eigvalsh(symmetric_system)[..., 0]
+
+        frame_gram = frame64.mT @ frame64
+        gram_values, gram_vectors = torch.linalg.eigh(frame_gram)
+        scales = torch.sqrt(gram_values.clamp_min(0.0))
+        inverse_system = torch.linalg.solve(
+            system,
+            identity.expand(batch, heads, rank, rank),
+        )
+        reflected = 2.0 * inverse_system - identity
+        eta_matrix = eta64[..., None, None] * identity
+        rotated = gram_vectors.mT @ (reflected - eta_matrix) @ gram_vectors
+        certificate_block = eta_matrix + scales.diag_embed() @ rotated @ scales.diag_embed()
+        token_gain = torch.linalg.svdvals(certificate_block)[..., 0]
+        if length > rank:
+            token_gain = torch.maximum(token_gain, eta64.abs())
+
+        state_denominator = torch.linalg.vector_norm(
+            compact64, dim=(-2, -1)
+        ).clamp_min(torch.finfo(torch.float64).tiny)
+        adjoint_denominator = torch.linalg.vector_norm(
+            rhs64, dim=(-2, -1)
+        ).clamp_min(torch.finfo(torch.float64).tiny)
+        state_ratio = (
+            torch.linalg.vector_norm(equilibrium, dim=(-2, -1))
+            / state_denominator
+        )
+        adjoint_ratio = (
+            torch.linalg.vector_norm(adjoint, dim=(-2, -1))
+            / adjoint_denominator
+        )
+
+    return {
+        "q": token_gain,
+        "contraction_slack": 1.0 - token_gain,
+        "mu": mu,
+        "state_ratio": state_ratio,
+        "adjoint_ratio": adjoint_ratio,
+        "state_bound_usage": mu * state_ratio,
+        "adjoint_bound_usage": mu * adjoint_ratio,
+    }
+
+
 def rank_rotary(relation: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     """Apply centered rank-space phases with the fixed LSSO frequency basis."""
 
@@ -595,6 +711,7 @@ __all__ = [
     "accretive_equilibrium_mix",
     "accretive_generator",
     "bounded_complement",
+    "compact_equilibrium_diagnostics",
     "qr_soft_frame",
     "rank_rotary",
     "tensor_core_linear",
