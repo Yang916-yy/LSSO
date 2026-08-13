@@ -116,7 +116,7 @@ LRA_DEFAULTS = {
 GENOMIC_DEFAULTS = TaskDefaults(
     max_length=0, epochs=40, batch_size=128, eval_batch_size=256, grad_accum=1,
     lr=3e-4, warmup_ratio=0.05, patience=8, dim=128, depth=4, heads=4,
-    rank=16, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
+    rank=32, mlp_ratio=4.0, dropout=0.1, weight_decay=0.01,
     pooling="mean",
 )
 DEFAULT_PATHFINDER_RESOLUTION = 32
@@ -573,6 +573,14 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         if args.task not in GENOMIC_BENCHMARKS:
             raise ValueError(f"unsupported GenomicBenchmarks task {args.task!r}")
         defaults = GENOMIC_DEFAULTS
+        if args.task == "dummy_mouse_enhancers_ensembl":
+            defaults = TaskDefaults(
+                **{
+                    **asdict(GENOMIC_DEFAULTS),
+                    "batch_size": 64,
+                    "grad_accum": 2,
+                }
+            )
     else:
         if args.task not in LRA_TASKS:
             raise ValueError(f"unsupported LRA task {args.task!r}")

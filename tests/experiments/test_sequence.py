@@ -1132,6 +1132,33 @@ def test_sequence_toml_template_supplies_required_task_selection() -> None:
     assert (args.suite, args.task, args.rank, args.lr) == ("lra", "listops", 32, 5e-4)
 
 
+def test_genomic_toml_template_matches_the_formal_rank() -> None:
+    root = Path(__file__).resolve().parents[2]
+    args = resolve_args(
+        parse_args(["--config", str(root / "experiments/configs/genomic.toml")])
+    )
+    assert (args.suite, args.dim, args.depth, args.heads, args.rank) == (
+        "genomic",
+        128,
+        4,
+        4,
+        32,
+    )
+    assert (args.batch_size, args.grad_accum) == (64, 2)
+
+    ordinary = resolve_args(
+        parse_args(
+            [
+                "--config",
+                str(root / "experiments/configs/genomic.toml"),
+                "--task",
+                "demo_human_or_worm",
+            ]
+        )
+    )
+    assert (ordinary.batch_size, ordinary.grad_accum, ordinary.rank) == (128, 1, 32)
+
+
 class _TinyTokenDataset(Dataset):
     labels = [0, 1, 0, 1]
     lengths = [3, 2, 3, 2]
