@@ -856,20 +856,15 @@ decoding.  A causal LSSO would need to construct prefix-conditioned solved
 states while preserving the exact contraction certificate and linear sequence
 scaling; this remains the principal open extension of the method.
 
-The reference implementation permits rank to be chosen for the workload, but
-the native CUDA realization is currently optimized and distributed only for
-the supported rank schedules in Appendix~\ref{app:cuda}.  Extending that
-coverage is an engineering limitation rather than a restriction of the
-operator mathematics.  Although the native path provides complete forward and
-analytic backward execution for the default operator, its kernel optimization
-is not yet as comprehensive as FlashAttention's across workload shapes and GPU
-generations.  This systems gap is also concrete headroom: shape-specific
-schedules and autotuning can yield further wall-clock gains without changing
-the operator.  The reported measurements therefore characterize the current
-implementation, not a performance ceiling for LSSO.  The present empirical
-evidence covers genomic
-classification, four LRA tasks, and wall-clock measurements on one recent
-NVIDIA architecture; vision tasks and broader hardware remain unevaluated.
+The reference implementation permits workload-specific ranks, whereas the
+native CUDA path is optimized and distributed only for the schedules in
+Appendix~\ref{app:cuda}.  Its complete forward and analytic backward paths are
+not yet as comprehensively optimized across workload shapes and GPU generations
+as FlashAttention, leaving concrete headroom for specialized schedules and
+autotuning.  The reported wall-clock measurements therefore characterize the
+current implementation rather than LSSO's performance ceiling.  Empirical
+evaluation currently covers genomic classification, four LRA tasks, and one
+recent NVIDIA architecture; vision and broader hardware remain open.
 
 \section{Conclusion}
 
