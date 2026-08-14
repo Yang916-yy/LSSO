@@ -70,6 +70,15 @@ test-time training adapt a compact inner state to the current context
 that the central object need not be a dense attention matrix; it can be a
 small state constructed from the sample.
 
+Two prior advances make a sharper next step possible.  XCiT establishes that
+cross-covariance statistics can generate an efficient, input-dependent global
+operator shared across tokens \cite{ali2021xcit}.  Direct Cayley
+parameterization maps free coordinates completely and differentiably to
+static Lipschitz-bounded network weights \cite{wang2023direct}.  LSSO brings
+these lines together and advances them from static contractive weights to a
+compact Cayley token mixer generated anew from every input, solved exactly,
+and certified at the realized sample.
+
 This raises a question for context-adaptive layers: how should that state be
 obtained?  Finite inner
 optimization turns its objective, learning rate, update count, and model depth
@@ -124,11 +133,13 @@ Our contributions are threefold:
     solution of a compact accretive system.  At fixed rank it scales linearly
     with sequence length and removes inner learning rates, update counts, and
     fixed-point iterations from the forward pass.
-    \item \textbf{Complete and certifiable compact geometry.}  We cover the
-    full open real matrix ball in rank space, including nonsymmetric and
-    nonnormal contractions.  We derive an exact compact certificate for every
-    realized token-space gain and a monotonicity margin that jointly bounds the
-    solved state, contextual sensitivity, implicit adjoint, and flow rate.
+    \item \textbf{The first context-conditioned Cayley token mixer.}  We
+    advance direct Cayley parameterization from static Lipschitz-bounded
+    network weights to a compact operator generated anew for every input.  The
+    construction spans the full open real matrix ball in rank space, including
+    nonsymmetric and nonnormal contractions, and yields exact per-instance
+    certificates for token-space gain, the solved state, contextual
+    sensitivity, the implicit adjoint, and flow rate.
     \item \textbf{Empirical breadth and efficient execution.}  In a
     matched three-seed comparison across eight genomic tasks, LSSO improves
     over MHA on seven tasks and raises macro accuracy by $3.16$ points.  A
@@ -151,9 +162,13 @@ unpacks information through a fixed-length auxiliary sequence
 \cite{ma2021luna}; and ABC interprets several such mechanisms as learned
 bounded memory \cite{peng2022abc}.  Perceiver similarly mediates global
 exchange through latent slots \cite{jaegle2021perceiver}.  LSSO advances this
-compact-state line by using the compressed statistic to generate an accretive
-system.  Its equilibrium is solved directly, and the resulting contraction is
-applied without constructing a dense token matrix.
+compact-state line by building on XCiT's central insight that an
+input-dependent cross-statistic can generate one compact global operator for
+all tokens \cite{ali2021xcit}.  XCiT turns token-aggregated cross-covariance
+into a shared channel mixer; LSSO carries the compact operator into token
+space, where the cross-moment generates an accretive system.  Its equilibrium
+is solved directly, and the resulting contraction is lifted through a learned
+token frame without constructing a dense token matrix.
 
 \paragraph{Context as learning.}
 Fast-weight views interpret linear attention as programming an associative
@@ -168,18 +183,22 @@ For bidirectional encoders, LSSO replaces both the finite update schedule and
 the iterative tolerance with the exact equilibrium of a per-sample strongly
 monotone system.
 
-\paragraph{Structured sequence models and certifiable equilibria.}
+\paragraph{Context-conditioned contractive geometry.}
 S4 and selective state-space models obtain linear sequence scaling through
 structured recurrence and input-dependent state evolution
 \cite{gu2022s4,gu2024mamba,dao2024mamba2}.  Deep equilibrium models use
 implicit differentiation at a root \cite{bai2019deep}; monotone operator
 equilibrium networks additionally obtain well-posed states from monotone
-structure \cite{winston2020mondeq}.  LSSO combines global noncausal
-conditioning with accretive/resolvent geometry \cite{bauschke2017convex}.  It
-provides an exact gain certificate for each realized token mixer, while skew
-coordinates retain nonsymmetric and nonnormal contractions.  This offers a
-directly measurable operator guarantee in a setting where ordinary
-self-attention need not be globally Lipschitz \cite{kim2021lipschitz}.
+structure \cite{winston2020mondeq}.  Direct Cayley parameterization gives a
+complete trainable chart for static Lipschitz-bounded network weights
+\cite{wang2023direct}.  LSSO makes this geometry contextual: every sample
+generates a compact accretive operator, its exact solve produces the global
+token mixer, and compact statistics recover the gain actually realized on
+that sample.  Skew coordinates retain nonsymmetric and nonnormal
+contractions.  This joins global noncausal conditioning with
+accretive/resolvent geometry \cite{bauschke2017convex} and provides a directly
+measurable operator guarantee in a setting where ordinary self-attention need
+not be globally Lipschitz \cite{kim2021lipschitz}.
 
 \paragraph{Hardware-efficient linear layers.}
 FlashAttention demonstrated that avoiding materialized intermediates and
@@ -411,6 +430,14 @@ A real square matrix $K$ is strictly accretive when
     \sym(K) \coloneqq \frac{K+K^\T}{2}\succ0.
 \end{equation}
 \end{definition}
+
+The Cayley connection between accretive coordinates and contractions is
+classical in monotone operator theory \cite{bauschke2017convex}, and direct
+Cayley charts have parameterized static Lipschitz-bounded network weights
+\cite{wang2023direct}.  The result below gives the complete strict form needed
+by LSSO.  Its role here is contextual: $K$ is generated from the current
+sample's cross-moment, and the resulting contraction is lifted through that
+sample's token frame.
 
 \begin{theorem}[Accretive Cayley parameterization]
 \label{thm:accretive-cayley}
