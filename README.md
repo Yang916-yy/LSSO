@@ -172,11 +172,15 @@ done
 ~~~
 
 The GenomicBenchmarks runner also supports `linear_transformer`, `performer`,
-`nystromformer`, and `cosformer` through the same `--mixer` argument. They use
-the same data protocol and encoder shell as the matched MHA/LSSO panel and run
-as ordinary PyTorch CUDA tensor programs. Their implementations and upstream
-parity tests are included, but formal three-seed results have not yet been
-reported.
+`nystromformer`, `cosformer`, and `rebased` through the same `--mixer`
+argument. They use the same data protocol and encoder shell as the matched
+MHA/LSSO panel and run as ordinary PyTorch CUDA tensor programs. Their
+implementations and upstream parity tests are included, but formal three-seed
+results have not yet been reported.
+
+`nystromformer` and `rebased` are frozen as numerical-reference implementations
+and excluded from formal runs until suitable bidirectional Triton kernels are
+available.
 
 The runner pins source and split provenance, keeps the compared DNA backbones
 matched, and refuses dirty or mutable formal inputs. See

@@ -298,7 +298,7 @@ def test_collate_uses_lengths_not_the_token_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "mixer", ("mha", "lsso", "linear_transformer", "performer", "nystromformer", "cosformer")
+    "mixer", ("mha", "lsso", "linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
 )
 @pytest.mark.parametrize("pooling", ("mean", "meanmax"))
 def test_sequence_classifier_masks_padding_for_both_mixers(
@@ -323,7 +323,7 @@ def test_factorized_grid_positions_mask_invalid_pixels_for_both_mixers(mixer: st
 
 
 @pytest.mark.parametrize(
-    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
 )
 def test_dna_baseline_forward_backward_is_finite(mixer: str) -> None:
     torch.manual_seed(23)
@@ -342,7 +342,7 @@ def test_dna_baseline_forward_backward_is_finite(mixer: str) -> None:
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
 )
 def test_dna_baseline_accepts_fp16_cuda_autocast(mixer: str) -> None:
     torch.manual_seed(23)
@@ -359,8 +359,41 @@ def test_dna_baseline_accepts_fp16_cuda_autocast(mixer: str) -> None:
     )
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mixer", ("linear_transformer", "performer"))
+def test_fp32_attention_core_matches_cuda_amp_at_long_length(mixer: str) -> None:
+    torch.manual_seed(31)
+    constructor = {
+        "linear_transformer": train_transformers.MaskedLinearTransformerAttention,
+        "performer": train_transformers.MaskedPerformerAttention,
+    }[mixer]
+    layer = constructor(64, 4, bias=True).cuda().eval()
+    inputs = (3 * torch.randn(2, 2048, 64, device="cuda")).requires_grad_()
+    valid = torch.ones(2, 2048, dtype=torch.bool, device="cuda")
+    valid[1, 1536:] = False
+    cotangent = torch.randn_like(inputs)
+    reference = layer(inputs, valid)
+    reference_gradient = torch.autograd.grad(
+        (reference * cotangent).sum(), inputs
+    )[0]
+
+    amp_inputs = inputs.detach().clone().requires_grad_()
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        actual = layer(amp_inputs.half(), valid)
+    actual_gradient = torch.autograd.grad(
+        (actual.float() * cotangent).sum(), amp_inputs
+    )[0]
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(actual_gradient).all()
+    torch.testing.assert_close(actual.float(), reference, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(
+        actual_gradient, reference_gradient, rtol=3e-3, atol=3e-3
+    )
+
+
 @pytest.mark.parametrize(
-    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
 )
 def test_variable_length_baseline_is_independent_of_batch_padding(mixer: str) -> None:
     torch.manual_seed(29)
@@ -509,6 +542,77 @@ def test_performer_matches_upstream_114_forward_and_gradients() -> None:
     )
 
 
+def _fla_rebased_reference_oracle(
+    inputs: torch.Tensor,
+    valid: torch.Tensor,
+    parameters: dict[str, torch.Tensor],
+    *,
+    num_heads: int,
+    feature_dim: int,
+    eps: float,
+) -> torch.Tensor:
+    """FLA ReBasedLinearAttention forward_reference with causal=False."""
+    batch, length, dim = inputs.shape
+    head_dim = dim // num_heads
+    q = _projection(inputs, parameters, "q_proj").reshape(
+        batch, length, num_heads, feature_dim
+    ).transpose(1, 2)
+    k = _projection(inputs, parameters, "k_proj").reshape(
+        batch, length, num_heads, feature_dim
+    ).transpose(1, 2)
+    v = _projection(inputs, parameters, "v_proj").reshape(
+        batch, length, num_heads, head_dim
+    ).transpose(1, 2)
+
+    def feature_map(value: torch.Tensor) -> torch.Tensor:
+        value = F.layer_norm(
+            value,
+            (feature_dim,),
+            parameters["gamma"],
+            parameters["beta"],
+        )
+        outer = torch.einsum("...i,...j->...ij", value, value)
+        indices = torch.triu_indices(feature_dim, feature_dim, 1, device=value.device)
+        return torch.cat(
+            (
+                outer.diagonal(dim1=-2, dim2=-1) * feature_dim**-0.5,
+                outer[..., indices[0], indices[1]] * (2 / feature_dim) ** 0.5,
+            ),
+            dim=-1,
+        )
+
+    q, k = feature_map(q), feature_map(k)
+    key_mask = valid[:, None, :, None]
+    k = k * key_mask
+    v = v * key_mask
+    q, k, v = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1)
+    output = (q * (k * v).sum(2, True)).sum(-1)
+    output = output / ((q * k.sum(2, True)).sum(-1) + eps)
+    output = output.transpose(1, 2).reshape(batch, length, dim)
+    output = _projection(output, parameters, "out_proj")
+    return torch.where(valid[:, :, None], output, torch.zeros_like(output))
+
+
+def test_rebased_matches_fla_noncausal_reference_forward_and_gradients() -> None:
+    torch.manual_seed(57)
+    layer = train_transformers.MaskedReBasedAttention(
+        16, 2, bias=True, feature_dim=4
+    ).double()
+    inputs = torch.randn(2, 7, 16, dtype=torch.double)
+    valid = torch.tensor(
+        [[True] * 7, [True, True, True, True, False, False, False]]
+    )
+    oracle = functools.partial(
+        _fla_rebased_reference_oracle,
+        num_heads=2,
+        feature_dim=4,
+        eps=1e-5,
+    )
+    _assert_upstream_forward_and_gradients(
+        layer, oracle, inputs, valid, rtol=1e-11, atol=1e-12
+    )
+
+
 def _nystrom_attention_0014_oracle(
     inputs: torch.Tensor,
     valid: torch.Tensor,
@@ -603,20 +707,39 @@ def test_cosformer_matches_upstream_forward_and_gradients() -> None:
 
 
 @pytest.mark.parametrize(
-    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer")
+    "mixer", ("linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
 )
 def test_dna_baselines_are_rejected_for_lra(mixer: str) -> None:
     with pytest.raises(ValueError, match="GenomicBenchmarks-only"):
         resolve_args(parse_args(["--suite", "lra", "--task", "listops", "--mixer", mixer]))
 
 
+@pytest.mark.parametrize("mixer", ("nystromformer", "rebased"))
+def test_frozen_dna_baselines_are_rejected_for_formal_runs(mixer: str) -> None:
+    with pytest.raises(ValueError, match="frozen baseline"):
+        resolve_args(
+            parse_args(
+                [
+                    "--suite",
+                    "genomic",
+                    "--task",
+                    "demo_human_or_worm",
+                    "--mixer",
+                    mixer,
+                    "--formal",
+                ]
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("mixer", "implementation"),
     (
-        ("linear_transformer", "linear-transformer-elu-plus-one-adapted"),
-        ("performer", "performer-pytorch-1.1.4-adapted"),
+        ("linear_transformer", "linear-transformer-elu-plus-one-adapted-fp32-core"),
+        ("performer", "performer-pytorch-1.1.4-adapted-fp32-core"),
         ("nystromformer", "nystrom-attention-0.0.14-adapted-no-conv"),
         ("cosformer", "opennlplab-cosformer-official-adapted"),
+        ("rebased", "fla-rebased-noncausal-reference-adapted"),
     ),
 )
 def test_dna_baseline_metadata_records_implementation(mixer: str, implementation: str) -> None:

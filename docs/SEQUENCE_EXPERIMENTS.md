@@ -80,8 +80,9 @@ for every task, LSSO has 33,264 fewer parameters than MHA. For example, the
 200-position Human-or-Worm models contain 786,834 and 820,098 parameters,
 respectively; task-dependent position-table sizes shift both totals equally.
 
-The runner also exposes four matched-shell global-mixer baselines for the DNA
-panel: `linear_transformer`, `performer`, `nystromformer`, and `cosformer`.
+The runner also exposes matched-shell global-mixer implementations for the DNA
+panel: `linear_transformer`, `performer`, `nystromformer`, `cosformer`, and
+`rebased`.
 Linear Transformer uses the original bidirectional ELU+1 feature map. Performer
 follows the FAVOR+ random-feature implementation in `performer-pytorch==1.1.4`
 with a fixed projection matrix. Nystrom attention follows
@@ -91,8 +92,16 @@ convolution is disabled so it does not add a local prior. cosFormer follows the
 official OpenNLPLab bidirectional ReLU/cosine formulation. The adaptations live
 in the experiment runner to enforce its boolean padding contract and, for
 variable-length batches, compute position- or landmark-dependent quantities at
-each sample's true length. On CUDA all four execute as ordinary PyTorch CUDA
-tensor programs; none has a separate vendor CUDA extension.
+each sample's true length. ReBased follows FLA's noncausal reference equation
+with its normalized, learnable quadratic feature map; its projections retain
+the matched shell's bias setting. Linear Transformer, Performer, and ReBased
+run their complete attention cores in FP32 under CUDA AMP; this changes only
+evaluation precision, not their real-valued formulas. All five execute as
+ordinary PyTorch CUDA tensor programs; none has a separate vendor CUDA
+extension.
+
+Nyströmformer and ReBased are frozen as numerical references and rejected by
+`--formal` until suitable bidirectional Triton implementations are available.
 
 Some MHA `config.json` files retain generic parser fields such as
 `core_mode=dynamic`, `rank=32`, `rank_rotary=true`, and
@@ -274,11 +283,11 @@ for task in listops text retrieval pathfinder; do
 done
 ~~~
 
-To run the four additional matched-shell DNA baselines, reuse the same loop
+To run the three active additional matched-shell DNA baselines, reuse the same loop
 and replace the mixer loop with:
 
 ~~~bash
-for mixer in linear_transformer performer nystromformer cosformer; do
+for mixer in linear_transformer performer cosformer; do
   for seed in 0 1 2; do
     python -m experiments.train_transformers \
       --config experiments/configs/genomic.toml \
