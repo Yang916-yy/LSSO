@@ -860,7 +860,13 @@ The reference implementation permits rank to be chosen for the workload, but
 the native CUDA realization is currently optimized and distributed only for
 the supported rank schedules in Appendix~\ref{app:cuda}.  Extending that
 coverage is an engineering limitation rather than a restriction of the
-operator mathematics.  The present empirical evidence covers genomic
+operator mathematics.  The native path already provides complete forward and
+analytic backward execution for the default operator, while leaving clear
+systems headroom.  FlashAttention-style specialization and autotuning across
+batch and head shapes, sequence lengths, ranks, and GPU generations offer a
+direct route to further wall-clock gains.  The reported measurements therefore
+characterize the current implementation, not a performance ceiling for LSSO.
+The present empirical evidence covers genomic
 classification, four LRA tasks, and wall-clock measurements on one recent
 NVIDIA architecture; vision tasks and broader hardware remain unevaluated.
 
