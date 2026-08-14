@@ -126,7 +126,7 @@ backward paths.  Compact construction and factorization share one schedule,
 and the backward reuses saved factors without forming an $N\times N$ token
 matrix or an explicit compact Cayley matrix.
 
-Our contributions are threefold:
+Our contributions are fourfold:
 \begin{enumerate}
     \item \textbf{Solved adaptation without unrolling.}  We introduce a
     noncausal global mixer whose sample-conditioned inner state is the exact
@@ -137,9 +137,14 @@ Our contributions are threefold:
     advance direct Cayley parameterization from static Lipschitz-bounded
     network weights to a compact operator generated anew for every input.  The
     construction spans the full open real matrix ball in rank space, including
-    nonsymmetric and nonnormal contractions, and yields exact per-instance
-    certificates for token-space gain, the solved state, contextual
-    sensitivity, the implicit adjoint, and flow rate.
+    nonsymmetric and nonnormal contractions.
+    \item \textbf{Exact per-instance certification.}  For every realized token
+    mixer, we derive its exact gain $q(X)<1$ entirely in compact space.  A
+    complementary sample-dependent monotonicity margin $\mu>1$ certifies
+    the equilibrium, contextual sensitivity, implicit adjoint, and
+    continuous-time convergence rate.  Both certificates require only
+    matrices of size at most $r\times r$ and are directly observable in trained
+    networks.
     \item \textbf{Empirical breadth and efficient execution.}  In a
     matched three-seed comparison across eight genomic tasks, LSSO improves
     over MHA on seven tasks and raises macro accuracy by $3.16$ points.  A
