@@ -70,14 +70,14 @@ test-time training adapt a compact inner state to the current context
 that the central object need not be a dense attention matrix; it can be a
 small state constructed from the sample.
 
-Two prior advances make a sharper next step possible.  XCiT establishes that
-cross-covariance statistics can generate an efficient, input-dependent global
-operator shared across tokens \cite{ali2021xcit}.  Direct Cayley
-parameterization maps free coordinates completely and differentiably to
-static Lipschitz-bounded network weights \cite{wang2023direct}.  LSSO brings
-these lines together and advances them from static contractive weights to a
-compact Cayley token mixer generated anew from every input, solved exactly,
-and certified at the realized sample.
+LSSO builds on two complementary advances.  XCiT shows that cross-covariance
+statistics can define an efficient, input-dependent global operator shared
+across tokens \cite{ali2021xcit}.  Direct Cayley parameterization provides a
+complete differentiable map from free coordinates to static
+Lipschitz-bounded network weights \cite{wang2023direct}.  LSSO takes the next
+step: it turns static contractive weights into a compact Cayley token mixer
+generated anew from every input, solved exactly, and certified on the realized
+sample.
 
 This raises a question for context-adaptive layers: how should that state be
 obtained?  Finite inner
