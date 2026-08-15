@@ -46,13 +46,16 @@ realized token mixer is a strict contraction whose exact gain is computable
 from a matrix of size at most $r\times r$; a per-sample monotonicity margin also
 bounds the equilibrium, contextual sensitivity, and implicit adjoint.  LSSO
 therefore removes unrolling, inner learning rates, and solver tolerances from
-the layer.  We provide an algebraically equivalent native CUDA path with an
-analytic backward that reuses the compact factors.  In a matched eight-task
-GenomicBenchmarks comparison, LSSO outperforms multi-head attention on seven
-tasks and improves unweighted macro accuracy from $75.37$ to $78.53$.  Across
-four Long Range Arena tasks with sequences up to $4096$ positions, LSSO attains
-the highest four-task average among the displayed general-purpose global
-mixers.
+the layer.  At fixed compact rank, both arithmetic and activation storage are
+linear in sequence length.  We provide an algebraically equivalent native CUDA
+path with an analytic backward that reuses the compact factors.  In a matched
+eight-task
+GenomicBenchmarks comparison against multi-head attention and three
+representative linear-attention baselines, LSSO leads on seven tasks and raises
+unweighted macro accuracy from the strongest alternative's $75.57$ to $78.53$.
+Across four Long Range Arena tasks with sequences up to $4096$ positions, LSSO
+attains the highest four-task average among the displayed general-purpose
+global mixers.
 \end{abstract}
 
 \section{Introduction}
@@ -116,23 +119,14 @@ accretive chart is complete, its reflected resolvent spans every real strict
 compact contraction, and the scalar complement learns the gain on token
 directions outside the frame $P$.
 
-LSSO combines three properties: noncausal global mixing, a directly solved
-contextual state, and an exact per-instance gain certificate.  For every input,
-the dynamic token mixer has gain $q(X)<1$, recoverable entirely in compact
-space, while a second certificate bounds the solve and its implicit adjoint.
-The default configuration uses the \textsc{Dynamic} core with Rank-Rotary and
-provides native CUDA inference, training forward, and analytic first-order
-backward paths.  Compact construction and factorization share one schedule,
-and the backward reuses saved factors without forming an $N\times N$ token
-matrix or an explicit compact Cayley matrix.
-
 Our contributions are fourfold:
 \begin{enumerate}
     \item \textbf{Solved adaptation without unrolling.}  We introduce a
     noncausal global mixer whose sample-conditioned inner state is the exact
     solution of a compact accretive system.  At fixed rank it scales linearly
-    with sequence length and removes inner learning rates, update counts, and
-    fixed-point iterations from the forward pass.
+    in time and activation storage with sequence length, and removes inner
+    learning rates, update counts, and fixed-point iterations from the forward
+    pass.
     \item \textbf{The first context-conditioned Cayley token mixer.}  We
     advance direct Cayley parameterization from static Lipschitz-bounded
     network weights to a compact operator generated anew for every input.  The
@@ -146,12 +140,13 @@ Our contributions are fourfold:
     matrices of size at most $r\times r$ and are directly observable in trained
     networks.
     \item \textbf{Empirical breadth and efficient execution.}  In a
-    matched three-seed comparison across eight genomic tasks, LSSO improves
-    over MHA on seven tasks and raises macro accuracy by $3.16$ points.  A
-    four-task LRA panel spans sequences up to length $4096$.  An algebraically
-    equivalent native CUDA forward and analytic backward reaches up to
-    $2.30\times$ the measured Flash-SDPA MHA training throughput without
-    forming a token--token map.
+    matched three-seed comparison across eight genomic tasks, LSSO leads MHA,
+    Linear Transformer, Performer, and cosFormer on seven tasks and exceeds the
+    strongest alternative's macro accuracy by $2.96$ points.  A four-task LRA
+    panel spans sequences up to length $4096$.  An algebraically equivalent
+    native CUDA forward and analytic backward reaches up to $2.30\times$ the
+    measured Flash-SDPA MHA training throughput without forming a token--token
+    map.
 \end{enumerate}
 
 \section{Related Work}
@@ -159,9 +154,9 @@ Our contributions are fourfold:
 
 \paragraph{Global compact-state mixing.}
 Efficient Transformers replace the dense token map with projections,
-landmarks, kernels, or inducing states
+landmarks, kernels, cosine reweighting, or inducing states
 \cite{wang2020linformer,katharopoulos2020linear,
-choromanski2021performer,xiong2021nystrom}.  Set Transformer uses inducing
+choromanski2021performer,qin2022cosformer,xiong2021nystrom}.  Set Transformer uses inducing
 points for global set interaction \cite{lee2019settransformer}; Luna packs and
 unpacks information through a fixed-length auxiliary sequence
 \cite{ma2021luna}; and ABC interprets several such mechanisms as learned
@@ -212,8 +207,11 @@ controlling memory traffic can matter as much as operation count
 hardware-aware parallel algorithm \cite{gu2024mamba}.  LSSO follows this
 algorithm--implementation co-design principle.  Its native path lowers the
 compact algebra to fused CUDA schedules for both the forward and analytic
-backward.  Section~\ref{sec:cuda-implementation} reports its measured behavior,
-and Appendix~\ref{app:cuda} gives the lowering and workspace accounting.
+backward.  Unlike exact softmax attention, whose pairwise arithmetic remains
+quadratic even when FlashAttention avoids storing the score matrix, LSSO's
+compact algebra is linear in sequence length at fixed rank.
+Section~\ref{sec:cuda-implementation} reports its measured behavior, and
+Appendix~\ref{app:cuda} gives the lowering and workspace accounting.
 
 \section{LSSO}
 \label{sec:method}
@@ -344,19 +342,35 @@ LSSO obtains $U^\star$ by a direct $r\times r$ solve.
 Section~\ref{sec:solved-inner-process} relates this solution to a globally
 convergent contextual dynamics.
 
-\paragraph{Cost.}
-For fixed $r$ and $d$, frame formation costs
-$O(Nr^2)$ per head, the frame-content products cost $O(Nrd)$, and the compact
-solve costs $O(r^2d+r^3)$.  The mixer is therefore linear in $N$ at fixed
-compact dimensions and never stores an $N\times N$ token matrix.  The dense
-input and output projections remain ordinary feature projections, as in other
-token mixers.
+\subsection{Linear sequence complexity}
+\label{sec:linear-complexity}
+
+For one head, frame formation costs $O(Nr^2)$, the two frame--content
+contractions cost $O(Nrd)$, and construction and solution of the compact
+problem cost $O(r^2d+r^3)$.  The forward arithmetic and activation/workspace
+storage are therefore
+\begin{align}
+    \mathcal C_{\mathrm{LSSO}}
+        &=O\!\left(Nr^2+Nrd+r^2d+r^3\right), \\
+    \mathcal M_{\mathrm{LSSO}}
+        &=O\!\left(N(r+d)+r^2+rd\right).
+\label{eq:lsso-complexity}
+\end{align}
+The analytic backward reuses compact factors and performs the same classes of
+token--rank contractions, so its arithmetic and saved-state dependence on $N$
+is also linear.  Multiplying the head-local terms by the number of heads does
+not change the sequence-length degree.
+
+Unlike exact MHA, whose $O(N^2d)$ mixing cost persists under FlashAttention
+\cite{dao2022flashattention}, LSSO has $O(Nr(r+d))$ token-dependent work and no
+$N\times N$ intermediate.  Both retain $O(ND^2)$ feature projections.
 
 \section{Solved and Certifiable Contextual Mixing}
 \label{sec:theory}
 
-We analyze one realized head in exact arithmetic; mixed-precision execution is
-described in Section~\ref{sec:cuda-implementation}.
+We analyze one realized head in exact arithmetic.  Complete proofs are given in
+Appendix~\ref{app:proofs}, and mixed-precision execution is described in
+Section~\ref{sec:cuda-implementation}.
 
 \subsection{The QR soft frame is a strict contraction chart}
 
@@ -395,9 +409,7 @@ Because $E^\T E\succ0$, the first claim follows.  Also
 $R_{\mathrm{qr}}^\T R_{\mathrm{qr}}=\I_r+A^\T A$ and
 $P=AR_{\mathrm{qr}}^{-1}$, which yields
 \eqref{eq:soft-frame-spectrum} and the exact norm margin.  In particular,
-$\norm{P}_2<1$, which implies $PP^\T\prec\I_N$ and proves the second
-claim.  Appendix~\ref{app:proofs} gives the full spectral argument and
-constructs the inverse chart for every $P$ in the strict column ball.
+$\norm{P}_2<1$, which implies $PP^\T\prec\I_N$ and proves the second claim.
 \end{proof}
 
 The identity augmentation supplies the strict complement $\I_N-PP^\T$, which
@@ -422,9 +434,6 @@ Accordingly, if $\norm{C}_F^2/n\leq c^2$, the magnitude of the contextual
 drive is at most $c\norm{W_{\mathrm{drive}}}_2$, independently of sequence
 length.
 \end{proposition}
-
-Under bounded average token energy, the resulting drive bound is independent
-of sequence length.
 
 \subsection{The compact core parameterizes the strict matrix ball}
 
@@ -479,8 +488,7 @@ $M=(\I_r-K)Q^{-1}$ gives
 which is \eqref{eq:cayley-defect}.  It is positive definite, so
 $\norm{M}_2<1$.
 The inverse formula maps every strict contraction back to a strictly
-accretive matrix.  Appendix~\ref{app:proofs} gives the complete converse and
-fractional-linear algebra.
+accretive matrix.
 \end{proof}
 
 Because $\Omega$ is unrestricted, $K$ and $M$ may be nonsymmetric and
@@ -525,9 +533,7 @@ Consequently, an infinitesimal perturbation obeys
 The same computable margin controls the forward state, the transposed solve
 used by implicit differentiation, and sensitivity to the generated compact
 problem.  The realized-gain certificate below separately measures the
-contraction margin, which also depends on the skew coordinates.  Appendix
-~\ref{app:proofs} gives the proof, exact implicit VJP, and a condition-number
-example.
+contraction margin, which also depends on the skew coordinates.
 
 \subsection{The direct solve resolves a convergent contextual process}
 \label{sec:solved-inner-process}
@@ -566,10 +572,10 @@ because $\sym(A_K)=\I_r+LL^\T\succeq\mu\I_r$.  Gronwall's inequality gives
 \eqref{eq:flow-rate}.
 \end{proof}
 
-Appendix~\ref{app:proofs} further shows that this direct solution is the
-infinite-step limit of stable gradient descent on the residual objective and
-derives its exact implicit VJP and sensitivity bound.  Thus the production
-backward differentiates the converged state rather than a finite unroll.
+Appendix~\ref{app:proofs} also identifies the direct solution as the
+infinite-step limit of stable gradient descent on the residual objective.  The
+production backward differentiates this solved state rather than a finite
+unroll.
 
 \subsection{An exact compact certificate for the realized token mixer}
 
@@ -613,8 +619,7 @@ $F=[P\;\Delta]$,
 \end{equation}
 and $FF^\T=\I_N$; hence $\norm{T}_2<1$.  Finally,
 $T-\eta\I_N=P(M-\eta\I_r)P^\T$, which gives both the rank bound and
-$Tv=\eta v$ on $\ker(P^\T)$.  Appendix~\ref{app:proofs} gives the complete
-spectral argument.
+$Tv=\eta v$ on $\ker(P^\T)$.
 \end{proof}
 
 The exact certificate requires only an
@@ -640,9 +645,7 @@ certificate.  Thus $T$ is a rank-$r$ correction to an isotropic complement.
 \end{remark}
 
 Appendix~\ref{app:proofs} proves padding isolation and noncausal permutation
-equivariance.  The certificates characterize the contextual mixer, direct
-solve, and implicit adjoint; feature projections, residual paths, and MLPs
-retain their standard roles.
+equivariance.
 
 \subsection{Certificates in trained models}
 \label{sec:certificate-evidence}
@@ -687,64 +690,73 @@ automatic mixed precision, and the CUDA implementation.  Checkpoints are
 selected only by validation accuracy, with validation loss breaking an exact
 tie; the held-out test split is evaluated once after selection.  Reported
 uncertainties are sample standard deviations over seeds $0$, $1$, and $2$.
+Across the evaluated task configurations, LSSO requires only
+$1.3\%$--$32.0\%$ of exact MHA's sequence-dependent mixer-core MACs
+(Appendix~\ref{app:mixer-macs}).
 
 \subsection{Matched genomic mixer comparison}
 
 GenomicBenchmarks collects binary DNA sequence-classification tasks with
 official train and test partitions \cite{gresova2023genomicbenchmarks}.  We
 derive a deterministic stratified validation set only from each training
-partition.  MHA and LSSO use the same $D=128$, four-layer, four-head encoder,
+partition.  All mixers use the same $D=128$, four-layer, four-head encoder,
 learned absolute position embeddings, MLP ratio $4$, mean readout, optimizer,
-data order, and $40$-epoch budget; only the token mixer changes.  The usual
-physical batch is $128$.  Mouse Enhancers Ensembl uses physical batch $64$ and
-two-step accumulation, preserving the same effective batch.  LSSO has $33{,}264$
-fewer parameters than MHA in every task because the mixer parameterizations
-differ; for the 200-position tasks the totals are $786{,}834$ and $820{,}098$.
+data order, and $40$-epoch budget; only the token mixer changes.  Alongside MHA,
+we test bidirectional ELU${}+1$ Linear Transformer
+\cite{katharopoulos2020linear}, FAVOR$+$ Performer with fixed orthogonal
+random features \cite{choromanski2021performer}, and the official bidirectional
+ReLU/cosine cosFormer formulation \cite{qin2022cosformer}.  Numerically
+sensitive attention cores run in FP32 under automatic mixed precision.  The
+effective batch is $128$, using two-step accumulation for Mouse Enhancers
+Ensembl.  The three linear baselines match MHA's parameter count; LSSO is
+$4.1\%$ smaller on the 200-position tasks.
 
 \begin{table}[H]
 \centering
-\small
-\setlength{\tabcolsep}{5pt}
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
 \caption{GenomicBenchmarks held-out test accuracy (\%), mean $\pm$ sample
-standard deviation over three seeds.  $\Delta$ is computed from the unrounded
-seed means as LSSO minus MHA.  Bold marks the higher mean in each row.}
+standard deviation over three seeds under the matched encoder and training
+protocol.  Bold marks the highest mean in each row.}
 \label{tab:genomic-results}
-\begin{tabular}{lrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Task & MHA & LSSO & $\Delta$ \\
+Task & MHA & Linear & Performer & cosFormer & LSSO \\
 \midrule
-Coding vs. intergenomic       & $80.34\pm1.99$ & $\boldsymbol{83.23\pm2.46}$ & $+2.89$ \\
-Human or worm                 & $65.87\pm0.35$ & $\boldsymbol{81.57\pm1.18}$ & $+15.70$ \\
-Mouse enhancers Ensembl       & $\boldsymbol{71.07\pm1.65}$ & $70.25\pm0.83$ & $-0.83$ \\
-Human enhancers Cohn          & $66.83\pm0.17$ & $\boldsymbol{67.24\pm0.26}$ & $+0.41$ \\
-Human enhancers Ensembl       & $76.37\pm0.20$ & $\boldsymbol{78.91\pm0.05}$ & $+2.54$ \\
-Human Ensembl regulatory      & $92.14\pm0.05$ & $\boldsymbol{93.10\pm0.02}$ & $+0.96$ \\
-Human non-TATA promoters      & $84.71\pm0.15$ & $\boldsymbol{85.41\pm0.17}$ & $+0.70$ \\
-Human OCR Ensembl             & $65.61\pm0.54$ & $\boldsymbol{68.55\pm0.31}$ & $+2.93$ \\
+Coding vs. intergenomic  & $80.34\pm1.99$ & $78.11\pm0.10$ & $78.17\pm0.01$ & $79.12\pm0.05$ & $\boldsymbol{83.23\pm2.46}$ \\
+Human or worm            & $65.87\pm0.35$ & $65.68\pm0.22$ & $65.76\pm0.08$ & $66.07\pm0.20$ & $\boldsymbol{81.57\pm1.18}$ \\
+Mouse enhancers Ensembl  & $71.07\pm1.65$ & $\boldsymbol{71.63\pm0.48}$ & $71.35\pm0.48$ & $71.35\pm0.48$ & $70.25\pm0.83$ \\
+Human enhancers Cohn     & $66.83\pm0.17$ & $66.89\pm0.07$ & $67.16\pm0.08$ & $67.06\pm0.23$ & $\boldsymbol{67.24\pm0.26}$ \\
+Human enhancers Ensembl  & $76.37\pm0.20$ & $75.16\pm0.57$ & $74.32\pm0.23$ & $77.34\pm1.53$ & $\boldsymbol{78.91\pm0.05}$ \\
+Human regulatory         & $92.14\pm0.05$ & $91.79\pm0.15$ & $90.10\pm0.34$ & $92.65\pm0.14$ & $\boldsymbol{93.10\pm0.02}$ \\
+Human non-TATA promoters & $84.71\pm0.15$ & $80.44\pm1.84$ & $82.51\pm1.07$ & $84.42\pm0.48$ & $\boldsymbol{85.41\pm0.17}$ \\
+Human OCR Ensembl        & $65.61\pm0.54$ & $65.12\pm0.26$ & $65.36\pm0.27$ & $66.56\pm0.07$ & $\boldsymbol{68.55\pm0.31}$ \\
 \midrule
-Unweighted task macro         & $75.37$         & $\mathbf{78.53}$ & $+3.16$ \\
+Unweighted task macro    & $75.37$ & $74.35$ & $74.34$ & $75.57$ & $\mathbf{78.53}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:genomic-results} shows that LSSO is higher on seven of eight
-tasks.  The macro result first averages seeds within each task and then gives
-all eight tasks equal weight.  The largest gain occurs on Human or Worm, while
-Mouse Enhancers Ensembl is the one negative result.
+Table~\ref{tab:genomic-results} shows that LSSO is highest on seven of eight
+tasks.  Its $78.53$ macro average exceeds cosFormer, the strongest alternative
+at $75.57$, by $2.96$ points and MHA's $75.37$ by $3.16$ points.  The three
+linear-attention controls indicate that neither removing softmax nor obtaining
+linear sequence scaling alone reproduces LSSO's gain.  The macro result first
+averages seeds within each task and then gives all tasks equal weight.  The
+largest gain occurs on Human or Worm; Mouse Enhancers Ensembl is the sole
+exception, where Linear Transformer is highest.
 
 \subsection{Long Range Arena context}
 
 Long Range Arena (LRA) tests structured reasoning and long-context
-classification \cite{tay2021lra}.  Its reported scores are strongly affected
-by architectural locality: recent analysis shows that explicit local and
-positional structure can account for a substantial fraction of the benchmark
-gains \cite{mirallesgonzalez2025locality}.  Following established LRA
-reporting practice \cite{gu2022s4}, Table~\ref{tab:lra-results} places our LSSO
-results alongside a representative set of values reported by the original
-benchmark and subsequent work.  The divider separates general-purpose global
-mixers and efficient attention approximations from models centered on
-structured recurrence or state-space dynamics, grouping models by their
-primary mixing mechanism.
+classification \cite{tay2021lra}.  Following established reporting practice
+\cite{gu2022s4}, Table~\ref{tab:lra-results} quotes results from the original
+benchmark and subsequent work and groups models by their primary mixing
+mechanism.  General-purpose global mixers and efficient-attention
+approximations form the first block; structured recurrence and state-space
+models form the second.  This distinction matters because explicit locality
+and positional structure materially affect LRA performance
+\cite{mirallesgonzalez2025locality}.
 
 We evaluate LSSO on four LRA tasks using six-layer encoders, with $D=128$ for
 ListOps and Retrieval and $D=256$ for Text and Pathfinder-32.  ListOps, Text,
@@ -792,15 +804,10 @@ Mega \cite{ma2023mega} & $\mathbf{63.14}$ & $\mathbf{90.43}$
 \end{tabular}
 \end{table}
 
-Across the general-purpose global-mixer block, LSSO gives the highest displayed
-Retrieval and Pathfinder values; it is within $0.38$ points of the highest
-ListOps result and $0.71$ points of the highest Text result.  Its unweighted
-four-task average is also the highest in that block.  More broadly, one
-LSSO mixer trains across symbolic, byte-level, paired-retrieval, and
-two-dimensional path tasks, including sequences far longer than the genomic
-panel.  The stronger results in the second block also show the value of
-task-aligned structured recurrence and state-space dynamics on LRA; LSSO
-obtains its panel with a general-purpose global mixer.
+Within the global-mixer block, LSSO gives the highest Retrieval, Pathfinder,
+and four-task average; it is within $0.38$ points of the highest ListOps result
+and $0.71$ points of the highest Text result.  The same mixer spans symbolic,
+byte-level, paired-retrieval, and two-dimensional path tasks.
 
 \section{Native CUDA Realization}
 \label{sec:cuda-implementation}
@@ -814,11 +821,11 @@ are validated against the FP64 reference.  Appendix~\ref{app:cuda} gives the
 execution schedule, workspace, VJP, numerical envelope, and build coverage.
 
 Table~\ref{tab:cuda-wall-clock} measures the complete mixer boundary, including
-input and output projections.  Native LSSO is faster than the canonical PyTorch
-implementation throughout the reported range.  Against PyTorch MHA backed by
-Flash SDPA, native LSSO is faster from $N=2048$ in the forward and throughout
-the reported $N=1024$--$4096$ forward--backward range, reaching $1.79\times$
-and $2.30\times$ speedups at $N=4096$.
+input and output projections.  At $N=4096$, native LSSO reaches $1.79\times$
+the Flash-SDPA MHA forward throughput and $2.30\times$ its training throughput.
+Across $N=1024$--$4096$, forward--backward latency grows by $3.88\times$ for
+LSSO and $7.92\times$ for MHA, matching their linear and quadratic mixer
+arithmetic.
 
 \begin{table}[H]
 \centering
@@ -849,22 +856,17 @@ $N$ & PyTorch ref. & Native & MHA & Ref./native & MHA/native \\
 \section{Limitations}
 \label{sec:limitations}
 
-The current LSSO operator is bidirectional: its compact statistic summarizes
-the complete valid sequence before the equilibrium is solved.  It therefore
-does not provide causal masking, prefix-state updates, or autoregressive
-decoding.  A causal LSSO would need to construct prefix-conditioned solved
-states while preserving the exact contraction certificate and linear sequence
-scaling; this remains the principal open extension of the method.
+LSSO is currently bidirectional: its compact statistic summarizes the full
+valid sequence before solving the equilibrium.  It therefore does not support
+causal masking or autoregressive decoding.  Prefix-conditioned solved states
+that preserve the contraction certificate and linear scaling are the principal
+open extension.
 
-The reference implementation permits workload-specific ranks, whereas the
-native CUDA path is optimized and distributed only for the schedules in
-Appendix~\ref{app:cuda}.  Its complete forward and analytic backward paths are
-not yet as comprehensively optimized across workload shapes and GPU generations
-as FlashAttention, leaving concrete headroom for specialized schedules and
-autotuning.  The reported wall-clock measurements therefore characterize the
-current implementation rather than LSSO's performance ceiling.  Empirical
-evaluation currently covers genomic classification, four LRA tasks, and one
-recent NVIDIA architecture; vision and broader hardware remain open.
+The reference implementation supports workload-specific ranks; current native
+packages target $r\in\{16,32,48,64\}$.  Their measured gains leave room for
+shape- and architecture-specific autotuning.  Evaluation spans genomic
+classification and four LRA tasks on SM120; vision and broader hardware
+coverage remain open.
 
 \section{Conclusion}
 
@@ -1070,8 +1072,7 @@ We treat $8$K as an operator-level stress test.  The learned absolute position
 table is repeated modulo its $4096$-position training range, while Rank-Rotary
 receives centered positions over the full probe.  This protocol tests the
 mixer beyond its training length without introducing a new learned-position
-extrapolation rule.  The diagnostic runner writes raw JSONL observations, a CSV
-summary, protocol metadata, and the plotted panel.
+extrapolation rule.
 
 Figure~\ref{fig:certificate-length-depth} shows the corresponding depth and
 length distributions.  The realized-gain curves coincide because the learned
@@ -1091,38 +1092,77 @@ the $8$K points are operator-level stress measurements.}
 \label{fig:certificate-length-depth}
 \end{figure}
 
+\section{Mixer-Core MAC Accounting}
+\label{app:mixer-macs}
+
+Table~\ref{tab:mixer-macs} reports the leading sequence-dependent matrix
+contractions per sample, accumulated over all mixer layers.  For depth $L$,
+$H$ heads, head width $d=D/H$, and rank $r=32$, the accounting is
+\begin{equation}
+    \operatorname{MAC}_{\mathrm{LSSO}}=2LHN r(r+d),
+    \qquad
+    \operatorname{MAC}_{\mathrm{MHA}}=2LHN^2d.
+\label{eq:mixer-mac-accounting}
+\end{equation}
+The LSSO count comprises two token--rank frame passes and two frame--content
+contractions; the MHA count comprises $QK^\T$ and the attention--value product.
+Feature projections, elementwise maps, MLPs, task heads, and the
+$N$-independent compact factorizations and solves are excluded from both
+columns.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4.5pt}
+\caption{Sequence-dependent mixer-core GMACs per sample at each task's maximum
+length, accumulated over all encoder layers.  The final column reports LSSO as
+a percentage of MHA.}
+\label{tab:mixer-macs}
+\begin{tabular}{lrcrrr}
+\toprule
+Task & $N$ & $D/L/H$ & LSSO & MHA & LSSO/MHA (\%) \\
+\midrule
+\multicolumn{6}{l}{\emph{GenomicBenchmarks}} \\
+Coding vs. intergenomic & 200  & $128/4/4$ & $0.0131$ & $0.0410$ & $32.0$ \\
+Human or worm           & 200  & $128/4/4$ & $0.0131$ & $0.0410$ & $32.0$ \\
+Mouse enhancers Ensembl & 4776 & $128/4/4$ & $0.3130$ & $23.3576$ & $1.3$ \\
+Human enhancers Cohn    & 500  & $128/4/4$ & $0.0328$ & $0.2560$ & $12.8$ \\
+Human enhancers Ensembl & 573  & $128/4/4$ & $0.0376$ & $0.3362$ & $11.2$ \\
+Human regulatory        & 802  & $128/4/4$ & $0.0526$ & $0.6586$ & $8.0$ \\
+Human non-TATA promoters & 251 & $128/4/4$ & $0.0164$ & $0.0645$ & $25.5$ \\
+Human OCR Ensembl       & 593  & $128/4/4$ & $0.0389$ & $0.3601$ & $10.8$ \\
+\midrule
+\multicolumn{6}{l}{\emph{Long Range Arena}} \\
+ListOps                 & 2048 & $128/6/8$ & $0.3020$ & $6.4425$  & $4.7$ \\
+Text                    & 4096 & $256/6/8$ & $0.8053$ & $51.5396$ & $1.6$ \\
+Retrieval               & 4000 & $128/6/8$ & $0.5898$ & $24.5760$ & $2.4$ \\
+Pathfinder-32           & 1024 & $256/6/4$ & $0.1510$ & $3.2212$  & $4.7$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \section{CUDA Implementation Details}
 \label{app:cuda}
 
 \subsection{Execution contract}
 
-The native backend implements the complete default operator,
-\textsc{Dynamic} with Rank-Rotary, for inference and first-order training.  It
-is algebraically equivalent to the equations in Section~\ref{sec:method}.  The
-\textsc{Static}, \textsc{Zero},
-and Rank-Rotary-off ablations remain reference-only and are rejected at the
-native boundary.  Unsupported inputs never silently fall back to another
-implementation, and higher-order gradients are outside the native contract.
+The native backend implements \textsc{Dynamic} with Rank-Rotary for inference
+and first-order training and is algebraically equivalent to
+Section~\ref{sec:method}.  It accepts FP16 or FP32 activations with FP32 learned
+parameters.  The \textsc{Static}, \textsc{Zero}, and Rank-Rotary-off ablations
+remain reference-only.
 
-The public CUDA entry point accepts FP16 or FP32 activations, while learned
-parameters remain FP32.  The joint input projection in
-Equation~\eqref{eq:input-projection} is evaluated outside the native mixer with
-FP32 operands and output, with TF32 enabled on supporting hardware.  Its
-contiguous FP32 relation and content coordinates are passed to the native
-operator.  The ordinary output projection is also outside the native boundary;
-it uses FP16 Tensor-Core operands with FP32 accumulation before the result is
-cast back to the activation dtype.  The implementation therefore covers the
-complete nonlinear mixer and its first-order derivative; the surrounding
-feature projections remain separate kernels.
+The joint input projection in Equation~\eqref{eq:input-projection} produces
+contiguous FP32 relation and content coordinates with TF32 enabled on
+supporting hardware.  The separate output projection uses FP16 Tensor-Core
+operands with FP32 accumulation before casting back to the activation dtype.
 
 The schedule supports
 \begin{equation}
     r\in\{16,32,48,64\}
 \end{equation}
-and any positive head width $d$ within ordinary allocation and launch limits.
-Rank and head width are independent, including $r>d$.  Runtime right-hand-side
-panels have width 32 with zero-filled tails, so $d$ need not belong to a fixed
-set.  BF16 is not part of this numerical contract.
+and any positive head width $d$ within allocation and launch limits, including
+$r>d$.  Runtime right-hand-side panels have width 32 with zero-filled tails.
 
 Boolean validity masks have shape $[B,N]$, and position identifiers have shape
 $[N]$ or $[B,N]$.  Invalid projected rows are zeroed before every compact
@@ -1253,10 +1293,8 @@ artifacts for
 \begin{equation}
     \mathrm{SM}\in\{75,80,86,87,89,90,100,120\}.
 \end{equation}
-Each loaded binary verifies its compiled SM and native contract version, and
-release metadata records the PyTorch version, CUDA runtime, C++ ABI, and
-artifact hashes.  Physical latency and numerical measurements in this paper use
-the RTX 5070 Ti specified below.
+Each binary records its compiled SM and numerical contract.  Physical latency
+and numerical measurements use the RTX 5070 Ti specified below.
 
 \subsection{Wall-clock protocol}
 
