@@ -194,3 +194,8 @@ ImageNet-1K uses the official DeiT III S/B/L training recipes with LSSO ranks
 Mask R-CNN + FPN 3x and ADE20K UperNet 160k use the shared dense DeiT III
 backbone and explicit padded-image masking. Their protocol provenance and
 launch commands are in [docs/DOWNSTREAM_PROTOCOLS.md](docs/DOWNSTREAM_PROTOCOLS.md).
+
+## Contributing
+
+Contributors using AI-assisted development tools must follow the repository
+rules in [`AGENTS.md`](AGENTS.md).

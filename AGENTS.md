@@ -1,9 +1,22 @@
-# Repository Rules
+# AI-Assisted Contribution Contract
+
+This file defines the repository contract for contributors who use coding
+agents, large language models, or other AI-assisted development tools. It
+governs proposed changes and review evidence; it does not affect installation,
+runtime behavior, or ordinary use of LSSO.
+
+The human contributor remains responsible for the scope, correctness,
+provenance, testing, and reviewability of every submitted change. AI-generated
+code, documentation, experiments, and citations must satisfy the same standards
+as human-authored work. Material use of external research or upstream code must
+be identified in the change summary with the source and the decision it
+informed.
 
 ## Design Principles
 
 - This repository has one current operator contract. Do not preserve legacy APIs,
-  checkpoints, imports, variants, or behavior unless the user explicitly asks.
+  checkpoints, imports, variants, or behavior unless the change request
+  explicitly requires it.
 - Prefer the simplest implementation that is mathematically equivalent to the
   contract and measurably better for the intended workload.
 - "Stable" means finite, correct, and trainable throughout the normal training
@@ -21,7 +34,7 @@
 - `lsso/ball/config.py` is the only owner of public variants and validation.
 - Do not add compatibility aliases, legacy imports, duplicate model classes, or
   a second reference implementation.
-- Do not add files under `lsso/ball/` without explicit user approval.
+- Do not add files under `lsso/ball/` without maintainer approval.
 
 ## Equivalent Implementations
 
