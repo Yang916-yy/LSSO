@@ -80,7 +80,10 @@ coordinate choice, not an absolute token-position representation.
 The frame, compact-state storage, accretive factor Gram `F F^T`, and solve
 calculations use FP32 unless the input is FP64. CUDA evaluates the factor Gram
 with IEEE FP32 FMA; its small size makes avoiding a second factor quantization
-worthwhile. The `w_bc` input projection uses FP32 operands with TF32 enabled
-on supported CUDA hardware; remaining eligible matrix contractions, including
-`w_o`, use the TC16/FP32 execution contract. Invalid tokens are zeroed before
-every compact statistic.
+worthwhile. Ordinary projections and eligible compact contractions use BF16
+multiplicands with FP32 accumulation. Packed activations and the pre-output
+boundary use BF16. Rank-Rotary stores bounded sin/cos in FP16 after FP32
+trigonometry, then rotates in FP32. Sensitive eta and solve state stay FP32.
+FP16 and BF16 public inputs are accepted by CUDA; the result matches the input
+dtype. FP32/FP64 inputs remain available on the reference path. Invalid tokens
+are zeroed before every compact statistic.

@@ -1269,7 +1269,7 @@ autograd state, returned gradients, and allocator caching.
 
 \subsection{Numerical and build coverage}
 
-The backend follows a fixed mixed TF32/FP16-Tensor-Core/FP32 contract.  The
+The contract-6 backend used for the reported experiments follows a fixed mixed TF32/FP16-Tensor-Core/FP32 contract. The current source uses contract 8 (BF16 ordinary multiplicands, FP16 phase storage, and FP32 sensitive arithmetic); the reported experiments have not been rerun under that contract.  The
 joint input projection uses TF32 where supported.  Selected compact
 contractions and the readout use FP16 multiplicands with FP32 accumulation.
 Rank-Rotary phases, the soft-frame Gram and Cholesky factorization, the

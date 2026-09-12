@@ -10,8 +10,9 @@ ZERO, and Rank-Rotary-off remain reference-only ablations. Rank-Rotary is an
 internal rank-space coordinate transform, so it is used in addition to, never
 instead of, the learned absolute position encoding in the experiment shell.
 Learned position parameters are initialized from `Normal(0, 0.02)`. The CUDA
-sequence runner uses FP16 AMP; BF16 is rejected instead of being silently
-routed through a different numerical contract.
+sequence encoder accepts FP16 and BF16 AMP under native contract 8. Existing
+training recipes still default to FP16. Historical results below used contract 6
+and have not been rerun under the new precision contract.
 
 All accuracies below are held-out test percentages. Three-seed summaries use
 the arithmetic mean and sample standard deviation (`n - 1`) over seeds 0, 1,

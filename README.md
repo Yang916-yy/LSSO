@@ -35,7 +35,7 @@ The native CUDA path covers only the complete DYNAMIC + Rank-Rotary
 operator, with rank 16, 32, 48, or 64 and any positive practical head dimension.
 It accepts the current operator's optional boolean `valid_mask` and shared or
 per-sample position IDs without falling back to another implementation. It
-targets Turing SM75 and newer supported NVIDIA architectures.
+targets Ampere SM80 and newer supported NVIDIA architectures.
 Build its strict per-SM artifacts with `tools/build_cuda.sh`, then load the
 artifact for the device before requesting it:
 
@@ -43,22 +43,35 @@ artifact for the device before requesting it:
 from lsso.ball import cuda
 
 cuda.load(device=x.device)
+x = x.to(torch.bfloat16)  # Native inputs must be FP16 or BF16.
 y = layer(x, implementation="cuda")
 ~~~
 
-Official releases provide a separate runtime wheel containing all eight CUDA
-artifacts. It is intentionally exact to the release binary contract:
-`torch==2.11.0+cu128`, CUDA `12.8`, native contract `6`, and Linux x86_64.
-Install the matching main and runtime wheels, then `cuda.load()` discovers the
-device-specific artifact without a local CUDA toolkit or compilation step.
+The current source requires `torch==2.11.0+cu128`, CUDA `12.8`, native
+contract `8`, and Linux x86_64 for its native runtime. Released v0.6.3 wheels
+must not be mixed with this newer source contract; build matching native
+artifacts from this checkout:
 
 ~~~bash
 python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
   'torch==2.11.0+cu128'
-python -m pip install \
-  ./lsso_operator-0.6.3-py3-none-any.whl \
-  ./lsso_cuda_runtime-0.6.3+torch2110cu128-py3-none-linux_x86_64.whl
+python -m pip install -e .
+PYTHON=python bash tools/build_cuda.sh
 ~~~
+
+A matching runtime wheel can also be built with `tools/package_cuda_runtime.py`.
+It packages seven architecture-specific artifacts (SM80 through supported
+Blackwell targets). Only SM120 was executed for the latest optimization checks.
+Biased FP16/BF16 projections additionally use the Triton runtime supplied by
+Linux CUDA PyTorch; their first call JIT-compiles a fused GEMM. Warm up on the
+capture stream before CUDA Graph capture. CPU reference imports do not require
+Triton. See [the CUDA contract](docs/CUDA_CONTRACT.md) for precision and build
+coverage.
+
+The current model checkpoint contract is version 12. A v0.6.3 checkpoint with
+version 11 requires an explicit, validated migration; `strict=False` does not
+bypass the contract check. Keep the original checkpoint when transferring
+pretrained weights.
 
 Source checkouts still prefer `build/cuda/lib/` for development; an explicit
 `LSSO_CUDA_LIBRARY` remains available for a manually built artifact.
