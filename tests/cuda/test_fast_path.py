@@ -92,7 +92,7 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float((difference / denominator).detach())
 
 
-def _assert_tc16_close(
+def _assert_mixed_close(
     actual: torch.Tensor,
     expected: torch.Tensor,
     *,
@@ -132,14 +132,14 @@ def test_fast_mix_selects_the_strict_train_and_inference_abis(
         calls.append("forward_inference")
         projected = arguments[0]
         assert isinstance(projected, torch.Tensor)
-        assert projected.dtype == torch.float32
+        assert projected.dtype == torch.bfloat16
         return projected.detach().clone()
 
     def train(*arguments: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         calls.append("forward_train")
         projected = arguments[0]
         assert isinstance(projected, torch.Tensor)
-        assert projected.dtype == torch.float32
+        assert projected.dtype == torch.bfloat16
         return (
             projected.clone(),
             torch.empty(1, dtype=torch.float32),
@@ -150,7 +150,7 @@ def test_fast_mix_selects_the_strict_train_and_inference_abis(
         calls.append("backward")
         assert len(arguments) == 9
         assert isinstance(arguments[0], torch.Tensor)
-        assert arguments[0].dtype == torch.float32
+        assert arguments[0].dtype == torch.bfloat16
         tape, pivots, positions, counts = arguments[5:]
         assert isinstance(tape, torch.Tensor) and tape.dtype == torch.float32
         assert isinstance(pivots, torch.Tensor) and pivots.dtype == torch.int32
@@ -176,7 +176,7 @@ def test_fast_mix_selects_the_strict_train_and_inference_abis(
     )
     monkeypatch.setattr(cuda, "require_available", lambda: None)
 
-    projected = torch.randn(1, 2, 3, dtype=torch.float32, requires_grad=True)
+    projected = torch.randn(1, 2, 3, dtype=torch.bfloat16, requires_grad=True)
     base = torch.randn(1, 16, 16, requires_grad=True)
     drive = torch.randn(1, 16, 16, requires_grad=True)
     eta = torch.randn(1, requires_grad=True)
@@ -357,7 +357,7 @@ def test_cuda_architecture_normalizes_sm121(
     assert cuda._device_architecture() == 120
 
 
-def test_cuda_architecture_accepts_turing_sm75(
+def test_cuda_architecture_rejects_turing_without_bf16(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(cuda.torch.cuda, "is_available", lambda: True)
@@ -367,7 +367,8 @@ def test_cuda_architecture_accepts_turing_sm75(
         "get_device_capability",
         lambda device: (7, 5),
     )
-    assert cuda._device_architecture() == 75
+    with pytest.raises(RuntimeError, match="supports SM80"):
+        cuda._device_architecture()
 
 
 def test_cuda_loader_rejects_a_different_loaded_architecture(
@@ -435,6 +436,7 @@ def test_reference_is_default_and_cuda_is_explicit(
 ) -> None:
     layer = LSSO(LSSOConfig(dim=32, num_heads=2, rank=16)).eval()
     x = torch.randn(2, 5, 32)
+    x = x.to(torch.float16).detach().requires_grad_(x.requires_grad)
 
     def fail_fast_mix(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("reference dispatch must not call the CUDA fast path")
@@ -471,6 +473,7 @@ def test_cuda_dispatch_accepts_supported_rank_and_generic_head_dimensions(
     config = LSSOConfig(dim=2 * head_dim, num_heads=2, rank=rank)
     layer = LSSO(config)
     x = torch.randn(1, 4, config.dim)
+    x = x.to(torch.float16).detach().requires_grad_(x.requires_grad)
 
     # A CPU input reaches the device check, proving that the Python contract
     # accepts each compiled rank and has no head-dimension whitelist.
@@ -481,6 +484,7 @@ def test_cuda_dispatch_accepts_supported_rank_and_generic_head_dimensions(
 def test_cuda_dispatch_accepts_mask_and_batch_specific_positions() -> None:
     layer = LSSO(LSSOConfig(dim=32, num_heads=2, rank=16))
     x = torch.randn(2, 4, 32)
+    x = x.to(torch.float16).detach().requires_grad_(x.requires_grad)
     with pytest.raises(ValueError, match="CUDA tensor"):
         layer(
             x,
@@ -497,7 +501,7 @@ def test_cuda_dispatch_requires_a_cuda_input() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("input_dtype", (torch.float16, torch.float32))
+@pytest.mark.parametrize("input_dtype", (torch.float16, torch.bfloat16))
 def test_cuda_dispatch_passes_the_strict_fast_path_abi(
     monkeypatch: pytest.MonkeyPatch,
     input_dtype: torch.dtype,
@@ -538,7 +542,7 @@ def test_cuda_dispatch_passes_the_strict_fast_path_abi(
     projected = captured["projected"]
     assert isinstance(projected, torch.Tensor)
     assert projected.shape == (2, 5, 2 * 16 + 32)
-    assert projected.dtype is torch.float32
+    assert projected.dtype is torch.bfloat16
     assert projected.is_contiguous()
     assert captured["core_base_raw"] is layer.core_base_raw
     assert captured["core_drive_weight"] is layer.core_drive_weight
@@ -559,7 +563,7 @@ def test_cuda_dispatch_passes_the_strict_fast_path_abi(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("input_dtype", (torch.float16, torch.float32))
+@pytest.mark.parametrize("input_dtype", (torch.float16, torch.bfloat16))
 def test_cuda_dispatch_packs_masked_batch_specific_inputs(
     monkeypatch: pytest.MonkeyPatch,
     input_dtype: torch.dtype,
@@ -634,11 +638,11 @@ def test_cuda_dispatch_packs_masked_batch_specific_inputs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_dispatch_rejects_bfloat16_input() -> None:
+def test_cuda_dispatch_rejects_float32_input() -> None:
     layer = LSSO(LSSOConfig(dim=32, num_heads=2, rank=16)).cuda()
-    x = torch.randn(1, 5, 32, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(1, 5, 32, device="cuda", dtype=torch.float32)
 
-    with pytest.raises(TypeError, match="does not support x with dtype torch.bfloat16"):
+    with pytest.raises(TypeError, match="got torch.float32"):
         layer(x, implementation="cuda")
 
 
@@ -677,7 +681,7 @@ def test_cuda_dispatch_rejects_position_gradients() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("length", (31, 32, 33, 65, 511, 512, 513))
+@pytest.mark.parametrize("length", (31, 32, 33, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513))
 def test_native_cuda_fast_mix_matches_reference_and_gradients(length: int) -> None:
     _require_native_cuda()
 
@@ -709,6 +713,7 @@ def test_native_cuda_fast_mix_matches_reference_and_gradients(length: int) -> No
     eta_seed = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1
     upstream = torch.randn(batch, length, dim, device="cuda", dtype=torch.float32)
 
+    projected_seed = projected_seed.to(torch.bfloat16)
     fast_inputs = tuple(
         value.detach().clone().requires_grad_()
         for value in (projected_seed, base_seed, drive_seed, eta_seed)
@@ -719,7 +724,7 @@ def test_native_cuda_fast_mix_matches_reference_and_gradients(length: int) -> No
     )
 
     fast = cuda.fast_mix(*fast_inputs, positions)
-    assert fast.dtype == torch.float32
+    assert fast.dtype == torch.bfloat16
     reference = _reference_fast_mix(*reference_inputs, positions)
 
     fast_gradients = torch.autograd.grad((fast * upstream).sum(), fast_inputs)
@@ -729,17 +734,17 @@ def test_native_cuda_fast_mix_matches_reference_and_gradients(length: int) -> No
     )
     torch.cuda.synchronize()
 
-    _assert_tc16_close(fast, reference, limit=5e-3)
+    _assert_mixed_close(fast, reference, limit=5e-3)
     for fast_gradient, reference_gradient in zip(
         fast_gradients,
         reference_gradients,
     ):
-        _assert_tc16_close(fast_gradient, reference_gradient, limit=1e-2)
+        _assert_mixed_close(fast_gradient, reference_gradient, limit=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_native_cuda_eta_vjp_matches_the_fp64_oracle_for_a_narrow_head() -> None:
-    """Keep the FP32 complement VJP independent of TC16 readout cancellation."""
+    """Keep the FP32 complement VJP independent of BF16 readout cancellation."""
 
     _require_native_cuda()
 
@@ -778,6 +783,7 @@ def test_native_cuda_eta_vjp_matches_the_fp64_oracle_for_a_narrow_head() -> None
     eta_seed = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1
     upstream = torch.randn(batch, length, dim, device="cuda", dtype=torch.float32)
 
+    projected_seed = projected_seed.to(torch.bfloat16)
     fast_inputs = tuple(
         value.detach().clone().requires_grad_()
         for value in (projected_seed, base_seed, drive_seed, eta_seed)
@@ -795,7 +801,7 @@ def test_native_cuda_eta_vjp_matches_the_fp64_oracle_for_a_narrow_head() -> None
     )[-1]
     torch.cuda.synchronize()
 
-    _assert_tc16_close(fast_eta_gradient, oracle_eta_gradient, limit=1e-2)
+    _assert_mixed_close(fast_eta_gradient, oracle_eta_gradient, limit=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -827,6 +833,7 @@ def test_native_cuda_complement_tail_stays_inside_the_oracle_envelope() -> None:
     eta_seed = torch.tensor([-9.5, 9.5], device="cuda", dtype=torch.float32)
     upstream = torch.randn(batch, length, dim, device="cuda", dtype=torch.float32)
 
+    projected_seed = projected_seed.to(torch.bfloat16)
     fast_inputs = tuple(
         value.detach().clone().requires_grad_()
         for value in (projected_seed, base_seed, drive_seed, eta_seed)
@@ -846,7 +853,7 @@ def test_native_cuda_complement_tail_stays_inside_the_oracle_envelope() -> None:
 
     assert torch.isfinite(fast_eta_gradient).all()
     assert torch.count_nonzero(fast_eta_gradient) == heads
-    _assert_tc16_close(fast_eta_gradient, oracle_eta_gradient, limit=1e-2)
+    _assert_mixed_close(fast_eta_gradient, oracle_eta_gradient, limit=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -879,6 +886,8 @@ def test_native_cuda_complement_tail_stays_inside_the_oracle_envelope() -> None:
         (1, 32, 8, 32, 4096),
         # GenomicBenchmarks Mouse reaches N=4776 with the paper DNA width.
         (1, 16, 4, 32, 4776),
+        # Cross-state groups cross the bounded producer-workspace boundary.
+        (1, 32, 1, 17, 8193),
     ],
 )
 def test_native_cuda_fast_mix_expanded_shapes_match_reference_and_gradients(
@@ -918,6 +927,7 @@ def test_native_cuda_fast_mix_expanded_shapes_match_reference_and_gradients(
     eta_seed = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.05
     upstream = torch.randn(batch, length, dim, device="cuda", dtype=torch.float32)
 
+    projected_seed = projected_seed.to(torch.bfloat16)
     fast_inputs = tuple(
         value.detach().clone().requires_grad_()
         for value in (projected_seed, base_seed, drive_seed, eta_seed)
@@ -934,12 +944,12 @@ def test_native_cuda_fast_mix_expanded_shapes_match_reference_and_gradients(
     )
     torch.cuda.synchronize()
 
-    _assert_tc16_close(fast, reference, limit=5e-3)
+    _assert_mixed_close(fast, reference, limit=5e-3)
     for fast_gradient, reference_gradient in zip(
         fast_gradients,
         reference_gradients,
     ):
-        _assert_tc16_close(fast_gradient, reference_gradient, limit=1e-2)
+        _assert_mixed_close(fast_gradient, reference_gradient, limit=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1019,6 +1029,7 @@ def test_native_cuda_fast_mix_masked_generic_shapes_match_reference_and_gradient
     upstream = torch.randn(batch, length, dim, device="cuda", dtype=torch.float32)
     upstream = torch.where(mask[:, :, None], upstream, torch.zeros_like(upstream))
 
+    projected_seed = projected_seed.to(torch.bfloat16)
     fast_inputs = tuple(
         value.detach().clone().requires_grad_()
         for value in (projected_seed, base_seed, drive_seed, eta_seed)
@@ -1044,12 +1055,12 @@ def test_native_cuda_fast_mix_masked_generic_shapes_match_reference_and_gradient
     torch.cuda.synchronize()
 
     assert torch.count_nonzero(fast[~mask]) == 0
-    _assert_tc16_close(fast, reference, limit=5e-3)
+    _assert_mixed_close(fast, reference, limit=5e-3)
     for fast_gradient, reference_gradient in zip(
         fast_gradients,
         reference_gradients,
     ):
-        _assert_tc16_close(fast_gradient, reference_gradient, limit=1e-2)
+        _assert_mixed_close(fast_gradient, reference_gradient, limit=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1073,7 +1084,7 @@ def test_native_cuda_full_lsso_masked_batch_matches_fp64_oracle() -> None:
             5 * torch.arange(35, device="cuda", dtype=torch.int64) + 101,
         )
     )
-    fast_x = torch.randn(2, 35, config.dim, device="cuda", dtype=torch.float32)
+    fast_x = torch.randn(2, 35, config.dim, device="cuda", dtype=torch.float16)
     fast_x[~mask] = float("nan")
     fast_x.requires_grad_()
     reference_x = fast_x.detach().double().requires_grad_()
@@ -1109,17 +1120,17 @@ def test_native_cuda_full_lsso_masked_batch_matches_fp64_oracle() -> None:
     assert torch.isfinite(fast_output).all()
     assert torch.count_nonzero(fast_output[1]) == 0
     assert torch.count_nonzero(fast_gradients[0][~mask]) == 0
-    _assert_tc16_close(fast_output, reference_output, limit=5e-3)
+    _assert_mixed_close(fast_output, reference_output, limit=5e-3)
     for fast_gradient, reference_gradient in zip(
         fast_gradients,
         reference_gradients,
     ):
-        _assert_tc16_close(fast_gradient, reference_gradient, limit=1e-2)
+        _assert_mixed_close(fast_gradient, reference_gradient, limit=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-def test_native_cuda_fast_mix_rejects_non_fp32_packed_input(
+@pytest.mark.parametrize("dtype", (torch.float16, torch.float32))
+def test_native_cuda_fast_mix_rejects_non_bf16_packed_input(
     dtype: torch.dtype,
 ) -> None:
     _require_native_cuda()
@@ -1149,7 +1160,7 @@ def test_native_cuda_fast_mix_rejects_non_fp32_packed_input(
     )
     eta = torch.randn(heads, device="cuda", dtype=torch.float32)
 
-    with pytest.raises(RuntimeError, match="strict TC16/FP32 CUDA contract"):
+    with pytest.raises(RuntimeError, match="mixed precision CUDA contract"):
         cuda.fast_mix(projected, base, drive, eta)
 
 
@@ -1181,6 +1192,7 @@ def test_native_cuda_train_tape_and_inference_forward_match(
         device="cuda",
         dtype=torch.float32,
     )
+    projected = projected.to(torch.bfloat16).detach().requires_grad_(projected.requires_grad)
     base = torch.randn(heads, rank, rank, device="cuda", dtype=torch.float32) * 0.1
     drive = torch.randn(
         heads,
@@ -1210,8 +1222,8 @@ def test_native_cuda_train_tape_and_inference_forward_match(
     )
     torch.cuda.synchronize()
 
-    assert inference_output.dtype == torch.float32
-    assert train_output.dtype == torch.float32
+    assert inference_output.dtype == torch.bfloat16
+    assert train_output.dtype == torch.bfloat16
     assert train_output.shape == inference_output.shape
     assert tape.is_cuda and tape.is_contiguous() and tape.dtype == torch.float32
     assert pivots.is_cuda and pivots.is_contiguous() and pivots.dtype == torch.int32
@@ -1232,6 +1244,7 @@ def test_native_cuda_forward_train_rejects_direct_autograd() -> None:
         dtype=torch.float32,
         requires_grad=True,
     )
+    projected = projected.to(torch.bfloat16).detach().requires_grad_(projected.requires_grad)
     base = torch.randn(
         heads,
         rank,
@@ -1272,6 +1285,7 @@ def test_native_cuda_forward_inference_rejects_direct_autograd() -> None:
         dtype=torch.float32,
         requires_grad=True,
     )
+    projected = projected.to(torch.bfloat16).detach().requires_grad_(projected.requires_grad)
     base = torch.randn(
         heads,
         rank,
@@ -1314,7 +1328,7 @@ def test_native_cuda_full_lsso_matches_fp64_oracle(
     reference_layer = copy.deepcopy(fast_layer).double().eval()
     length = 33
     position_ids = 3 * torch.arange(length, device="cuda", dtype=torch.int64) + 7
-    x_seed = torch.randn(1, length, config.dim, device="cuda", dtype=torch.float32)
+    x_seed = torch.randn(1, length, config.dim, device="cuda", dtype=torch.float16)
     upstream = torch.randn_like(x_seed)
     fast_x = x_seed.detach().clone().requires_grad_()
     reference_x = x_seed.detach().double().requires_grad_()
@@ -1347,13 +1361,13 @@ def test_native_cuda_full_lsso_matches_fp64_oracle(
     )
     torch.cuda.synchronize()
 
-    assert fast_output.dtype == torch.float32
-    _assert_tc16_close(fast_output, reference_output, limit=5e-3)
+    assert fast_output.dtype == fast_x.dtype
+    _assert_mixed_close(fast_output, reference_output, limit=5e-3)
     for fast_gradient, reference_gradient in zip(
         fast_gradients,
         reference_gradients,
     ):
-        _assert_tc16_close(fast_gradient, reference_gradient, limit=1e-2)
+        _assert_mixed_close(fast_gradient, reference_gradient, limit=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1365,6 +1379,7 @@ def test_cuda_float64_positions_preserve_relative_coordinates() -> None:
     fast_layer = LSSO(config).cuda().eval()
     reference_layer = copy.deepcopy(fast_layer).double().eval()
     x = torch.randn(1, 9, config.dim, device="cuda")
+    x = x.to(torch.float16).detach().requires_grad_(x.requires_grad)
     positions = torch.arange(9, device="cuda", dtype=torch.float64)
     shifted_positions = positions + 1e12
 
@@ -1384,7 +1399,7 @@ def test_cuda_float64_positions_preserve_relative_coordinates() -> None:
         implementation="cuda",
     )
 
-    _assert_tc16_close(fast_output, reference_output, limit=5e-3)
+    _assert_mixed_close(fast_output, reference_output, limit=5e-3)
     torch.testing.assert_close(fast_output, unshifted_output, rtol=1e-5, atol=1e-6)
 
 
@@ -1419,3 +1434,94 @@ def test_native_cuda_full_lsso_low_precision_backward_is_finite(
     for parameter in layer.parameters():
         if parameter.grad is not None:
             assert torch.isfinite(parameter.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_native_cuda_mixed_precision_matches_production_reference(dtype) -> None:
+    _require_native_cuda()
+    torch.manual_seed(20260907)
+    native = LSSO(LSSOConfig(32, 2, 16, bias=True)).cuda()
+    reference = copy.deepcopy(native)
+    x = torch.randn(2, 65, 32, device="cuda", dtype=dtype).requires_grad_()
+    rx = x.detach().clone().requires_grad_()
+    upstream = torch.randn_like(x)
+    with torch.autocast("cuda", dtype=dtype):
+        y = native(x, implementation="cuda")
+        ry = reference(rx, implementation="reference")
+    gradients = torch.autograd.grad((y * upstream).sum(), (x, *native.parameters()))
+    rgradients = torch.autograd.grad((ry * upstream).sum(), (rx, *reference.parameters()))
+    assert y.dtype == dtype
+    _assert_mixed_close(y, ry, limit=5e-3)
+    for actual, expected in zip(gradients, rgradients):
+        _assert_mixed_close(actual, expected, limit=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_native_cuda_bf16_content_exceeds_fp16_range() -> None:
+    _require_native_cuda()
+    torch.manual_seed(101)
+    projected = torch.randn(1, 33, 32, device="cuda")
+    projected[:, :, 16:] *= 131072
+    projected = projected.bfloat16().requires_grad_()
+    base = torch.zeros(1, 16, 16, device="cuda", requires_grad=True)
+    drive = torch.zeros(1, 16, 16, device="cuda", requires_grad=True)
+    eta = torch.tensor([0.7], device="cuda", requires_grad=True)
+    inputs = (projected, base, drive, eta)
+    oracle_inputs = tuple(v.detach().double().requires_grad_() for v in inputs)
+    output = cuda.fast_mix(*inputs, None)
+    oracle = _reference_fast_mix(*oracle_inputs, None)
+    assert output.detach().abs().max() > torch.finfo(torch.float16).max
+    _assert_mixed_close(output, oracle, limit=5e-3)
+    gradients = torch.autograd.grad(output.float().sum(), inputs)
+    oracle_gradients = torch.autograd.grad(oracle.sum(), oracle_inputs)
+    for actual, expected in zip(gradients, oracle_gradients):
+        _assert_mixed_close(actual, expected, limit=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("scale", (0.001, 64.0))
+def test_native_cuda_reconstructed_frame_input_matches_oracle(scale: float) -> None:
+    _require_native_cuda()
+    torch.manual_seed(711)
+    length, rank, head_dim = 33, 32, 17
+    projected = torch.randn(1, length, rank + head_dim, device="cuda")
+    projected[..., :rank] *= scale
+    projected = projected.bfloat16().requires_grad_()
+    base = (0.1 * torch.randn(1, rank, rank, device="cuda")).requires_grad_()
+    drive = (0.1 * torch.randn(1, head_dim, rank, device="cuda")).requires_grad_()
+    eta = torch.tensor([0.7], device="cuda", requires_grad=True)
+    inputs = (projected, base, drive, eta)
+    oracle_inputs = tuple(v.detach().double().requires_grad_() for v in inputs)
+    output = cuda.fast_mix(*inputs, None)
+    oracle = _reference_fast_mix(*oracle_inputs, None)
+    upstream = torch.randn_like(output)
+    # This extended high-amplitude fixture has 0.6513% forward error in
+    # the pre-reconstruction implementation too; standard fixtures retain 0.5%.
+    _assert_mixed_close(output, oracle, limit=1e-2 if scale > 1 else 5e-3)
+    gradients = torch.autograd.grad((output * upstream).sum(), inputs)
+    oracle_gradients = torch.autograd.grad((oracle * upstream.double()).sum(), oracle_inputs)
+    for actual, expected in zip(gradients, oracle_gradients):
+        _assert_mixed_close(actual, expected, limit=3e-2)
+    with torch.no_grad():
+        _, tape, _ = torch.ops.lsso_equilibrium.forward_train(*inputs, None)
+    # One token-sized frame, three rank matrices, and two compact states.
+    assert tape.numel() == length * rank + 3 * rank * rank + 2 * rank * head_dim + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_native_backward_requires_bf16_upstream() -> None:
+    _require_native_cuda()
+    projected = torch.zeros(1, 5, 32, device="cuda", dtype=torch.bfloat16)
+    base = torch.zeros(1, 16, 16, device="cuda")
+    drive = torch.zeros(1, 16, 16, device="cuda")
+    eta = torch.zeros(1, device="cuda")
+    output, tape, pivots = torch.ops.lsso_equilibrium.forward_train(
+        projected, base, drive, eta, None
+    )
+    arguments = (projected, base, drive, eta, tape, pivots, None)
+    with pytest.raises(RuntimeError, match="grad_output must use bfloat16"):
+        torch.ops.lsso_equilibrium.backward(torch.zeros_like(output).float(), *arguments)
+    gradients = torch.ops.lsso_equilibrium.backward(torch.zeros_like(output), *arguments)
+    for gradient in gradients:
+        assert torch.count_nonzero(gradient) == 0

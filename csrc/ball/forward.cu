@@ -9,6 +9,7 @@
 #include <cusolverdx/detail/shared_memory.hpp>
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cmath>
 #include <cstdint>
@@ -47,6 +48,9 @@ struct ForwardResult {
 };
 
 constexpr int kGenericTokenTile = 32;
+// Selective fusion: accumulate four adjacent GEMMs per CTA, then reduce
+// independent groups. Keep token-group parallelism instead of a full-sequence CTA.
+constexpr int kCrossTilesPerBlock = 4;
 constexpr int kCrossTokenChunk = 64;
 constexpr int kDefaultPhaseCacheEntriesPerDevice = 2;
 constexpr size_t kDefaultPhaseCacheBytes = 4 * 1024 * 1024;
@@ -56,9 +60,9 @@ constexpr int kParallelGramMinimumTokenTiles = 32;
 
 template <int rank>
 constexpr int generic_frame_materialize_token_tile() {
-    // At the larger compiled ranks, one right-hand-side panel spans two
-    // adjacent token tiles and amortizes loading the Cholesky factor.
-    return rank >= 48 ? 64 : kGenericTokenTile;
+    // One 128-token right-hand-side panel amortizes the Cholesky-factor load
+    // and triangular-solve setup across four adjacent token tiles.
+    return 128;
 }
 
 template <int rank>
@@ -71,7 +75,7 @@ __device__ __forceinline__ float generic_inverse_frequency(int pair) {
 template <int rank>
 __global__ __launch_bounds__(kThreads) void rank_rotary_phase_kernel(
     const float* __restrict__ centered_positions,
-    float2* __restrict__ phases,
+    __half2* __restrict__ phases,
     int64_t batch_count,
     int64_t length,
     bool batch_specific) {
@@ -92,7 +96,7 @@ __global__ __launch_bounds__(kThreads) void rank_rotary_phase_kernel(
     float sine = 0.0f;
     float cosine = 0.0f;
     sincosf(position * generic_inverse_frequency<rank>(pair), &sine, &cosine);
-    phases[linear] = make_float2(cosine, sine);
+    phases[linear] = __floats2half2_rn(cosine, sine);
 }
 
 template <int rank>
@@ -106,7 +110,7 @@ at::Tensor launch_rank_rotary_phase_table(
     const auto stream = at::cuda::getCurrentCUDAStream(projected.get_device()).stream();
     if (!centered_positions.has_value() &&
         shape.length <=
-            static_cast<int64_t>(kDefaultPhaseCacheBytes / (rank * sizeof(float)))) {
+            static_cast<int64_t>(kDefaultPhaseCacheBytes / (rank * sizeof(at::Half)))) {
         struct CachedPhaseTable {
             at::Tensor phases;
             cudaEvent_t ready;
@@ -129,12 +133,12 @@ at::Tensor launch_rank_rotary_phase_table(
             kDefaultPhaseCacheEntriesPerDevice) {
             auto phases = at::empty(
                 {shape.length, rank / 2, 2},
-                projected.options().dtype(at::kFloat));
+                projected.options().dtype(at::kHalf));
             const int64_t phase_count = shape.length * (rank / 2);
             const int64_t blocks = (phase_count + kThreads - 1) / kThreads;
             rank_rotary_phase_kernel<rank><<<blocks, kThreads, 0, stream>>>(
                 nullptr,
-                reinterpret_cast<float2*>(phases.data_ptr<float>()),
+                reinterpret_cast<__half2*>(phases.data_ptr<at::Half>()),
                 shape.batch,
                 shape.length,
                 false);
@@ -150,16 +154,16 @@ at::Tensor launch_rank_rotary_phase_table(
     auto phases = batch_specific
         ? at::empty(
               {shape.batch, shape.length, rank / 2, 2},
-              projected.options().dtype(at::kFloat))
+              projected.options().dtype(at::kHalf))
         : at::empty(
               {shape.length, rank / 2, 2},
-              projected.options().dtype(at::kFloat));
+              projected.options().dtype(at::kHalf));
     const int64_t phase_count =
         (batch_specific ? shape.batch : 1) * shape.length * (rank / 2);
     const int64_t blocks = (phase_count + kThreads - 1) / kThreads;
     rank_rotary_phase_kernel<rank><<<blocks, kThreads, 0, stream>>>(
         centered_positions.has_value() ? centered_positions->data_ptr<float>() : nullptr,
-        reinterpret_cast<float2*>(phases.data_ptr<float>()),
+        reinterpret_cast<__half2*>(phases.data_ptr<at::Half>()),
         shape.batch,
         shape.length,
         batch_specific);
@@ -167,29 +171,6 @@ at::Tensor launch_rank_rotary_phase_table(
     return phases;
 }
 
-template <typename scalar_t, int rank>
-__device__ __forceinline__ float2 generic_rotated_relation_from_phase(
-    const scalar_t* projected,
-    const float2* phases,
-    int64_t batch,
-    int64_t head,
-    int64_t token,
-    int pair,
-    int64_t length,
-    int64_t projected_width,
-    int64_t phase_batch_stride,
-    float inverse_length_sqrt) {
-    const int even_rank = 2 * pair;
-    const int64_t relation_base =
-        (batch * length + token) * projected_width + head * rank;
-    const float even = load_scalar(projected, relation_base + even_rank);
-    const float odd = load_scalar(projected, relation_base + even_rank + 1);
-    const float2 phase = phases[
-        batch * phase_batch_stride + token * (rank / 2) + pair];
-    return make_float2(
-        (even * phase.x - odd * phase.y) * inverse_length_sqrt,
-        (even * phase.y + odd * phase.x) * inverse_length_sqrt);
-}
 
 template <int rank>
 struct GenericFrameMathDx {
@@ -210,7 +191,7 @@ struct GenericFrameMathDx {
 
     using Cross = decltype(
         cublasdx::Size<rank, kRhsTile, kGenericTokenTile>() +
-        cublasdx::Precision<__half, __half, float>() +
+        cublasdx::Precision<__nv_bfloat16, __nv_bfloat16, float>() +
         cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
@@ -225,7 +206,7 @@ struct GenericFrameMathDx {
 
     using Core = decltype(
         cublasdx::Size<rank, rank, kRhsTile>() +
-        cublasdx::Precision<__half, __half, float>() +
+        cublasdx::Precision<__nv_bfloat16, __nv_bfloat16, float>() +
         cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
@@ -240,7 +221,7 @@ struct GenericFrameMathDx {
 
     using Readout = decltype(
         cublasdx::Size<kGenericTokenTile, kRhsTile, rank>() +
-        cublasdx::Precision<__half, __half, float>() +
+        cublasdx::Precision<__nv_bfloat16, __nv_bfloat16, float>() +
         cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
@@ -332,9 +313,9 @@ constexpr size_t generic_cross_shared_bytes() {
     constexpr size_t c_elements = cublasdx::cosize(Cross::get_layout_smem_c());
     size_t offset = 0;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * a_elements;
+    offset += sizeof(__nv_bfloat16) * a_elements;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * b_elements;
+    offset += sizeof(__nv_bfloat16) * b_elements;
     offset = align_shared_offset(offset, 16);
     offset += sizeof(float) * c_elements;
     return offset;
@@ -350,19 +331,14 @@ template <int rank>
 constexpr size_t generic_core_factor_shared_bytes() {
     using Core = typename GenericFrameMathDx<rank>::Core;
     using Getrf = typename GenericCoreFactorMathDx<rank>::Getrf;
-    constexpr size_t core_a_elements = cublasdx::cosize(Core::get_layout_smem_a());
-    constexpr size_t core_b_elements = cublasdx::cosize(Core::get_layout_smem_b());
-    constexpr size_t core_c_elements = cublasdx::cosize(Core::get_layout_smem_c());
-    size_t offset = 0;
-    offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * core_a_elements;
-    offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * core_b_elements;
-    offset = align_shared_offset(offset, 16);
-    offset += sizeof(float) * core_c_elements;
-    offset = align_shared_offset(offset, alignof(float));
-    offset += Getrf::shared_memory_size;
-    return offset;
+    constexpr size_t ab_bytes = sizeof(__nv_bfloat16) * (
+        cublasdx::cosize(Core::get_layout_smem_a()) +
+        cublasdx::cosize(Core::get_layout_smem_b()));
+    constexpr size_t c_bytes = sizeof(float) * cublasdx::cosize(Core::get_layout_smem_c());
+    // A/B die after the final GEMM. The accumulator must remain separate
+    // while the solver scratch first holds F and then its assembled matrix.
+    return align_shared_offset(c_bytes, 16) +
+        (ab_bytes > Getrf::shared_memory_size ? ab_bytes : Getrf::shared_memory_size);
 }
 
 template <int rank>
@@ -373,9 +349,9 @@ constexpr size_t generic_output_shared_bytes() {
     constexpr size_t c_elements = cublasdx::cosize(Readout::get_layout_smem_c());
     size_t offset = 0;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * a_elements;
+    offset += sizeof(__nv_bfloat16) * a_elements;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * b_elements;
+    offset += sizeof(__nv_bfloat16) * b_elements;
     offset = align_shared_offset(offset, 16);
     offset += sizeof(float) * c_elements;
     return offset;
@@ -384,7 +360,7 @@ constexpr size_t generic_output_shared_bytes() {
 template <typename scalar_t, int rank>
 __global__ __launch_bounds__(kThreads) void generic_frame_kernel(
     const scalar_t* __restrict__ projected,
-    const float2* __restrict__ phases,
+    const __half2* __restrict__ phases,
     const float* __restrict__ valid_counts,
     float* __restrict__ tape,
     ForwardWorkspaceLayout workspace_layout,
@@ -709,10 +685,10 @@ __global__ __launch_bounds__(kThreads) void generic_frame_materialize_kernel(
     }
 }
 
-template <typename scalar_t, int rank>
+template <typename scalar_t, int rank, bool direct = false>
 __global__ __launch_bounds__(kThreads) void generic_cross_state_partials_kernel(
     const scalar_t* __restrict__ projected,
-    const float* __restrict__ tape,
+    float* __restrict__ tape,
     float* __restrict__ partial_cross,
     ForwardWorkspaceLayout workspace_layout,
     int64_t frame_offset,
@@ -723,21 +699,22 @@ __global__ __launch_bounds__(kThreads) void generic_cross_state_partials_kernel(
     int64_t head_dim,
     int64_t rhs_tiles,
     int64_t partial_tile_stride,
-    int64_t token_tile_start,
-    int64_t token_tile_count) {
+    int64_t token_group_start,
+    int64_t token_group_count) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     const int64_t rhs_tile = static_cast<int64_t>(blockIdx.y);
-    const int64_t local_token_tile = static_cast<int64_t>(blockIdx.z);
+    const int64_t local_token_group = static_cast<int64_t>(blockIdx.z);
     const int64_t system_count = batch_count * heads;
     if (system_index >= system_count || rhs_tile >= rhs_tiles ||
-        local_token_tile >= token_tile_count) {
+        local_token_group >= token_group_count) {
         return;
     }
     const int64_t batch = system_index / heads;
     const int64_t head = system_index - batch * heads;
     const int64_t rhs_start = rhs_tile * kRhsTile;
-    const int64_t token_start =
-        (token_tile_start + local_token_tile) * kGenericTokenTile;
+    const int64_t group_start =
+        (token_group_start + local_token_group) *
+        kCrossTilesPerBlock * kGenericTokenTile;
     const int64_t projected_width = heads * rank + dim;
     const float* system_tape = tape + system_index * workspace_layout.stride;
     const float* frame = system_tape + frame_offset;
@@ -748,10 +725,10 @@ __global__ __launch_bounds__(kThreads) void generic_cross_state_partials_kernel(
     constexpr size_t c_elements = cublasdx::cosize(Cross::get_layout_smem_c());
     extern __shared__ __align__(16) unsigned char shared_raw[];
     SharedCursor shared(shared_raw);
-    __half* a_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * a_elements, 16));
-    __half* b_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * b_elements, 16));
+    __nv_bfloat16* a_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * a_elements, 16));
+    __nv_bfloat16* b_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * b_elements, 16));
     float* gemm_output = reinterpret_cast<float*>(
         shared.take_bytes(sizeof(float) * c_elements, 16));
     auto cross_a = cublasdx::make_tensor(a_tile, Cross::get_layout_smem_a());
@@ -762,38 +739,50 @@ __global__ __launch_bounds__(kThreads) void generic_cross_state_partials_kernel(
         gemm_output[linear] = 0.0f;
     }
     __syncthreads();
-    for (int linear = threadIdx.x; linear < rank * kGenericTokenTile;
-         linear += blockDim.x) {
-        const int column = linear / rank;
-        const int row = linear - column * rank;
-        const int64_t token = token_start + column;
-        cross_a(row, column) = __float2half_rn(
-            token < length ? frame[token * rank + row] : 0.0f);
+    const int tiles = direct ? static_cast<int>((length + kGenericTokenTile - 1) / kGenericTokenTile) : kCrossTilesPerBlock;
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int64_t token_start = group_start + tile * kGenericTokenTile;
+        if (token_start >= length) {
+            break;
+        }
+        for (int linear = threadIdx.x; linear < rank * kGenericTokenTile;
+             linear += blockDim.x) {
+            const int column = linear / rank;
+            const int row = linear - column * rank;
+            const int64_t token = token_start + column;
+            cross_a(row, column) = __float2bfloat16_rn(
+                token < length ? frame[token * rank + row] : 0.0f);
+        }
+        for (int linear = threadIdx.x; linear < kGenericTokenTile * kRhsTile;
+             linear += blockDim.x) {
+            const int row = linear / kRhsTile;
+            const int column = linear - row * kRhsTile;
+            const int64_t token = token_start + row;
+            const int64_t feature = rhs_start + column;
+            cross_b(row, column) = __float2bfloat16_rn(
+                token < length && feature < head_dim
+                    ? load_scalar(
+                          projected,
+                          (batch * length + token) * projected_width + heads * rank +
+                              head * head_dim + feature)
+                    : 0.0f);
+        }
+        __syncthreads();
+        Cross().execute(1.0f, cross_a, cross_b, 1.0f, cross_c);
+        __syncthreads();
     }
-    for (int linear = threadIdx.x; linear < kGenericTokenTile * kRhsTile;
-         linear += blockDim.x) {
-        const int row = linear / kRhsTile;
-        const int column = linear - row * kRhsTile;
-        const int64_t token = token_start + row;
-        const int64_t feature = rhs_start + column;
-        cross_b(row, column) = __float2half_rn(
-            token < length && feature < head_dim
-                ? load_scalar(
-                      projected,
-                      (batch * length + token) * projected_width + heads * rank +
-                          head * head_dim + feature)
-                : 0.0f);
-    }
-    __syncthreads();
-    Cross().execute(1.0f, cross_a, cross_b, 0.0f, cross_c);
-    __syncthreads();
-    float* output = partial_cross +
-        ((system_index * rhs_tiles + rhs_tile) * partial_tile_stride + local_token_tile) *
-            rank * kRhsTile;
     for (int linear = threadIdx.x; linear < rank * kRhsTile; linear += blockDim.x) {
         const int row = linear / kRhsTile;
         const int column = linear - row * kRhsTile;
-        output[linear] = cross_c(row, column);
+        if constexpr (direct) {
+            if (rhs_start + column < head_dim) {
+                tape[system_index * workspace_layout.stride + workspace_layout.z_offset +
+                     row * head_dim + rhs_start + column] = cross_c(row, column);
+            }
+        } else {
+            partial_cross[((system_index * rhs_tiles + rhs_tile) * partial_tile_stride +
+                           local_token_group) * rank * kRhsTile + linear] = cross_c(row, column);
+        }
     }
 }
 
@@ -806,7 +795,7 @@ __global__ __launch_bounds__(kThreads) void generic_cross_state_reduce_kernel(
     int64_t head_dim,
     int64_t rhs_tiles,
     int64_t partial_tile_stride,
-    int64_t token_tile_count,
+    int64_t token_group_count,
     bool accumulate) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     const int64_t rhs_tile = static_cast<int64_t>(blockIdx.y);
@@ -825,7 +814,7 @@ __global__ __launch_bounds__(kThreads) void generic_cross_state_reduce_kernel(
             float value = accumulate
                 ? compact_state[row * head_dim + rhs_start + column]
                 : 0.0f;
-            for (int64_t tile = 0; tile < token_tile_count; ++tile) {
+            for (int64_t tile = 0; tile < token_group_count; ++tile) {
                 value += partial[tile * rank * kRhsTile + linear];
             }
             compact_state[row * head_dim + rhs_start + column] = value;
@@ -919,15 +908,12 @@ __global__ __launch_bounds__(kThreads) void generic_core_factor_kernel(
     constexpr size_t core_b_elements = cublasdx::cosize(Core::get_layout_smem_b());
     constexpr size_t core_c_elements = cublasdx::cosize(Core::get_layout_smem_c());
     static_assert(core_c_elements >= rank * rank);
-    SharedCursor shared(shared_raw);
-    __half* a_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * core_a_elements, 16));
-    __half* b_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * core_b_elements, 16));
-    float* gemm_output = reinterpret_cast<float*>(
-        shared.take_bytes(sizeof(float) * core_c_elements, 16));
-    auto* solver_raw = static_cast<unsigned char*>(
-        shared.take_bytes(Getrf::shared_memory_size, alignof(MatrixScalar)));
+    float* gemm_output = reinterpret_cast<float*>(shared_raw);
+    auto* stage_raw = shared_raw + align_shared_offset(
+        sizeof(float) * core_c_elements, 16);
+    __nv_bfloat16* a_tile = reinterpret_cast<__nv_bfloat16*>(stage_raw);
+    __nv_bfloat16* b_tile = a_tile + core_a_elements;
+    auto* solver_raw = stage_raw;
     auto [matrix, factor_pivots] = cusolverdx::shared_memory::slice<MatrixScalar, int>(
         solver_raw,
         alignof(MatrixScalar), rank * Getrf::lda,
@@ -947,7 +933,7 @@ __global__ __launch_bounds__(kThreads) void generic_core_factor_kernel(
             const int row = linear / kRhsTile;
             const int column = linear - row * kRhsTile;
             const int64_t feature = feature_start + column;
-            core_a(row, column) = __float2half_rn(
+            core_a(row, column) = __float2bfloat16_rn(
                 feature < head_dim
                     ? compact_state[row * head_dim + feature]
                     : 0.0f);
@@ -957,7 +943,7 @@ __global__ __launch_bounds__(kThreads) void generic_core_factor_kernel(
             const int row = linear / rank;
             const int column = linear - row * rank;
             const int64_t feature = feature_start + row;
-            core_b(row, column) = __float2half_rn(
+            core_b(row, column) = __float2bfloat16_rn(
                 feature < head_dim
                     ? core_drive_weight[(head * head_dim + feature) * rank + column]
                     : 0.0f);
@@ -966,7 +952,7 @@ __global__ __launch_bounds__(kThreads) void generic_core_factor_kernel(
         Core().execute(1.0f, core_a, core_b, 1.0f, core_c);
         __syncthreads();
     }
-    // Once the TC16 core product is consumed, reuse solver storage for F and
+    // Once the BF16 core product is consumed, reuse solver storage for F and
     // the upper Omega coordinates; gemm_output becomes the assembled K.
     for (int linear = threadIdx.x; linear < rank * rank; linear += blockDim.x) {
         const int row = linear / rank;
@@ -1122,10 +1108,10 @@ __global__ __launch_bounds__(kThreads) void generic_output_kernel(
     constexpr size_t c_elements = cublasdx::cosize(Readout::get_layout_smem_c());
     extern __shared__ __align__(16) unsigned char shared_raw[];
     SharedCursor shared(shared_raw);
-    __half* a_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * a_elements, 16));
-    __half* b_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * b_elements, 16));
+    __nv_bfloat16* a_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * a_elements, 16));
+    __nv_bfloat16* b_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * b_elements, 16));
     float* gemm_output = reinterpret_cast<float*>(
         shared.take_bytes(sizeof(float) * c_elements, 16));
     auto readout_a = cublasdx::make_tensor(a_tile, Readout::get_layout_smem_a());
@@ -1137,7 +1123,7 @@ __global__ __launch_bounds__(kThreads) void generic_output_kernel(
         const int row = linear / rank;
         const int column = linear - row * rank;
         const int64_t token = token_start + row;
-        readout_a(row, column) = __float2half_rn(
+        readout_a(row, column) = __float2bfloat16_rn(
             row < token_count ? frame[token * rank + column] : 0.0f);
     }
     __syncthreads();
@@ -1154,7 +1140,7 @@ __global__ __launch_bounds__(kThreads) void generic_output_kernel(
                 ? 2.0f * equilibrium[row * head_dim + feature] -
                     (1.0f + eta) * compact_state[row * head_dim + feature]
                 : 0.0f;
-            readout_b(row, column) = __float2half_rn(compact_mix);
+            readout_b(row, column) = __float2bfloat16_rn(compact_mix);
         }
         __syncthreads();
         Readout().execute(1.0f, readout_a, readout_b, 0.0f, readout_c);
@@ -1276,7 +1262,7 @@ ForwardResult launch_generic_forward(
         : 0;
     generic_frame_kernel<scalar_t, rank><<<system_count, kThreads, 0, stream>>>(
         projected.data_ptr<scalar_t>(),
-        reinterpret_cast<const float2*>(phases.data_ptr<float>()),
+        reinterpret_cast<const __half2*>(phases.data_ptr<at::Half>()),
         valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
         workspace.data_ptr<float>(),
         workspace_layout,
@@ -1295,16 +1281,10 @@ ForwardResult launch_generic_forward(
         float* gram_partial_data = nullptr;
         int64_t gram_partial_system_stride =
             token_tiles * kPackedLowerElements;
-        if constexpr (record_tape && rank < 64) {
-            // At the long-sequence threshold, packed partials for r<64 fit in
-            // the not-yet-materialized P[N, R] tape region of every system.
-            gram_partial_data = workspace.data_ptr<float>() + tape_layout.p_offset;
-            gram_partial_system_stride = workspace_layout.stride;
-        } else {
-            gram_partials = at::empty(
-                {system_count, token_tiles, kPackedLowerElements}, workspace_options);
-            gram_partial_data = gram_partials.data_ptr<float>();
-        }
+        // B is still live here; the future P region now aliases B.
+        gram_partials = at::empty(
+            {system_count, token_tiles, kPackedLowerElements}, workspace_options);
+        gram_partial_data = gram_partials.data_ptr<float>();
         const int64_t gram_blocks = system_count * token_tiles;
         constexpr size_t gram_partial_shared_bytes =
             generic_frame_gram_partial_shared_bytes<rank>();
@@ -1363,23 +1343,33 @@ ForwardResult launch_generic_forward(
     const dim3 rhs_grid(
         static_cast<unsigned int>(system_count), static_cast<unsigned int>(rhs_tiles));
     constexpr size_t cross_shared_bytes = generic_cross_shared_bytes<rank>();
-    const int64_t cross_tile_capacity = token_tiles < kCrossTokenChunk
-        ? token_tiles
+    const int64_t cross_groups =
+        (token_tiles + kCrossTilesPerBlock - 1) / kCrossTilesPerBlock;
+    const int64_t cross_tile_capacity = cross_groups < kCrossTokenChunk
+        ? cross_groups
         : kCrossTokenChunk;
-    {
+    if (shape.length <= 256) {
+        // At most eight tiles per RHS CTA: no global partial or reduction launch.
+        generic_cross_state_partials_kernel<scalar_t, rank, true><<<
+            rhs_grid, kThreads, cross_shared_bytes, stream>>>(
+            projected.data_ptr<scalar_t>(), workspace.data_ptr<float>(), nullptr,
+            workspace_layout, frame_offset, shape.batch, shape.length, shape.heads,
+            shape.dim, shape.head_dim, rhs_tiles, 1, 0, 1);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
         auto partial_cross = at::empty(
             {system_count, rhs_tiles, cross_tile_capacity, rank, kRhsTile},
             workspace_options);
-        for (int64_t token_tile_start = 0; token_tile_start < token_tiles;
-             token_tile_start += kCrossTokenChunk) {
-            const int64_t token_tile_count =
-                token_tiles - token_tile_start < kCrossTokenChunk
-                ? token_tiles - token_tile_start
+        for (int64_t token_group_start = 0; token_group_start < cross_groups;
+             token_group_start += kCrossTokenChunk) {
+            const int64_t token_group_count =
+                cross_groups - token_group_start < kCrossTokenChunk
+                ? cross_groups - token_group_start
                 : kCrossTokenChunk;
             const dim3 cross_grid(
                 static_cast<unsigned int>(system_count),
                 static_cast<unsigned int>(rhs_tiles),
-                static_cast<unsigned int>(token_tile_count));
+                static_cast<unsigned int>(token_group_count));
             generic_cross_state_partials_kernel<scalar_t, rank><<<
                 cross_grid, kThreads, cross_shared_bytes, stream>>>(
                 projected.data_ptr<scalar_t>(),
@@ -1394,8 +1384,8 @@ ForwardResult launch_generic_forward(
                 shape.head_dim,
                 rhs_tiles,
                 cross_tile_capacity,
-                token_tile_start,
-                token_tile_count);
+                token_group_start,
+                token_group_count);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             generic_cross_state_reduce_kernel<rank><<<rhs_grid, kThreads, 0, stream>>>(
                 partial_cross.data_ptr<float>(),
@@ -1405,8 +1395,8 @@ ForwardResult launch_generic_forward(
                 shape.head_dim,
                 rhs_tiles,
                 cross_tile_capacity,
-                token_tile_count,
-                token_tile_start != 0);
+                token_group_count,
+                token_group_start != 0);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     }
@@ -1528,7 +1518,7 @@ at::Tensor forward_inference_cuda(
         valid_counts);
     c10::cuda::CUDAGuard guard(projected.device());
     (void)supported_sm();
-    return dispatch_expanded_forward<float, false>(
+    return dispatch_expanded_forward<at::BFloat16, false>(
         projected,
         core_base_raw,
         core_drive_weight,
@@ -1554,7 +1544,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_train_cuda(
         valid_counts);
     c10::cuda::CUDAGuard guard(projected.device());
     (void)supported_sm();
-    ForwardResult result = dispatch_expanded_forward<float, true>(
+    ForwardResult result = dispatch_expanded_forward<at::BFloat16, true>(
         projected,
         core_base_raw,
         core_drive_weight,

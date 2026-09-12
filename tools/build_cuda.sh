@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cuda_root="${CUDA_HOME:-/usr/local/cuda-12.8}"
 mathdx_root="${MATHDX_ROOT:-/opt/nvidia/nvidia-mathdx-25.12.1-cuda12/nvidia-mathdx-25.12.1-cuda12/nvidia/mathdx/25.12}"
 python_bin="${PYTHON:-python3}"
-architectures="${LSSO_CUDA_ARCHITECTURES:-75;80;86;87;89;90;100;120}"
+architectures="${LSSO_CUDA_ARCHITECTURES:-80;86;87;89;90;100;120}"
 build_dir="${repo_root}/build/cuda"
 
 if [[ ! -x "${cuda_root}/bin/nvcc" ]]; then
@@ -52,7 +52,7 @@ fi
 
 for architecture in "${architecture_list[@]}"; do
     case "${architecture}" in
-        75|80|86|87|89|90|100|120) ;;
+        80|86|87|89|90|100|120) ;;
         *)
             printf 'LSSO_CUDA_ARCHITECTURES contains unsupported architecture %s\n' "${architecture}" >&2
             exit 1

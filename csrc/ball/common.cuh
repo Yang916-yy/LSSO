@@ -5,6 +5,7 @@
 #include <c10/util/Optional.h>
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -85,7 +86,8 @@ inline TrainingTapeLayout training_tape_layout(FastPathShape shape) {
     const int64_t compact_elements = shape.rank * shape.head_dim;
     const int64_t matrix_elements = shape.rank * shape.rank;
     const int64_t b_offset = 0;
-    const int64_t p_offset = b_offset + relation_elements;
+    // Materialization overwrites B with P; backward reconstructs B.
+    const int64_t p_offset = b_offset;
     const int64_t l_offset = p_offset + relation_elements;
     const int64_t z_offset = l_offset + matrix_elements;
     const int64_t coordinates_offset = z_offset + compact_elements;
@@ -105,9 +107,31 @@ inline TrainingTapeLayout training_tape_layout(FastPathShape shape) {
     };
 }
 
-// Generic inference omits the training-only P section. It retains compact
-// coordinates because the TC16 dynamic-core product and LU factorization run
-// in separate kernels.
+// Share rotation arithmetic between forward and backward B reconstruction.
+template <typename scalar_t, int rank>
+__device__ __forceinline__ float2 generic_rotated_relation_from_phase(
+    const scalar_t* projected,
+    const __half2* phases,
+    int64_t batch,
+    int64_t head,
+    int64_t token,
+    int pair,
+    int64_t length,
+    int64_t projected_width,
+    int64_t phase_batch_stride,
+    float inverse_length_sqrt) {
+    const int even_rank = 2 * pair;
+    const int64_t relation_base =
+        (batch * length + token) * projected_width + head * rank;
+    const float even = static_cast<float>(projected[relation_base + even_rank]);
+    const float odd = static_cast<float>(projected[relation_base + even_rank + 1]);
+    const float2 phase = __half22float2(phases[
+        batch * phase_batch_stride + token * (rank / 2) + pair]);
+    return make_float2(
+        (even * phase.x - odd * phase.y) * inverse_length_sqrt,
+        (even * phase.y + odd * phase.x) * inverse_length_sqrt);
+}
+
 struct ForwardWorkspaceLayout {
     int64_t b_offset;
     int64_t l_offset;
@@ -179,8 +203,8 @@ inline FastPathShape validate_fast_inputs(
     TORCH_CHECK(projected.dim() == 3,
                 "projected must have shape [B, N, H*R + D], got ", projected.sizes());
     TORCH_CHECK(
-        projected.scalar_type() == at::kFloat,
-        "projected must use float32 under the strict TC16/FP32 CUDA contract, got ",
+        projected.scalar_type() == at::kBFloat16,
+        "projected must use bfloat16 under the mixed precision CUDA contract, got ",
         projected.scalar_type());
 
     TORCH_CHECK(core_base_raw.is_contiguous(), "core_base_raw must be contiguous");
@@ -258,7 +282,6 @@ inline int supported_sm() {
         "; load the matching strict artifact");
 
     switch (capability) {
-        case 750:
         case 800:
         case 860:
         case 870:
@@ -271,8 +294,8 @@ inline int supported_sm() {
             return 1200;
         default:
             TORCH_CHECK(false,
-                        "the LSSO CUDA fast path supports known Turing-and-newer "
-                        "architectures (SM75, SM80, SM86, SM87, SM89, SM90, SM100, SM120); "
+                        "the LSSO CUDA fast path supports known Ampere-and-newer "
+                        "architectures (SM80, SM86, SM87, SM89, SM90, SM100, SM120); "
                         "got SM", properties.major, ".", properties.minor);
     }
 }

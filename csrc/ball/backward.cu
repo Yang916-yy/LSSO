@@ -9,6 +9,7 @@
 #include <cusolverdx/detail/shared_memory.hpp>
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cmath>
@@ -59,11 +60,11 @@ __device__ __forceinline__ void reduce_sum(float* values) {
 
 constexpr int kGenericVjpTokenTile = 64;
 
-template <int rank>
+template <int rank, int token_rows = kRhsTile>
 struct GenericBackwardMathDx {
     using Token = decltype(
-        cublasdx::Size<kRhsTile, rank, kRhsTile>() +
-        cublasdx::Precision<__half, __half, float>() +
+        cublasdx::Size<token_rows, rank, kRhsTile>() +
+        cublasdx::Precision<__nv_bfloat16, __nv_bfloat16, float>() +
         cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
@@ -78,7 +79,7 @@ struct GenericBackwardMathDx {
 
     using Compact = decltype(
         cublasdx::Size<rank, rank, kRhsTile>() +
-        cublasdx::Precision<__half, __half, float>() +
+        cublasdx::Precision<__nv_bfloat16, __nv_bfloat16, float>() +
         cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
@@ -93,7 +94,7 @@ struct GenericBackwardMathDx {
 
     using Content = decltype(
         cublasdx::Size<kRhsTile, kRhsTile, rank>() +
-        cublasdx::Precision<__half, __half, float>() +
+        cublasdx::Precision<__nv_bfloat16, __nv_bfloat16, float>() +
         cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
@@ -107,8 +108,8 @@ struct GenericBackwardMathDx {
         cublasdx::SM<kCompiledSm>());
 
     using CoreContent = decltype(
-        cublasdx::Size<kRhsTile, rank, rank>() +
-        cublasdx::Precision<__half, __half, float>() +
+        cublasdx::Size<token_rows, rank, rank>() +
+        cublasdx::Precision<__nv_bfloat16, __nv_bfloat16, float>() +
         cublasdx::Alignment<16, 16, 16>() +
         cublasdx::Type<cublasdx::type::real>() +
         cublasdx::Function<cublasdx::function::MM>() +
@@ -181,9 +182,9 @@ constexpr size_t generic_frame_compact_shared_bytes() {
     constexpr size_t c_elements = cublasdx::cosize(Compact::get_layout_smem_c());
     size_t offset = 0;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * a_elements;
+    offset += sizeof(__nv_bfloat16) * a_elements;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * b_elements;
+    offset += sizeof(__nv_bfloat16) * b_elements;
     offset = align_shared_offset(offset, 16);
     offset += sizeof(float) * c_elements;
     return offset;
@@ -197,9 +198,9 @@ constexpr size_t generic_content_vjp_shared_bytes() {
     constexpr size_t c_elements = cublasdx::cosize(Content::get_layout_smem_c());
     size_t offset = 0;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * a_elements;
+    offset += sizeof(__nv_bfloat16) * a_elements;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * b_elements;
+    offset += sizeof(__nv_bfloat16) * b_elements;
     offset = align_shared_offset(offset, 16);
     offset += sizeof(float) * c_elements;
     return offset;
@@ -213,13 +214,13 @@ constexpr size_t generic_core_content_vjp_shared_bytes() {
     constexpr size_t c_elements = cublasdx::cosize(CoreContent::get_layout_smem_c());
     size_t offset = 0;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * a_elements;
+    offset += sizeof(__nv_bfloat16) * a_elements;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * b_elements;
+    offset += sizeof(__nv_bfloat16) * b_elements;
     offset = align_shared_offset(offset, 16);
     offset += sizeof(float) * c_elements;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * rank * rank;
+    offset += sizeof(__nv_bfloat16) * rank * rank;
     return offset;
 }
 
@@ -237,8 +238,11 @@ constexpr size_t generic_frame_vjp_shared_bytes() {
 // panel form is algebraically identical: D_B = D_P L^{-1}, then D_B += 2 B C.
 template <int rank>
 struct PanelRelationVjpMathDx {
+    // Wider local panels amortize GEMM/TRSM setup. At rank 64 the wider
+    // panels lose throughput in measurements, so keep 32-token panels.
+    static constexpr int kTokenPanel = rank == 64 ? kRhsTile : 64;
     using Trsm = decltype(
-        cusolverdx::Size<kRhsTile, rank>() +
+        cusolverdx::Size<kTokenPanel, rank>() +
         cusolverdx::Precision<float>() +
         cusolverdx::Type<cusolverdx::type::real>() +
         cusolverdx::Function<cusolverdx::function::trsm>() +
@@ -254,7 +258,8 @@ struct PanelRelationVjpMathDx {
         cusolverdx::BatchesPerBlock<1>() +
         cusolverdx::SM<kCompiledSm>());
 
-    using Correction = typename GenericBackwardMathDx<rank>::CoreContent;
+    using Token = typename GenericBackwardMathDx<rank, kTokenPanel>::Token;
+    using Correction = typename GenericBackwardMathDx<rank, kTokenPanel>::CoreContent;
 };
 
 template <int rank>
@@ -266,9 +271,9 @@ constexpr size_t panel_relation_vjp_shared_bytes() {
     constexpr size_t c_elements = cublasdx::cosize(Correction::get_layout_smem_c());
     size_t offset = Trsm::shared_memory_size;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * a_elements;
+    offset += sizeof(__nv_bfloat16) * a_elements;
     offset = align_shared_offset(offset, 16);
-    offset += sizeof(__half) * b_elements;
+    offset += sizeof(__nv_bfloat16) * b_elements;
     offset = align_shared_offset(offset, 16);
     offset += sizeof(float) * c_elements;
     return offset;
@@ -287,8 +292,8 @@ void validate_grad_output(
     FastPathShape shape) {
     check_same_cuda_device(grad_output, projected, "grad_output");
     TORCH_CHECK(grad_output.is_contiguous(), "grad_output must be contiguous");
-    TORCH_CHECK(grad_output.scalar_type() == at::kFloat,
-                "grad_output must use float32");
+    TORCH_CHECK(grad_output.scalar_type() == at::kBFloat16,
+                "grad_output must use bfloat16");
     TORCH_CHECK(
         grad_output.sizes() == at::IntArrayRef({shape.batch, shape.length, shape.dim}),
         "grad_output must have shape [B, N, D], got ", grad_output.sizes());
@@ -314,12 +319,16 @@ void validate_training_tape(
         "pivots has an incompatible shape ", pivots.sizes());
 }
 
-template <typename scalar_t, int rank>
-__global__ __launch_bounds__(kThreads) void generic_compact_partials_kernel(
-    const float* __restrict__ grad_output,
+// Both statistics are the same FP32 contraction P_tile^T V_tile.  Reuse
+// cuBLASDx's shared-memory GEMM (as in the forward frame Gram), loading each
+// frame tile once and each content/gradient panel once.  No BF16 rounding is
+// introduced: the reconstructed content statistic protects the eta VJP.
+template <typename scalar_t, int rank, bool gradient_statistic>
+__global__ __launch_bounds__(kThreads) void generic_statistic_partials_kernel(
+    const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ projected,
     const float* __restrict__ tape,
-    float* __restrict__ partial_d_t,
+    float* __restrict__ partial,
     float* __restrict__ partial_eta,
     TrainingTapeLayout tape_layout,
     int64_t batch_count,
@@ -330,56 +339,89 @@ __global__ __launch_bounds__(kThreads) void generic_compact_partials_kernel(
     int64_t tile_count) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     const int64_t tile_index = static_cast<int64_t>(blockIdx.y);
-    const int64_t system_count = batch_count * heads;
-    if (system_index >= system_count) {
+    const int64_t token_start = tile_index * kGenericVjpTokenTile;
+    if (system_index >= batch_count * heads || token_start >= length) {
         return;
     }
     const int64_t batch = system_index / heads;
     const int64_t head = system_index - batch * heads;
-    const int64_t token_start = tile_index * kGenericVjpTokenTile;
-    if (token_start >= length) {
-        return;
-    }
-    const int token_count = static_cast<int>(
-        length - token_start < kGenericVjpTokenTile ? length - token_start : kGenericVjpTokenTile);
     const int64_t projected_width = heads * rank + dim;
-    const float* system_tape = tape + system_index * tape_layout.stride;
-    const float* frame = system_tape + tape_layout.p_offset;
-    float* output = partial_d_t +
-        (system_index * tile_count + tile_index) * rank * head_dim;
-
-    for (int64_t linear = threadIdx.x; linear < rank * head_dim; linear += blockDim.x) {
-        const int row = static_cast<int>(linear / head_dim);
-        const int feature = static_cast<int>(linear - row * head_dim);
-        float value = 0.0f;
-        for (int local_token = 0; local_token < token_count; ++local_token) {
-            const int64_t token = token_start + local_token;
-            value += frame[token * rank + row] * grad_output[
-                (batch * length + token) * dim + head * head_dim + feature];
-        }
-        output[linear] = value;
-    }
-
+    const float* frame =
+        tape + system_index * tape_layout.stride + tape_layout.p_offset;
+    using Gemm = decltype(
+        cublasdx::Size<rank, kRhsTile, kGenericVjpTokenTile>() +
+        cublasdx::Precision<float, float, float>() +
+        cublasdx::Alignment<16, 16, 16>() +
+        cublasdx::Type<cublasdx::type::real>() +
+        cublasdx::Function<cublasdx::function::MM>() +
+        cublasdx::Arrangement<
+            cublasdx::col_major,
+            cublasdx::row_major,
+            cublasdx::row_major>() +
+        cublasdx::Block() +
+        cublasdx::BlockDim<kThreads>() +
+        cublasdx::StaticBlockDim() +
+        cublasdx::SM<kCompiledSm>());
+    __shared__ __align__(16) float a_storage[cublasdx::cosize(Gemm::get_layout_smem_a())];
+    __shared__ __align__(16) float b_storage[cublasdx::cosize(Gemm::get_layout_smem_b())];
+    __shared__ __align__(16) float c_storage[cublasdx::cosize(Gemm::get_layout_smem_c())];
     __shared__ float reduction[kThreads];
-    float eta_local = 0.0f;
-    for (int64_t linear = threadIdx.x;
-         linear < static_cast<int64_t>(token_count) * head_dim;
-         linear += blockDim.x) {
-        const int local_token = static_cast<int>(linear / head_dim);
-        const int feature = static_cast<int>(linear - local_token * head_dim);
-        const int64_t token = token_start + local_token;
-        eta_local += grad_output[
-            (batch * length + token) * dim + head * head_dim + feature] *
-            load_scalar(
-                projected,
-                (batch * length + token) * projected_width + heads * rank +
-                    head * head_dim + feature);
+    auto a = cublasdx::make_tensor(a_storage, Gemm::get_layout_smem_a());
+    auto b = cublasdx::make_tensor(b_storage, Gemm::get_layout_smem_b());
+    auto c = cublasdx::make_tensor(c_storage, Gemm::get_layout_smem_c());
+    for (int i = threadIdx.x; i < rank * kGenericVjpTokenTile; i += blockDim.x) {
+        const int t = i / rank;
+        const int r = i % rank;
+        a(r, t) = token_start + t < length
+            ? frame[(token_start + t) * rank + r]
+            : 0.0f;
     }
-    reduction[threadIdx.x] = eta_local;
-    __syncthreads();
-    reduce_sum(reduction);
-    if (threadIdx.x == 0) {
-        partial_eta[system_index * tile_count + tile_index] = reduction[0];
+    float eta_local = 0.0f;
+    for (int64_t start = 0; start < head_dim; start += kRhsTile) {
+        for (int i = threadIdx.x; i < kGenericVjpTokenTile * kRhsTile; i += blockDim.x) {
+            const int t = i / kRhsTile;
+            const int f = i % kRhsTile;
+            const int64_t token = token_start + t;
+            const int64_t feature = start + f;
+            float value = 0.0f;
+            if (token < length && feature < head_dim) {
+                const int64_t content_index =
+                    (batch * length + token) * projected_width +
+                    heads * rank + head * head_dim + feature;
+                if constexpr (gradient_statistic) {
+                    value = load_scalar(grad_output,
+                        (batch * length + token) * dim + head * head_dim + feature);
+                    eta_local += value * load_scalar(projected, content_index);
+                } else {
+                    value = load_scalar(projected, content_index);
+                }
+            }
+            b(t, f) = value;
+        }
+        for (int i = threadIdx.x; i < cublasdx::cosize(Gemm::get_layout_smem_c());
+             i += blockDim.x) {
+            c_storage[i] = 0.0f;
+        }
+        __syncthreads();
+        Gemm().execute(1.0f, a, b, 0.0f, c);
+        __syncthreads();
+        for (int i = threadIdx.x; i < rank * kRhsTile; i += blockDim.x) {
+            const int r = i / kRhsTile;
+            const int f = i % kRhsTile;
+            if (start + f < head_dim) {
+                partial[((system_index * tile_count + tile_index) * rank + r) *
+                        head_dim + start + f] = c(r, f);
+            }
+        }
+        __syncthreads();
+    }
+    if constexpr (gradient_statistic) {
+        reduction[threadIdx.x] = eta_local;
+        __syncthreads();
+        reduce_sum(reduction);
+        if (threadIdx.x == 0) {
+            partial_eta[system_index * tile_count + tile_index] = reduction[0];
+        }
     }
 }
 
@@ -433,52 +475,6 @@ GenericPartialReductionLaunch generic_partial_reduction_launch(
         std::min(maximum_slices, requested_slices),
         kShardedThreads,
     };
-}
-
-template <int rank>
-__global__ __launch_bounds__(kThreads) void generic_compact_state_partials_kernel(
-    const float* __restrict__ projected,
-    const float* __restrict__ tape,
-    float* __restrict__ partial_compact_state,
-    TrainingTapeLayout tape_layout,
-    int64_t batch_count,
-    int64_t length,
-    int64_t heads,
-    int64_t dim,
-    int64_t head_dim,
-    int64_t tile_count) {
-    const int64_t system_index = static_cast<int64_t>(blockIdx.x);
-    const int64_t tile_index = static_cast<int64_t>(blockIdx.y);
-    const int64_t system_count = batch_count * heads;
-    if (system_index >= system_count) {
-        return;
-    }
-    const int64_t batch = system_index / heads;
-    const int64_t head = system_index - batch * heads;
-    const int64_t token_start = tile_index * kGenericVjpTokenTile;
-    if (token_start >= length) {
-        return;
-    }
-    const int token_count = static_cast<int>(
-        length - token_start < kGenericVjpTokenTile ? length - token_start : kGenericVjpTokenTile);
-    const int64_t projected_width = heads * rank + dim;
-    const float* system_tape = tape + system_index * tape_layout.stride;
-    const float* frame = system_tape + tape_layout.p_offset;
-    float* output = partial_compact_state +
-        (system_index * tile_count + tile_index) * rank * head_dim;
-
-    for (int64_t linear = threadIdx.x; linear < rank * head_dim; linear += blockDim.x) {
-        const int row = static_cast<int>(linear / head_dim);
-        const int feature = static_cast<int>(linear - row * head_dim);
-        float value = 0.0f;
-        for (int local_token = 0; local_token < token_count; ++local_token) {
-            const int64_t token = token_start + local_token;
-            value += frame[token * rank + row] * projected[
-                (batch * length + token) * projected_width + heads * rank +
-                head * head_dim + feature];
-        }
-        output[linear] = value;
-    }
 }
 
 template <int rank>
@@ -702,22 +698,22 @@ __global__ __launch_bounds__(kThreads) void generic_core_content_vjp_kernel(
     constexpr size_t c_elements = cublasdx::cosize(CoreContent::get_layout_smem_c());
     extern __shared__ __align__(16) unsigned char shared_raw[];
     SharedCursor shared(shared_raw);
-    __half* a_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * a_elements, 16));
-    __half* b_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * b_elements, 16));
+    __nv_bfloat16* a_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * a_elements, 16));
+    __nv_bfloat16* b_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * b_elements, 16));
     float* gemm_output = reinterpret_cast<float*>(
         shared.take_bytes(sizeof(float) * c_elements, 16));
-    __half* scaled_adjoint = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * rank * rank, 16));
+    __nv_bfloat16* scaled_adjoint = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * rank * rank, 16));
     auto core_a = cublasdx::make_tensor(a_tile, CoreContent::get_layout_smem_a());
     auto core_b = cublasdx::make_tensor(b_tile, CoreContent::get_layout_smem_b());
     auto core_c = cublasdx::make_tensor(gemm_output, CoreContent::get_layout_smem_c());
 
     // The upstream scale belongs before FP16 conversion to match the canonical
-    // TC16 VJP rounding boundary used by tensor_core_matmul.
+    // BF16 VJP rounding boundary used by tensor_core_matmul.
     for (int linear = threadIdx.x; linear < rank * rank; linear += blockDim.x) {
-        scaled_adjoint[linear] = __float2half_rn(
+        scaled_adjoint[linear] = __float2bfloat16_rn(
             system_raw_adjoint[linear] * inverse_length_sqrt);
     }
     __syncthreads();
@@ -731,7 +727,7 @@ __global__ __launch_bounds__(kThreads) void generic_core_content_vjp_kernel(
             const int feature = linear / rank;
             const int row = linear - feature * rank;
             const int64_t global_feature = feature_start + feature;
-            core_a(feature, row) = __float2half_rn(
+            core_a(feature, row) = __float2bfloat16_rn(
                 global_feature < head_dim
                     ? compact_state[row * head_dim + global_feature]
                     : 0.0f);
@@ -766,7 +762,7 @@ __global__ __launch_bounds__(kThreads) void generic_core_content_vjp_kernel(
             const int feature = linear / rank;
             const int row = linear - feature * rank;
             const int64_t global_feature = feature_start + feature;
-            core_a(feature, row) = __float2half_rn(
+            core_a(feature, row) = __float2bfloat16_rn(
                 global_feature < head_dim
                     ? core_drive_weight[
                           (head * head_dim + global_feature) * rank + row]
@@ -829,10 +825,10 @@ __global__ __launch_bounds__(kThreads) void generic_frame_compact_adjoint_kernel
     constexpr size_t c_elements = cublasdx::cosize(Compact::get_layout_smem_c());
     extern __shared__ __align__(16) unsigned char shared_raw[];
     SharedCursor shared(shared_raw);
-    __half* a_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * a_elements, 16));
-    __half* b_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * b_elements, 16));
+    __nv_bfloat16* a_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * a_elements, 16));
+    __nv_bfloat16* b_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * b_elements, 16));
     float* gemm_output = reinterpret_cast<float*>(
         shared.take_bytes(sizeof(float) * c_elements, 16));
     auto compact_a = cublasdx::make_tensor(a_tile, Compact::get_layout_smem_a());
@@ -855,7 +851,7 @@ __global__ __launch_bounds__(kThreads) void generic_frame_compact_adjoint_kernel
             const int row = linear / kRhsTile;
             const int feature = linear - row * kRhsTile;
             const int64_t global_feature = feature_start + feature;
-            compact_a(row, feature) = __float2half_rn(
+            compact_a(row, feature) = __float2bfloat16_rn(
                 global_feature < head_dim
                     ? 2.0f * equilibrium[row * head_dim + global_feature] -
                         (1.0f + eta) * compact_state[row * head_dim + global_feature]
@@ -866,7 +862,7 @@ __global__ __launch_bounds__(kThreads) void generic_frame_compact_adjoint_kernel
             const int feature = linear / rank;
             const int column = linear - feature * rank;
             const int64_t global_feature = feature_start + feature;
-            compact_b(feature, column) = __float2half_rn(
+            compact_b(feature, column) = __float2bfloat16_rn(
                 global_feature < head_dim
                     ? system_d_t[column * head_dim + global_feature]
                     : 0.0f);
@@ -879,7 +875,7 @@ __global__ __launch_bounds__(kThreads) void generic_frame_compact_adjoint_kernel
             const int row = linear / kRhsTile;
             const int feature = linear - row * kRhsTile;
             const int64_t global_feature = feature_start + feature;
-            compact_a(row, feature) = __float2half_rn(
+            compact_a(row, feature) = __float2bfloat16_rn(
                 global_feature < head_dim
                     ? system_state_adjoint[row * head_dim + global_feature]
                     : 0.0f);
@@ -897,7 +893,7 @@ __global__ __launch_bounds__(kThreads) void generic_frame_compact_adjoint_kernel
                 eta_state_dot +=
                     system_d_t[column * head_dim + global_feature] * compact_value;
             }
-            compact_b(feature, column) = __float2half_rn(compact_value);
+            compact_b(feature, column) = __float2bfloat16_rn(compact_value);
         }
         __syncthreads();
         Compact().execute(-1.0f, compact_a, compact_b, 1.0f, compact_c);
@@ -1000,13 +996,13 @@ __global__ __launch_bounds__(kThreads) void generic_frame_vjp_kernel(
 // shared memory rather than round-tripping [B*H, N, R] FP32 storage.
 template <typename scalar_t, int rank>
 __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
-    const float* __restrict__ grad_output,
+    const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ projected,
     const float* __restrict__ state_adjoint,
     const float* __restrict__ frame_state,
     const float* __restrict__ tape,
     const float* __restrict__ frame_c,
-    const float2* __restrict__ phases,
+    const __half2* __restrict__ phases,
     const float* __restrict__ valid_counts,
     scalar_t* __restrict__ grad_projected,
     TrainingTapeLayout tape_layout,
@@ -1017,7 +1013,8 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
     int64_t head_dim,
     int64_t tile_count,
     int64_t phase_batch_stride) {
-    using Token = typename GenericBackwardMathDx<rank>::Token;
+    constexpr int kRelationPanel = PanelRelationVjpMathDx<rank>::kTokenPanel;
+    using Token = typename PanelRelationVjpMathDx<rank>::Token;
     using Trsm = typename PanelRelationVjpMathDx<rank>::Trsm;
     using Correction = typename PanelRelationVjpMathDx<rank>::Correction;
 
@@ -1036,7 +1033,6 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
     const float* system_state_adjoint = state_adjoint + system_index * rank * head_dim;
     const float* system_frame_state = frame_state + system_index * rank * head_dim;
     const float* system_tape = tape + system_index * tape_layout.stride;
-    const float* b = system_tape + tape_layout.b_offset;
     const float* lower = system_tape + tape_layout.l_offset;
     const float* c = frame_c + system_index * rank * rank;
     const float inverse_scale = 1.0f / system_tape[tape_layout.scale_offset];
@@ -1055,8 +1051,8 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
         cublasdx::cosize(Correction::get_layout_smem_c());
 
     static_assert(
-        token_a_elements * sizeof(__half) <=
-            kRhsTile * Trsm::ldb * sizeof(float));
+        token_a_elements * sizeof(__nv_bfloat16) <=
+            kRelationPanel * Trsm::ldb * sizeof(float));
     static_assert((rank * Trsm::lda * sizeof(float)) % 16 == 0);
     static_assert(token_b_elements <= correction_a_elements);
     static_assert(token_c_elements <= correction_c_elements);
@@ -1068,15 +1064,15 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
         rank * Trsm::lda,
         alignof(float));
     SharedCursor shared(shared_raw + Trsm::shared_memory_size);
-    __half* correction_a = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * correction_a_elements, 16));
-    __half* correction_b = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * correction_b_elements, 16));
+    __nv_bfloat16* correction_a = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * correction_a_elements, 16));
+    __nv_bfloat16* correction_b = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * correction_b_elements, 16));
     float* correction_output = reinterpret_cast<float*>(
         shared.take_bytes(sizeof(float) * correction_c_elements, 16));
 
     auto token_a = cublasdx::make_tensor(
-        reinterpret_cast<__half*>(relation_adjoint), Token::get_layout_smem_a());
+        reinterpret_cast<__nv_bfloat16*>(relation_adjoint), Token::get_layout_smem_a());
     auto token_b = cublasdx::make_tensor(correction_a, Token::get_layout_smem_b());
     auto token_c = cublasdx::make_tensor(correction_output, Token::get_layout_smem_c());
     auto correction_a_tensor = cublasdx::make_tensor(
@@ -1086,26 +1082,26 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
     auto correction_c_tensor = cublasdx::make_tensor(
         correction_output, Correction::get_layout_smem_c());
 
-    for (int token_offset = 0; token_offset < token_count; token_offset += kRhsTile) {
-        const int subtile_count = token_count - token_offset < kRhsTile
+    for (int token_offset = 0; token_offset < token_count; token_offset += kRelationPanel) {
+        const int subtile_count = token_count - token_offset < kRelationPanel
             ? token_count - token_offset
-            : kRhsTile;
+            : kRelationPanel;
         for (int linear = threadIdx.x; linear < token_c_elements; linear += blockDim.x) {
             correction_output[linear] = 0.0f;
         }
         __syncthreads();
         for (int64_t feature_start = 0; feature_start < head_dim;
              feature_start += kRhsTile) {
-            for (int linear = threadIdx.x; linear < kRhsTile * kRhsTile;
+            for (int linear = threadIdx.x; linear < kRelationPanel * kRhsTile;
                  linear += blockDim.x) {
                 const int row = linear / kRhsTile;
                 const int column = linear - row * kRhsTile;
                 const int64_t token = token_start + token_offset + row;
                 const int64_t feature = feature_start + column;
-                token_a(row, column) = __float2half_rn(
+                token_a(row, column) = __float2bfloat16_rn(
                     row < subtile_count && feature < head_dim
-                        ? grad_output[
-                              (batch * length + token) * dim + head * head_dim + feature]
+                        ? load_scalar(grad_output,
+                              (batch * length + token) * dim + head * head_dim + feature)
                         : 0.0f);
             }
             for (int linear = threadIdx.x; linear < kRhsTile * rank;
@@ -1113,7 +1109,7 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
                 const int feature = linear / rank;
                 const int row = linear - feature * rank;
                 const int64_t global_feature = feature_start + feature;
-                token_b(feature, row) = __float2half_rn(
+                token_b(feature, row) = __float2bfloat16_rn(
                     global_feature < head_dim
                         ? system_frame_state[row * head_dim + global_feature]
                         : 0.0f);
@@ -1121,13 +1117,13 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
             __syncthreads();
             Token().execute(1.0f, token_a, token_b, 1.0f, token_c);
             __syncthreads();
-            for (int linear = threadIdx.x; linear < kRhsTile * kRhsTile;
+            for (int linear = threadIdx.x; linear < kRelationPanel * kRhsTile;
                  linear += blockDim.x) {
                 const int row = linear / kRhsTile;
                 const int column = linear - row * kRhsTile;
                 const int64_t token = token_start + token_offset + row;
                 const int64_t feature = feature_start + column;
-                token_a(row, column) = __float2half_rn(
+                token_a(row, column) = __float2bfloat16_rn(
                     row < subtile_count && feature < head_dim
                         ? load_scalar(
                               projected,
@@ -1140,7 +1136,7 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
                 const int feature = linear / rank;
                 const int row = linear - feature * rank;
                 const int64_t global_feature = feature_start + feature;
-                token_b(feature, row) = __float2half_rn(
+                token_b(feature, row) = __float2bfloat16_rn(
                     global_feature < head_dim
                         ? system_state_adjoint[row * head_dim + global_feature]
                         : 0.0f);
@@ -1150,7 +1146,7 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
             __syncthreads();
         }
 
-        for (int linear = threadIdx.x; linear < kRhsTile * rank;
+        for (int linear = threadIdx.x; linear < kRelationPanel * rank;
              linear += blockDim.x) {
             const int row = linear / rank;
             const int column = linear - row * rank;
@@ -1164,16 +1160,22 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
             const int row = linear / rank;
             const int column = linear - row * rank;
             lower_tile[row * Trsm::lda + column] = lower[linear];
-            correction_b_tensor(row, column) = __float2half_rn(c[linear]);
+            correction_b_tensor(row, column) = __float2bfloat16_rn(c[linear]);
         }
-        for (int linear = threadIdx.x; linear < kRhsTile * rank;
+        for (int linear = threadIdx.x; linear < kRelationPanel * (rank / 2);
              linear += blockDim.x) {
-            const int row = linear / rank;
-            const int column = linear - row * rank;
-            correction_a_tensor(row, column) = __float2half_rn(
-                row < subtile_count
-                    ? b[(token_start + token_offset + row) * rank + column]
-                    : 0.0f);
+            const int row = linear / (rank / 2);
+            const int pair = linear - row * (rank / 2);
+            float2 value = make_float2(0.0f, 0.0f);
+            if (row < subtile_count) {
+                value = generic_rotated_relation_from_phase<scalar_t, rank>(
+                    projected, phases, batch, head, token_start + token_offset + row,
+                    pair, length, projected_width, phase_batch_stride, inverse_length_sqrt);
+                value.x *= inverse_scale;
+                value.y *= inverse_scale;
+            }
+            correction_a_tensor(row, 2 * pair) = __float2bfloat16_rn(value.x);
+            correction_a_tensor(row, 2 * pair + 1) = __float2bfloat16_rn(value.y);
         }
         for (int linear = threadIdx.x; linear < correction_c_elements;
              linear += blockDim.x) {
@@ -1202,8 +1204,8 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
             const float d_odd = (
                 relation_adjoint[local_token * Trsm::ldb + even_rank + 1] +
                 correction_c_tensor(local_token, even_rank + 1)) * inverse_scale;
-            const float2 phase = phases[
-                batch * phase_batch_stride + token * (rank / 2) + pair];
+            const float2 phase = __half22float2(phases[
+                batch * phase_batch_stride + token * (rank / 2) + pair]);
             const int64_t relation_base =
                 (batch * length + token) * projected_width + head * rank;
             store_scalar(
@@ -1221,7 +1223,7 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
 
 template <typename scalar_t, int rank>
 __global__ __launch_bounds__(kThreads) void generic_content_vjp_kernel(
-    const float* __restrict__ grad_output,
+    const scalar_t* __restrict__ grad_output,
     const float* __restrict__ tape,
     const float* __restrict__ state_adjoint,
     const float* __restrict__ eta_raw,
@@ -1255,10 +1257,10 @@ __global__ __launch_bounds__(kThreads) void generic_content_vjp_kernel(
     constexpr size_t c_elements = cublasdx::cosize(Content::get_layout_smem_c());
     extern __shared__ __align__(16) unsigned char shared_raw[];
     SharedCursor shared(shared_raw);
-    __half* a_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * a_elements, 16));
-    __half* b_tile = reinterpret_cast<__half*>(
-        shared.take_bytes(sizeof(__half) * b_elements, 16));
+    __nv_bfloat16* a_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * a_elements, 16));
+    __nv_bfloat16* b_tile = reinterpret_cast<__nv_bfloat16*>(
+        shared.take_bytes(sizeof(__nv_bfloat16) * b_elements, 16));
     float* gemm_output = reinterpret_cast<float*>(
         shared.take_bytes(sizeof(float) * c_elements, 16));
     auto content_a = cublasdx::make_tensor(a_tile, Content::get_layout_smem_a());
@@ -1279,7 +1281,7 @@ __global__ __launch_bounds__(kThreads) void generic_content_vjp_kernel(
                 const int row = linear / rank;
                 const int column = linear - row * rank;
                 const int64_t token = token_start + token_offset + row;
-                content_a(row, column) = __float2half_rn(
+                content_a(row, column) = __float2bfloat16_rn(
                     row < subtile_count ? frame[token * rank + column] : 0.0f);
             }
             for (int linear = threadIdx.x; linear < rank * kRhsTile;
@@ -1287,7 +1289,7 @@ __global__ __launch_bounds__(kThreads) void generic_content_vjp_kernel(
                 const int row = linear / kRhsTile;
                 const int column = linear - row * kRhsTile;
                 const int64_t feature = feature_start + column;
-                content_b(row, column) = __float2half_rn(
+                content_b(row, column) = __float2bfloat16_rn(
                     feature < head_dim
                         ? system_state_adjoint[row * head_dim + feature]
                         : 0.0f);
@@ -1302,8 +1304,8 @@ __global__ __launch_bounds__(kThreads) void generic_content_vjp_kernel(
                 const int64_t token = token_start + token_offset + row;
                 const int64_t feature = feature_start + column;
                 if (row < subtile_count && feature < head_dim) {
-                    const float value = eta * grad_output[
-                        (batch * length + token) * dim + head * head_dim + feature] +
+                    const float value = eta * load_scalar(grad_output,
+                        (batch * length + token) * dim + head * head_dim + feature) +
                         content_c(row, column);
                     store_scalar(
                         grad_projected,
@@ -1429,8 +1431,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
     const dim3 reduction_grid(
         static_cast<unsigned int>(system_count),
         static_cast<unsigned int>(reduction_launch.output_slices));
-    generic_compact_partials_kernel<scalar_t, rank><<<token_grid, kThreads, 0, stream>>>(
-        grad_output.data_ptr<float>(),
+    generic_statistic_partials_kernel<scalar_t, rank, true><<<token_grid, kThreads, 0, stream>>>(
+        grad_output.data_ptr<scalar_t>(),
         projected.data_ptr<scalar_t>(),
         tape.data_ptr<float>(),
         partial_d_t.data_ptr<float>(),
@@ -1451,10 +1453,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         token_tiles,
         shape.head_dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    generic_compact_state_partials_kernel<rank><<<token_grid, kThreads, 0, stream>>>(
-        projected.data_ptr<float>(),
+    generic_statistic_partials_kernel<scalar_t, rank, false><<<token_grid, kThreads, 0, stream>>>(
+        nullptr,
+        projected.data_ptr<scalar_t>(),
         tape.data_ptr<float>(),
         partial_d_t.data_ptr<float>(),
+        nullptr,
         tape_layout,
         shape.batch,
         shape.length,
@@ -1549,7 +1553,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
     constexpr size_t content_vjp_shared_bytes = generic_content_vjp_shared_bytes<rank>();
     generic_content_vjp_kernel<scalar_t, rank><<<
         token_grid, kThreads, content_vjp_shared_bytes, stream>>>(
-        grad_output.data_ptr<float>(),
+        grad_output.data_ptr<scalar_t>(),
         tape.data_ptr<float>(),
         compact_state_adjoint.data_ptr<float>(),
         eta_raw.data_ptr<float>(),
@@ -1565,13 +1569,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         fused_frame_relation_vjp_shared_bytes<rank>();
     fused_frame_relation_vjp_kernel<scalar_t, rank><<<
         token_grid, kThreads, frame_relation_shared_bytes, stream>>>(
-        grad_output.data_ptr<float>(),
+        grad_output.data_ptr<scalar_t>(),
         projected.data_ptr<scalar_t>(),
         compact_state_adjoint.data_ptr<float>(),
         equilibrium_adjoint.data_ptr<float>(),
         tape.data_ptr<float>(),
         frame_c.data_ptr<float>(),
-        reinterpret_cast<const float2*>(phases.data_ptr<float>()),
+        reinterpret_cast<const __half2*>(phases.data_ptr<at::Half>()),
         valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
         grad_projected.data_ptr<scalar_t>(),
         tape_layout,
@@ -1649,7 +1653,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> backward_cuda(
     c10::cuda::CUDAGuard guard(projected.device());
     (void)supported_sm();
 
-    return dispatch_expanded_backward<float>(
+    return dispatch_expanded_backward<at::BFloat16>(
         grad_output,
         projected,
         core_base_raw,

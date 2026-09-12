@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DIST_NAME = "lsso_cuda_runtime"
 PACKAGE_NAME = "lsso_cuda_runtime"
 PLATFORM_TAG = "linux_x86_64"
-SUPPORTED_ARCHITECTURES = (75, 80, 86, 87, 89, 90, 100, 120)
+SUPPORTED_ARCHITECTURES = (80, 86, 87, 89, 90, 100, 120)
 
 
 def _normalized(value: str) -> str:

@@ -9,8 +9,8 @@ import torch
 
 
 _LOAD_LOCK = Lock()
-_SUPPORTED_ARCHITECTURES = frozenset((75, 80, 86, 87, 89, 90, 100, 120))
-_NATIVE_CONTRACT_VERSION = 6
+_SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
+_NATIVE_CONTRACT_VERSION = 8
 _RUNTIME_PACKAGE = "lsso_cuda_runtime"
 _LOADED_ARCHITECTURE: int | None = None
 
@@ -104,7 +104,7 @@ def _device_architecture(device: torch.device | int | None = None) -> int:
         architecture = 120
     if architecture not in _SUPPORTED_ARCHITECTURES:
         raise RuntimeError(
-            "the LSSO CUDA fast path supports SM75, SM80, SM86, SM87, SM89, "
+            "the LSSO CUDA fast path supports SM80, SM86, SM87, SM89, "
             f"SM90, SM100, and SM120; got SM{major}{minor}"
         )
     return architecture
@@ -267,7 +267,7 @@ class _FastMix(torch.autograd.Function):
         valid_counts = saved[index] if ctx.has_valid_counts else None
 
         gradients = torch.ops.lsso_equilibrium.backward(
-            grad_output.float().contiguous(),
+            grad_output.contiguous(),
             projected,
             core_base_raw,
             core_drive_weight,

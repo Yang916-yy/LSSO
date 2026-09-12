@@ -21,10 +21,10 @@ set(
     "Directory for the built LSSO CUDA extension"
 )
 
-set(_lsso_supported_architectures 75 80 86 87 89 90 100 120)
+set(_lsso_supported_architectures 80 86 87 89 90 100 120)
 if(NOT LSSO_CUDA_ARCHITECTURE IN_LIST _lsso_supported_architectures)
     message(FATAL_ERROR
-        "LSSO supports only Turing-and-newer CUDA architectures: "
+        "LSSO supports only Ampere-and-newer CUDA architectures: "
         "${_lsso_supported_architectures}. Got ${LSSO_CUDA_ARCHITECTURE}."
     )
 endif()
