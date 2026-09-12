@@ -2,11 +2,13 @@
 
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb,amsthm,mathtools}
-\usepackage{booktabs}
+\usepackage{booktabs,array}
 \usepackage{float}
 \usepackage{graphicx}
 \usepackage{microtype}
 \usepackage[hidelinks]{hyperref}
+\hypersetup{pdftitle={LSSO: Solved Contextual Operators for Bidirectional Sequence Modeling},
+  pdfauthor={Zhaoyang Wang}}
 
 \newtheorem{theorem}{Theorem}[section]
 \newtheorem{proposition}[theorem]{Proposition}
@@ -26,7 +28,7 @@
 \newcommand{\triu}{\operatorname{triu}}
 \newcommand{\qf}{\operatorname{qf}}
 
-\title{LSSO: Solved Contextual Adaptation with Certifiable Global Mixing}
+\title{LSSO: Solved Contextual Operators for Bidirectional Sequence Modeling}
 \author{Zhaoyang Wang\\\texttt{zhaoy@uir.edu.cn}}
 \date{}
 
@@ -34,120 +36,123 @@
 \maketitle
 
 \begin{abstract}
-Context-conditioned sequence layers commonly express adaptation through
-finite update rules or recurrent state evolution.  We introduce LSSO, a
-global mixer that instead turns contextual adaptation into a solved operator:
-one per-sample statistic generates a compact strictly accretive system, and a
-direct solve returns its equilibrium.  A QR soft frame lifts the compact
-operator to token space, while a learned scalar complement controls the
-unrepresented subspace.  The resulting chart covers the entire open real
-matrix ball, including nonsymmetric and nonnormal contractions.  Every
-realized token mixer is a strict contraction whose exact gain is computable
-from a matrix of size at most $r\times r$; a per-sample monotonicity margin also
-bounds the equilibrium, contextual sensitivity, and implicit adjoint.  LSSO
-therefore removes unrolling, inner learning rates, and solver tolerances from
-the layer.  At fixed compact rank, both arithmetic and activation storage are
-linear in sequence length.  We provide an algebraically equivalent native CUDA
-path with an analytic backward that reuses the compact factors.  In a matched
-eight-task
-GenomicBenchmarks comparison against multi-head attention and three
-representative linear-attention baselines, LSSO leads on seven tasks and raises
-unweighted macro accuracy from the strongest alternative's $75.57$ to $78.53$.
-Across four Long Range Arena tasks with sequences up to $4096$ positions, LSSO
-attains the highest four-task average among the displayed general-purpose
-global mixers.
+Bidirectional sequence models can use the entire context to construct a compact
+state for global interaction.  Recent extensions of recurrent memory and
+test-time training make this an increasingly useful alternative to dense
+attention, but leave open how to jointly design the state, its induced mixing,
+and its computational realization.  We introduce LSSO, a contextual operator
+built around one compact direct solve per sample and head.  A full-context
+cross-moment generates a strictly accretive system; its solved state is lifted
+to tokens through a QR soft frame and a learned scalar complement.  The compact
+core covers every real strict contraction, including nonsymmetric and nonnormal
+maps, while the resulting token mixer has an exact gain computable in compact
+space.  These guarantees concern the realized mixing operator, rather than the
+end-to-end input-dependent network.  At fixed rank, arithmetic and activation
+storage scale linearly with sequence length.  An algebraically equivalent CUDA
+implementation evaluates the solve and its analytic backward without a dense
+token map.  In a matched three-seed comparison on eight GenomicBenchmarks tasks,
+LSSO obtains the highest mean accuracy on seven tasks and improves macro accuracy
+from the strongest alternative's $75.57$ to $78.53$.  Additional long-sequence
+results, trained-state diagnostics, and complete-mixer timings characterize the
+scope and cost of this full-context design.
 \end{abstract}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{operator_overview.pdf}
+\caption{\textbf{Graphical abstract: full context, compact solve, global mixing.}
+All valid tokens jointly define a compact system.  One direct solve per sample
+and head produces a shared state whose action reaches every output token.
+At fixed rank, the construction scales linearly with sequence length and admits
+an exact realized-gain formula.  This formula describes the mixer after freezing
+its sample-conditioned quantities, not the end-to-end network Jacobian.
+The dashed path generates the system from the context statistic; the solid
+path evaluates it.  Global readout uses the shared frame, context statistic,
+and scalar complement.  Tensor shapes are schematic; no experimental results
+are depicted.}
+\label{fig:overview}
+\end{figure}
 
 \section{Introduction}
 \label{sec:introduction}
 
-Global interaction is central to sequence and vision encoders, yet materializing
-all token pairs incurs quadratic cost.  Efficient alternatives compress the
-sequence into landmarks or latent slots, replace attention by structured
-recurrence, or maintain an input-selective state
-\cite{wang2020linformer,lee2019settransformer,ma2021luna,
-jaegle2021perceiver,gu2022s4,gu2024mamba,dao2024mamba2}.  A second line of
-work interprets sequence processing itself as learning: fast-weight models and
-test-time training adapt a compact inner state to the current context
-\cite{schlag2021fastweights,sun2025ttt}.  Together these developments suggest
-that the central object need not be a dense attention matrix; it can be a
-small state constructed from the sample.
+Image encoders and full-sequence classifiers receive all their tokens before
+producing a prediction.  Each position can therefore draw on the entire sample,
+which makes global interaction a natural building block.  Dense attention
+provides this interaction through token pairs, but its quadratic arithmetic
+becomes costly as the sequence grows.  Compact-state alternatives offer another
+route: gather contextual information into a smaller representation and use it
+to transform every token \cite{lee2019settransformer,ma2021luna,jaegle2021perceiver}.
+The design of that representation determines both the global interaction and
+its computational cost.
 
-LSSO builds on two complementary advances.  XCiT shows that cross-covariance
-statistics can define an efficient, input-dependent global operator shared
-across tokens \cite{ali2021xcit}.  Direct Cayley parameterization provides a
-complete differentiable map from free coordinates to static
-Lipschitz-bounded network weights \cite{wang2023direct}.  LSSO takes the next
-step: it turns static contractive weights into a compact Cayley token mixer
-generated anew from every input, solved exactly, and certified on the realized
-sample.
+Recurrent linear attention, selective state-space models, and test-time
+training (TTT) have developed powerful ways to construct such states from
+context \cite{schlag2021fastweights,gu2024mamba,sun2025ttt}.
+Their extension to bidirectional tasks is now an active architectural direction.
+LION relates full, recurrent, and chunkwise forms of bidirectional linear
+attention \cite{afzal2025lion}; ViT$^3$ studies full-batch inner updates for visual
+TTT \cite{han2026vit3}; and ZipMap compresses an image collection into a shared
+scene state for bidirectional reconstruction \cite{jin2026zipmap}.
+These approaches establish several ways to exploit complete context.  In
+particular, bidirectional information access and parallel execution are distinct
+choices: a causal computation can be parallelized, and a bidirectional model
+can retain directional scans.
 
-This raises a question for context-adaptive layers: how should that state be
-obtained?  Finite inner
-optimization turns its objective, learning rate, update count, and model depth
-into architectural choices.  ViT$^3$ shows that these choices materially shape
-visual test-time training and that deeper inner models can remain
-under-optimized \cite{han2026vit3}.  MesaNet moves toward locally optimal
-adaptation by solving per-context regressions to a numerical tolerance, at the
-cost of a data-dependent iterative solve \cite{vonoswald2026mesanet}.
-Deep equilibrium and monotone equilibrium networks instead define implicit
-states through root finding and monotone structure
-\cite{bai2019deep,winston2020mondeq}, but still require iterative forward and
-backward solvers.  We instead study a bidirectional mixer in which each sample
-defines a strongly monotone compact problem, solved once with fixed work.  The
-goal is to retain global conditioning and linear sequence scaling while making
-the realized operator geometry exactly verifiable.
+When the entire context is available, a layer can construct its state jointly
+from all tokens.  This raises a design question: \emph{what global transformation
+should the state induce, and how should its expressivity, evaluation, and gain
+be controlled?}  The optimization perspective of test-time regression provides
+one framework for choosing a state \cite{wang2025testtimeregression}, and MesaNet
+solves causal context regressions using conjugate gradients
+\cite{vonoswald2026mesanet}.  However, a smaller inner loss need not imply better
+task performance: recent analysis of KV-binding TTT motivates inspecting the
+induced operator itself \cite{liu2026kvbinding}.  We consequently treat the
+full-context operator as the design object, with its solve and geometry chosen
+together.
 
-LSSO answers this question with a compact matrix-ball construction.  Each head
-compresses the full sample into a shared cross-moment $Z=P^\T C$, which
-generates a strictly accretive matrix $K$.  Its contextual state is returned by
-the direct solve $U^\star=(\I+K)^{-1}Z$.  Equivalently, the compact mixer is the
-reflected resolvent
-\begin{equation}
-    M = 2(\I + K)^{-1}-\I
-\label{eq:reflected-resolvent}
-\end{equation}
-of the generated accretive system.  A QR soft frame $P$ and a learned scalar
-complement $\eta$ lift this state to tokens,
-\begin{equation}
-    T = \eta\I + P(M-\eta\I)P^\T.
+LSSO constructs this operator from a compact strictly accretive system.  Each
+head gathers the full sample into a cross-moment $Z=P^\T C$, generates a matrix
+$K$ from $Z$, and obtains the contextual state by solving
+$(\I+K)U^\star=Z$.  The state is read back through the same soft frame $P$ to
+produce a global token transformation (Figure~\ref{fig:overview}).  Equivalently,
+the compact action and its token-space lift are
+\begin{align}
+    M &= 2(\I+K)^{-1}-\I,
+\label{eq:reflected-resolvent}\\
+    T &= \eta\I+P(M-\eta\I)P^\T.
 \label{eq:token-mixer-intro}
-\end{equation}
-The construction never materializes $T$.  It evaluates token--rank products
-and one small solve, giving linear sequence scaling for fixed rank.  The
-accretive chart is complete, its reflected resolvent spans every real strict
-compact contraction, and the scalar complement learns the gain on token
-directions outside the frame $P$.
+\end{align}
+All valid tokens participate in generating this shared operator.  LSSO is a
+native full-context construction, rather than an equivalence transformation of
+an existing causal update rule.
 
-Our contributions are fourfold:
+The construction assigns a role to each structural choice.  Accretivity makes
+the compact state uniquely solvable and controls the transposed solve used in
+backpropagation.  Its reflected resolvent spans every strict contraction in
+\emph{compact rank space}, so gain control still permits nonsymmetric mixing.
+The soft frame lifts this action to tokens, while $\eta$ controls the complement
+outside the frame.  Together they give an exact, sample-specific gain formula
+using matrices no larger than $r\times r$.  Token--rank products and one small
+direct solve realize the operator with linear sequence scaling at fixed rank;
+the dense token matrix is never formed.
+
+Our contributions are threefold:
 \begin{enumerate}
-    \item \textbf{Solved adaptation without unrolling.}  We introduce a
-    noncausal global mixer whose sample-conditioned inner state is the exact
-    solution of a compact accretive system.  At fixed rank it scales linearly
-    in time and activation storage with sequence length, and removes inner
-    learning rates, update counts, and fixed-point iterations from the forward
-    pass.
-    \item \textbf{The first context-conditioned Cayley token mixer.}  We
-    advance direct Cayley parameterization from static Lipschitz-bounded
-    network weights to a compact operator generated anew for every input.  The
-    construction spans the full open real matrix ball in rank space, including
-    nonsymmetric and nonnormal contractions.
-    \item \textbf{Exact per-instance certification.}  For every realized token
-    mixer, we derive its exact gain $q(X)<1$ entirely in compact space.  A
-    complementary sample-dependent monotonicity margin $\mu>1$ certifies
-    the equilibrium, contextual sensitivity, implicit adjoint, and
-    continuous-time convergence rate.  Both certificates require only
-    matrices of size at most $r\times r$ and are directly observable in trained
-    networks.
-    \item \textbf{Empirical breadth and efficient execution.}  In a
-    matched three-seed comparison across eight genomic tasks, LSSO leads MHA,
-    Linear Transformer, Performer, and cosFormer on seven tasks and exceeds the
-    strongest alternative's macro accuracy by $2.96$ points.  A four-task LRA
-    panel spans sequences up to length $4096$.  An algebraically equivalent
-    native CUDA forward and analytic backward reaches up to $2.30\times$ the
-    measured Flash-SDPA MHA training throughput without forming a token--token
-    map.
+    \item \textbf{A solved full-context operator.}  LSSO jointly constructs a
+    compact state from all valid tokens and evaluates it by direct solution,
+    without an inner learning rate, update schedule, or iterative stopping rule.
+    \item \textbf{Expressive compact geometry with a computable global gain.}
+    The compact chart covers the real strict matrix ball, and its structured
+    token-space lift admits an exact realized-gain certificate.  A complementary
+    monotonicity margin bounds the state and implicit adjoint.
+    \item \textbf{Task evidence and efficient realization.}  Matched genomic
+    experiments evaluate the complete mixer; LRA results and trained-state
+    diagnostics examine further sequence settings.  An equivalent native CUDA
+    implementation demonstrates the execution cost of the compact construction.
 \end{enumerate}
+
+
 
 \section{Related Work}
 \label{sec:related-work}
@@ -170,18 +175,46 @@ space, where the cross-moment generates an accretive system.  Its equilibrium
 is solved directly, and the resulting contraction is lifted through a learned
 token frame without constructing a dense token matrix.
 
-\paragraph{Context as learning.}
-Fast-weight views interpret linear attention as programming an associative
-memory \cite{schlag2021fastweights}.  TTT learns an inner model from the current
-sequence \cite{sun2025ttt}, while Longhorn and test-time regression connect
-state updates to online least-squares objectives
-\cite{liu2024longhorn,wang2025testtimeregression}.  ViT$^3$ exposes the design
-and optimization of inner models as a central axis in vision
-\cite{han2026vit3}; MesaNet moves toward more complete per-context
-optimization with a parallel iterative solver \cite{vonoswald2026mesanet}.
-For bidirectional encoders, LSSO replaces both the finite update schedule and
-the iterative tolerance with the exact equilibrium of a per-sample strongly
-monotone system.
+\paragraph{From causal memory to full-context operators.}
+Fast-weight models and TTT construct a compact representation from a sequence
+\cite{schlag2021fastweights,sun2025ttt}.  LION extends linear attention to
+bidirectional tasks through equivalent full, recurrent, and chunkwise forms
+\cite{afzal2025lion}.  ViT$^3$ studies full-batch visual inner updates
+\cite{han2026vit3}, while ZipMap uses TTT to form a shared state from an image
+collection \cite{jin2026zipmap}.  These are distinct ways to make complete
+context available to the output.  LSSO contributes a different state
+construction: a full-context statistic generates a compact system whose direct
+solution defines the global mixing map.  The available experiments do not yet
+compare LSSO against LION or visual TTT under a matched training protocol.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Representative full-context constructions.  This comparison concerns
+how the state is formed, not a matched performance ranking.}
+\label{tab:full-context-designs}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth}>{\raggedright\arraybackslash}p{0.31\linewidth}>{\raggedright\arraybackslash}p{0.40\linewidth}}
+\toprule
+Construction & Context representation & Evaluation route \\
+\midrule
+LION \cite{afzal2025lion} & Bidirectional linear-attention aggregates & Equivalent full, recurrent, or chunkwise forms \\
+Visual full-batch TTT \cite{han2026vit3} & Updated inner-model parameters & Full-context inner update and query evaluation \\
+LSSO & Generated compact system and solved state & Direct compact solve and soft-frame readout \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Context as a solved problem.}
+Longhorn and test-time regression relate sequence processing to regression
+objectives \cite{liu2024longhorn,wang2025testtimeregression}.  MesaNet optimizes
+causal per-context regressions with a chunkwise conjugate-gradient formulation
+\cite{vonoswald2026mesanet}.  Our bidirectional construction instead generates
+one compact accretive problem per sample and head.  Its mathematical solution
+is evaluated with a direct factorization, subject to floating-point error.
+Analysis of KV-binding TTT further shows that inner optimization and task
+performance need not track one another in the studied settings
+\cite{liu2026kvbinding}.  This motivates our focus on the resulting operator;
+we do not infer a task advantage merely from solving a system accurately.
 
 \paragraph{Context-conditioned contractive geometry.}
 S4 and selective state-space models obtain linear sequence scaling through
@@ -228,33 +261,22 @@ Heads are concatenated and passed through an ordinary output projection after
 mixing.  The construction below is repeated independently for each head, with
 one compact state shared by all valid tokens in that head.
 
-\subsection{Masking and rank-space phase}
-\label{sec:mask-and-phase}
-
-For a boolean validity mask $m\in\{0,1\}^N$, invalid rows of both $A$ and $C$
-are set to zero before any compact statistic is formed.  Let
+\subsection{Full-context computation at a glance}
+For normalized, position-transformed relation coordinates, LSSO builds a soft
+frame $P$ and evaluates
 \begin{equation}
-    n = \sum_{i=1}^N m_i.
+ Z=P^\T C,\qquad U^\star=(\I_r+K(Z))^{-1}Z,\qquad
+ Y=\eta C+P[2U^\star-(1+\eta)Z].
+\label{eq:computation-overview}
 \end{equation}
-For a nonempty sequence, relation coordinates are normalized as
-$A\leftarrow A/\sqrt{n}$.  An entirely masked sequence is assigned the zero
-output by definition.  Masking before normalization makes the result invariant
-to appended padding.
+The first operation gathers the entire valid context; the second constructs a
+shared solved state; the third returns its action to all tokens.  The following
+subsections specify each operation.  Masking, $1/\sqrt n$ relation normalization,
+and Rank-Rotary precede frame construction, as detailed in
+Section~\ref{sec:mask-and-phase}; throughout, $n$ is the valid-token count.
 
-Rank-Rotary applies a block-diagonal planar rotation to
-the $r$ relation coordinates before the soft frame.  For centered position
-$p_i$ and frequencies $\{\omega_j\}_{j=1}^{r/2}$, each coordinate pair uses
-the angle $p_i\omega_j$.  The transformation preserves each relation row's
-Euclidean norm and obeys the relative-phase identity
-\begin{equation}
-    \mathcal R(p_i)^\T\mathcal R(p_j)=\mathcal R(p_j-p_i).
-\label{eq:rank-rotary-relative}
-\end{equation}
-Rank-Rotary therefore supplies relative phase within relation rank space while
-preserving each row norm.  Absolute or two-dimensional position embeddings
-remain external to the mixer.
 
-\subsection{QR soft frame and compact statistic}
+\subsection{Gathering the full context into a compact statistic}
 \label{sec:soft-frame}
 
 The QR soft frame maps unconstrained relation coordinates to a strict column
@@ -282,7 +304,7 @@ The frame compresses the content into one shared cross-moment,
 $Z$ aggregates all valid positions symmetrically in one noncausal pass without
 forming the token-level matrix in \eqref{eq:token-mixer-intro}.
 
-\subsection{Accretive compact equilibrium}
+\subsection{Generating and solving the contextual core}
 \label{sec:accretive-core}
 
 In the default \textsc{Dynamic} mode, $Z$ generates compact raw coordinates
@@ -323,7 +345,9 @@ At $\Theta=0$, $L=\I_r$, $\Omega=0$, $K=\I_r$, and the compact contraction is
 $M=0$.  Both nonzero-core modes start at that point; \textsc{Dynamic} also
 starts with $W_{\mathrm{drive}}=0$.
 
-For later use, define the reflected resolvent
+\subsection{Lifting the compact action to all tokens}
+
+Define the reflected resolvent
 \begin{equation}
     M = 2(\I_r+K)^{-1}-\I_r
       = (\I_r-K)(\I_r+K)^{-1}.
@@ -339,8 +363,36 @@ token-mixing form
 
 \paragraph{Solved contextual inner state.}
 LSSO obtains $U^\star$ by a direct $r\times r$ solve.
-Section~\ref{sec:solved-inner-process} relates this solution to a globally
+Appendix~\ref{sec:solved-inner-process} relates this solution to a globally
 convergent contextual dynamics.
+
+\subsection{Position, masking, and execution order}
+\label{sec:mask-and-phase}
+
+For a boolean validity mask $m\in\{0,1\}^N$, invalid rows of both $A$ and $C$
+are set to zero before any compact statistic is formed.  Let
+\begin{equation}
+    n = \sum_{i=1}^N m_i.
+\end{equation}
+For a nonempty sequence, relation coordinates are normalized as
+$A\leftarrow A/\sqrt{n}$.  An entirely masked sequence is assigned the zero
+output by definition.  Masking before normalization makes the result invariant
+to appended padding.
+
+Rank-Rotary applies a block-diagonal planar rotation to
+the $r$ relation coordinates before the soft frame.  For centered position
+$p_i$ and frequencies $\{\omega_j\}_{j=1}^{r/2}$, each coordinate pair uses
+the angle $p_i\omega_j$.  The transformation preserves each relation row's
+Euclidean norm and obeys the relative-phase identity
+\begin{equation}
+    \mathcal R(p_i)^\T\mathcal R(p_j)=\mathcal R(p_j-p_i).
+\label{eq:rank-rotary-relative}
+\end{equation}
+Rank-Rotary therefore supplies relative phase within relation rank space while
+preserving each row norm.  Absolute or two-dimensional position embeddings
+remain external to the mixer.  Full-context access does not remove positional
+structure: these feature rotations are applied before aggregation and do not
+impose a causal visibility mask.
 
 \subsection{Linear sequence complexity}
 \label{sec:linear-complexity}
@@ -365,14 +417,57 @@ Unlike exact MHA, whose $O(N^2d)$ mixing cost persists under FlashAttention
 \cite{dao2022flashattention}, LSSO has $O(Nr(r+d))$ token-dependent work and no
 $N\times N$ intermediate.  Both retain $O(ND^2)$ feature projections.
 
-\section{Solved and Certifiable Contextual Mixing}
+\section{Geometry of the Full-Context Operator}
 \label{sec:theory}
 
 We analyze one realized head in exact arithmetic.  Complete proofs are given in
 Appendix~\ref{app:proofs}, and mixed-precision execution is described in
 Section~\ref{sec:cuda-implementation}.
 
-\subsection{The QR soft frame is a strict contraction chart}
+\subsection{Is the contextual state well posed?}
+
+\begin{theorem}[Stable solved state and implicit adjoint]
+\label{thm:stable-solve}
+Define the per-sample monotonicity margin
+\begin{equation}
+    \mu=1+\sigma_{\min}(L)^2>1,
+    \qquad A_K=\I_r+K.
+\label{eq:monotonicity-margin}
+\end{equation}
+Then $U^\star=A_K^{-1}Z$ exists uniquely, and
+\begin{equation}
+    \sigma_{\min}(A_K)\geq\mu,
+    \quad
+    \norm{U^\star}_F\leq\mu^{-1}\norm{Z}_F,
+    \quad
+    \norm{A_K^{-\T}G}_F\leq\mu^{-1}\norm{G}_F.
+\label{eq:solve-adjoint-bound}
+\end{equation}
+For a second generated problem $A_K'=\I_r+K'$ with margin $\mu'$ and solution
+$U^{\star'}=A_K'^{-1}Z'$, the finite contextual perturbation obeys
+\begin{equation}
+    \norm{U^\star-U^{\star'}}_F
+    \leq \mu^{-1}\norm{Z-Z'}_F
+       +(\mu\mu')^{-1}\norm{K-K'}_2\norm{Z'}_F.
+\label{eq:finite-solve-sensitivity}
+\end{equation}
+Consequently, an infinitesimal perturbation obeys
+\begin{equation}
+    \norm{dU^\star}_F
+    \leq \mu^{-1}\norm{dZ}_F
+       +\mu^{-2}\norm{dK}_2\norm{Z}_F.
+\label{eq:solve-sensitivity}
+\end{equation}
+\end{theorem}
+
+The same computable margin controls the forward state, the transposed solve
+used by implicit differentiation, and sensitivity to the generated compact
+problem.  The realized-gain certificate below separately measures the
+contraction margin, which also depends on the skew coordinates.
+
+\subsection{What does gain control allow the operator to express?}
+
+\paragraph{A frame that preserves the compact guarantee.}
 
 \begin{theorem}[Soft-frame contract]
 \label{thm:soft-frame}
@@ -435,7 +530,7 @@ drive is at most $c\norm{W_{\mathrm{drive}}}_2$, independently of sequence
 length.
 \end{proposition}
 
-\subsection{The compact core parameterizes the strict matrix ball}
+\paragraph{A complete compact contraction chart.}
 
 \begin{definition}[Strict accretivity]
 \label{def:accretive}
@@ -496,88 +591,27 @@ nonnormal.  The chart retains every strict contraction in rank space, and at
 token level,
 $T-T^\T=P(M-M^\T)P^\T$, so this nonsymmetric structure survives the lift.
 
-\begin{theorem}[Stable solved state and implicit adjoint]
-\label{thm:stable-solve}
-Define the per-sample monotonicity margin
-\begin{equation}
-    \mu=1+\sigma_{\min}(L)^2>1,
-    \qquad A_K=\I_r+K.
-\label{eq:monotonicity-margin}
-\end{equation}
-Then $U^\star=A_K^{-1}Z$ exists uniquely, and
-\begin{equation}
-    \sigma_{\min}(A_K)\geq\mu,
-    \quad
-    \norm{U^\star}_F\leq\mu^{-1}\norm{Z}_F,
-    \quad
-    \norm{A_K^{-\T}G}_F\leq\mu^{-1}\norm{G}_F.
-\label{eq:solve-adjoint-bound}
-\end{equation}
-For a second generated problem $A_K'=\I_r+K'$ with margin $\mu'$ and solution
-$U^{\star'}=A_K'^{-1}Z'$, the finite contextual perturbation obeys
-\begin{equation}
-    \norm{U^\star-U^{\star'}}_F
-    \leq \mu^{-1}\norm{Z-Z'}_F
-       +(\mu\mu')^{-1}\norm{K-K'}_2\norm{Z'}_F.
-\label{eq:finite-solve-sensitivity}
-\end{equation}
-Consequently, an infinitesimal perturbation obeys
-\begin{equation}
-    \norm{dU^\star}_F
-    \leq \mu^{-1}\norm{dZ}_F
-       +\mu^{-2}\norm{dK}_2\norm{Z}_F.
-\label{eq:solve-sensitivity}
-\end{equation}
-\end{theorem}
+\subsection{Can the realized global gain be computed exactly?}
 
-The same computable margin controls the forward state, the transposed solve
-used by implicit differentiation, and sensitivity to the generated compact
-problem.  The realized-gain certificate below separately measures the
-contraction margin, which also depends on the skew coordinates.
+The soft frame identifies the token subspace where contextual mixing acts.
+Figure~\ref{fig:geometry} separates this compact action from the scalar
+complement.  Because $P$ is generally not orthonormal, the restricted token
+block $B$ below differs from the compact Cayley core $M$.
 
-\subsection{The direct solve resolves a convergent contextual process}
-\label{sec:solved-inner-process}
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{operator_geometry.pdf}
+\caption{\textbf{From token subspaces to an exact gain.}
+(a) An illustrative nonsymmetric contraction in the frame subspace and scalar
+multiplication on its orthogonal complement; the scalar sketch uses positive
+$\eta$.  (b) In an orthonormal token basis, the realized mixer separates into
+$B$ and $\eta I$.  (c) For $0<k<N$, its norm is the larger of the two block norms.
+Theorem~\ref{thm:token-contraction} covers either sign of $\eta$ and the empty
+and full-rank cases.  The ellipse and matrix glyphs are schematic, not trained
+operator measurements.}
+\label{fig:geometry}
+\end{figure}
 
-Let $A_K=\I_r+K$.  The following result relates the direct solve to a
-continuous contextual process.
-
-\begin{theorem}[Solved contextual inner process]
-\label{thm:inner-process}
-For fixed contextual quantities $K$ and $Z$, consider the continuous dynamics
-\begin{equation}
-    \dot U(t)=Z-A_KU(t).
-\label{eq:contextual-flow}
-\end{equation}
-From every initial state $U(0)$, the dynamics converge to
-$U^\star=A_K^{-1}Z$ and obey
-\begin{equation}
-    \norm{U(t)-U^\star}_F
-    \leq e^{-\mu t}\norm{U(0)-U^\star}_F.
-\label{eq:flow-rate}
-\end{equation}
-The rate lower bound is independent of the skew-symmetric part of $K$.
-
-\end{theorem}
-
-\begin{proof}[Proof sketch]
-Write $E(t)=U(t)-U^\star$.  Since $A_KU^\star=Z$,
-$\dot E=-A_KE$.  The skew part vanishes in the Frobenius inner product, so
-\begin{equation}
-    \frac{d}{dt}\frac12\norm{E}_F^2
-    =-\inner{E}{A_KE}_F
-    =-\inner{E}{\sym(A_K)E}_F
-    \leq-\mu\norm{E}_F^2,
-\end{equation}
-because $\sym(A_K)=\I_r+LL^\T\succeq\mu\I_r$.  Gronwall's inequality gives
-\eqref{eq:flow-rate}.
-\end{proof}
-
-Appendix~\ref{app:proofs} also identifies the direct solution as the
-infinite-step limit of stable gradient descent on the residual objective.  The
-production backward differentiates this solved state rather than a finite
-unroll.
-
-\subsection{An exact compact certificate for the realized token mixer}
 
 \begin{theorem}[Exact realized-gain certificate]
 \label{thm:token-contraction}
@@ -632,7 +666,8 @@ pointwise energy statement
 \label{eq:pointwise-energy}
 \end{equation}
 whenever $C(X)\neq0$.  The guarantee is pointwise in the input-conditioned
-operator.  Along any fixed realized sequence of mixer maps, the gains compose:
+operator.  It does not bound the Jacobian of $X\mapsto T(X)C(X)$,
+which also contains $(dT)C$.  Along any fixed realized sequence of mixer maps, the gains compose:
 $\norm{T_L\cdots T_1}_2\leq\prod_{\ell=1}^L q_\ell$.
 
 \begin{remark}[Why the scalar complement is part of the model]
@@ -647,40 +682,7 @@ certificate.  Thus $T$ is a rank-$r$ correction to an isotropic complement.
 Appendix~\ref{app:proofs} proves padding isolation and noncausal permutation
 equivariance.
 
-\subsection{Certificates in trained models}
-\label{sec:certificate-evidence}
-
-We next measure how much certified margin trained models retain.  Across three
-six-layer LRA Text checkpoints and matched held-out token-stream probes from
-$1$K to $8$K, all $9{,}216$ head-level observations are finite and satisfy
-their certified conditions (Table~\ref{tab:certificate-audit}).  The worst
-realized gain is $0.9087$, leaving at least $0.0913$ contraction slack, and the
-minimum monotonicity margin is $1.1667$.  Solved states use at most $93.3\%$ of
-their certified bound, while deterministic adjoint probes use at most $88.1\%$.
-Appendix~\ref{app:certificate-protocol} reports the per-layer distributions
-and stress-test protocol.
-
-\begin{table}[H]
-\centering
-\small
-\setlength{\tabcolsep}{7pt}
-\caption{Worst observation in the trained-model certificate audit.  Bound
-usage is the measured ratio normalized by its certified upper bound $1/\mu$.}
-\label{tab:certificate-audit}
-\begin{tabular}{lcc}
-\toprule
-Quantity & Certified condition & Worst observed \\
-\midrule
-Realized gain & $q(X)<1$ & $\max q=0.9087$ \\
-Contraction slack & $1-q(X)>0$ & $\min(1-q)=0.0913$ \\
-Monotonicity margin & $\mu>1$ & $\min\mu=1.1667$ \\
-Solved-state bound usage & $\mu\norm{U^\star}_F/\norm{Z}_F\leq1$ & $0.9329$ \\
-Adjoint-probe bound usage & $\mu\norm{A_K^{-\T}G}_F/\norm{G}_F\leq1$ & $0.8814$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\section{Sequence Classification Evidence}
+\section{Task Evidence and Realized Operators}
 \label{sec:sequence-experiments}
 
 We evaluate LSSO as a drop-in replacement for attention in otherwise ordinary
@@ -737,14 +739,63 @@ Unweighted task macro    & $75.37$ & $74.35$ & $74.34$ & $75.57$ & $\mathbf{78.5
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:genomic-results} shows that LSSO is highest on seven of eight
-tasks.  Its $78.53$ macro average exceeds cosFormer, the strongest alternative
+Table~\ref{tab:genomic-results} shows that LSSO has the highest mean on
+seven of eight tasks; this is not a claim of statistical significance on each task.  Its $78.53$ macro average exceeds cosFormer, the strongest alternative
 at $75.57$, by $2.96$ points and MHA's $75.37$ by $3.16$ points.  The three
 linear-attention controls indicate that neither removing softmax nor obtaining
 linear sequence scaling alone reproduces LSSO's gain.  The macro result first
 averages seeds within each task and then gives all tasks equal weight.  The
 largest gain occurs on Human or Worm; Mouse Enhancers Ensembl is the sole
 exception, where Linear Transformer is highest.
+
+\subsection{Scope of mechanism attribution}
+The matched comparison tests the complete LSSO layer.  It does not isolate the
+benefits of the dynamic drive, skew coordinates, rank, or Rank-Rotary.
+In particular, \textsc{Static} removes the dynamic drive to $K$ while leaving
+$P$ input-dependent; it is not a fully input-independent mixer.  Matched
+\textsc{Dynamic}/\textsc{Static}/\textsc{Zero} training and core-activity
+measurements are needed to attribute a task advantage to the generated core.
+No such ablation results are included here.
+
+\subsection{Certificates in trained models}
+\label{sec:certificate-evidence}
+
+We next measure how much certified margin trained models retain.  Across three
+six-layer LRA Text checkpoints and matched held-out token-stream probes from
+$1$K to $8$K, all $9{,}216$ head-level observations are finite and satisfy
+their certified conditions (Table~\ref{tab:certificate-audit}).  The worst
+realized gain is $0.9087$, leaving at least $0.0913$ contraction slack, and the
+minimum monotonicity margin is $1.1667$.  Solved states use at most $93.3\%$ of
+their certified bound, while deterministic adjoint probes use at most $88.1\%$.
+Appendix~\ref{app:certificate-protocol} reports the per-layer distributions
+and stress-test protocol.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{7pt}
+\caption{Worst observation in the trained-model certificate audit.  Bound
+usage is the measured ratio normalized by its certified upper bound $1/\mu$.}
+\label{tab:certificate-audit}
+\begin{tabular}{lcc}
+\toprule
+Quantity & Certified condition & Worst observed \\
+\midrule
+Realized gain & $q(X)<1$ & $\max q=0.9087$ \\
+Contraction slack & $1-q(X)>0$ & $\min(1-q)=0.0913$ \\
+Monotonicity margin & $\mu>1$ & $\min\mu=1.1667$ \\
+Solved-state bound usage & $\mu\norm{U^\star}_F/\norm{Z}_F\leq1$ & $0.9329$ \\
+Adjoint-probe bound usage & $\mu\norm{A_K^{-\T}G}_F/\norm{G}_F\leq1$ & $0.8814$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+The gain in these probes is dominated by the scalar complement $|\eta|$
+(Appendix~\ref{app:certificate-protocol}).  The audit therefore establishes
+realized operator margins, not the task contribution of the dynamic core.
+The $8$K probes are operator stress tests on assembled token streams, not an
+$8$K classification or length-generalization result.
 
 \subsection{Long Range Arena context}
 
@@ -809,7 +860,7 @@ and four-task average; it is within $0.38$ points of the highest ListOps result
 and $0.71$ points of the highest Text result.  The same mixer spans symbolic,
 byte-level, paired-retrieval, and two-dimensional path tasks.
 
-\section{Native CUDA Realization}
+\section{Execution Cost of the Solved Operator}
 \label{sec:cuda-implementation}
 
 The default \textsc{Dynamic} core with Rank-Rotary has a native,
@@ -820,19 +871,22 @@ analytic backward reuses saved factors.  Mixed-precision outputs and gradients
 are validated against the FP64 reference.  Appendix~\ref{app:cuda} gives the
 execution schedule, workspace, VJP, numerical envelope, and build coverage.
 
+The following measurements use the historical contract-6 implementation;
+they have not been rerun under the current contract-8 mixed-precision backend.
 Table~\ref{tab:cuda-wall-clock} measures the complete mixer boundary, including
 input and output projections.  At $N=4096$, native LSSO reaches $1.79\times$
 the Flash-SDPA MHA forward throughput and $2.30\times$ its training throughput.
 Across $N=1024$--$4096$, forward--backward latency grows by $3.88\times$ for
-LSSO and $7.92\times$ for MHA, matching their linear and quadratic mixer
-arithmetic.
+LSSO and $7.92\times$ for MHA.  These finite-shape timings illustrate
+the scaling trend; they are not an asymptotic fit or an end-to-end model benchmark.
 
 \begin{table}[H]
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
 \caption{Synchronized milliseconds per batch on an RTX 5070 Ti (lower is
-better), with $B=64,D=256,H=8$, FP16 AMP, and $r=32$ for LSSO.  Ratios above
+better), with $B=64,D=256,H=8$, FP16 AMP, and $r=32$ for LSSO
+(historical contract 6).  Ratios above
 one favor native LSSO; forward--backward includes loss and gradient reset.
 Bold marks the lowest latency in each row.}
 \label{tab:cuda-wall-clock}
@@ -853,31 +907,44 @@ $N$ & PyTorch ref. & Native & MHA & Ref./native & MHA/native \\
 \end{tabular}
 \end{table}
 
+\section{Visual Representation and Dense Prediction}
+\label{sec:vision}
+% Intentionally empty: no visual results are claimed in this draft.
+\subsection{ImageNet classification}
+\subsection{COCO detection and instance segmentation}
+\subsection{ADE20K semantic segmentation}
+
 \section{Limitations}
 \label{sec:limitations}
 
-LSSO is currently bidirectional: its compact statistic summarizes the full
-valid sequence before solving the equilibrium.  It therefore does not support
-causal masking or autoregressive decoding.  Prefix-conditioned solved states
-that preserve the contraction certificate and linear scaling are the principal
-open extension.
+LSSO is designed for bidirectional tasks: its compact statistic uses the full
+valid sequence.  It has no causal masking or autoregressive decoding contract.
+The token-space family is a rank-$r$ correction to a scalar complement, even
+though the compact chart covers every real strict contraction.  Its realized
+gain certificate does not bound the end-to-end Jacobian, which also includes
+derivatives of the input-conditioned operator, feature projections, and the
+surrounding network.
 
-The reference implementation supports workload-specific ranks; current native
-packages target $r\in\{16,32,48,64\}$.  Their measured gains leave room for
-shape- and architecture-specific autotuning.  Evaluation spans genomic
-classification and four LRA tasks on SM120; vision and broader hardware
-coverage remain open.
+The task evidence evaluates the complete layer on genomic classification and
+four LRA tasks.  Mechanism attribution, matched comparisons with recent
+bidirectional linear attention and TTT, and visual transfer remain open.
+The native packages support $r\in\{16,32,48,64\}$, but the reported task runs
+use $r=32$.  Timings are hardware- and shape-specific and use the historical
+implementation contract; broader hardware, rank, and current-backend
+measurements are needed to extend those empirical conclusions.
 
 \section{Conclusion}
 
-LSSO turns contextual adaptation from a finite update procedure into a solved
-global operator.  One per-sample statistic generates a compact strictly
-accretive system, a direct solve returns its equilibrium, and defect completion
-lifts the resulting strict contraction to token space.  The construction has
-linear sequence scaling at fixed rank and a complete native CUDA forward and
-analytic backward realization.  GenomicBenchmarks and LRA results show that
-the same certifiable operator remains useful across long biological, symbolic,
-textual, retrieval, and spatial inputs.
+Complete context permits a sequence layer to construct its mixing state jointly
+from all tokens.  LSSO realizes this choice through a sample-generated compact
+system and one direct solve.  The accretive core, soft frame, and scalar
+complement jointly specify an expressive compact action, a structured global
+lift, and an exactly computable realized gain.  The resulting algebra supports
+linear sequence scaling at fixed rank and an equivalent native backward.
+Matched genomic results establish task value for the complete layer, while
+long-sequence diagnostics and timings characterize its realized behavior.
+This construction makes the full-context operator, its geometry, and its
+execution part of the same design.
 
 \appendix
 
@@ -938,6 +1005,48 @@ Cauchy--Schwarz therefore gives
 $\norm{(\I_r+K)v}_2\geq\mu\norm{v}_2$, proving
 $\sigma_{\min}(\I_r+K)\geq\mu$ and
 $\norm{(\I_r+K)^{-1}}_2\leq\mu^{-1}$.
+
+\subsection{The direct solve resolves a convergent contextual process}
+\label{sec:solved-inner-process}
+
+Let $A_K=\I_r+K$.  The following result relates the direct solve to a
+continuous contextual process.
+
+\begin{theorem}[Solved contextual inner process]
+\label{thm:inner-process}
+For fixed contextual quantities $K$ and $Z$, consider the continuous dynamics
+\begin{equation}
+    \dot U(t)=Z-A_KU(t).
+\label{eq:contextual-flow}
+\end{equation}
+From every initial state $U(0)$, the dynamics converge to
+$U^\star=A_K^{-1}Z$ and obey
+\begin{equation}
+    \norm{U(t)-U^\star}_F
+    \leq e^{-\mu t}\norm{U(0)-U^\star}_F.
+\label{eq:flow-rate}
+\end{equation}
+The rate lower bound is independent of the skew-symmetric part of $K$.
+
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Write $E(t)=U(t)-U^\star$.  Since $A_KU^\star=Z$,
+$\dot E=-A_KE$.  The skew part vanishes in the Frobenius inner product, so
+\begin{equation}
+    \frac{d}{dt}\frac12\norm{E}_F^2
+    =-\inner{E}{A_KE}_F
+    =-\inner{E}{\sym(A_K)E}_F
+    \leq-\mu\norm{E}_F^2,
+\end{equation}
+because $\sym(A_K)=\I_r+LL^\T\succeq\mu\I_r$.  Gronwall's inequality gives
+\eqref{eq:flow-rate}.
+\end{proof}
+
+Appendix~\ref{app:proofs} also identifies the direct solution as the
+infinite-step limit of stable gradient descent on the residual objective.  The
+production backward differentiates this solved state rather than a finite
+unroll.
 
 \subsection{Residual optimization, implicit derivative, and sensitivity}
 
@@ -1322,8 +1431,22 @@ all sequence lengths and implementations.  The benchmark entry point is
 \texttt{benchmarks/benchmark\_ball.py}.
 
 {\small
+\section{Figure Sources and Production}
+The conceptual diagrams are supplied as vector PDFs.  Their matrix textures
+and geometric illustrations are schematic and encode no experimental results.
+Layout and export review used the Scientific Visualization skill from
+Scientific Agent Skills \cite{kassis2026skills}; the drawing code and operator
+content were written for this manuscript.  The tensor-flow diagrams in
+ViT$^3$ \cite{han2026vit3} and the semantic color grouping in LION
+\cite{afzal2025lion} informed the visual organization; no source artwork was
+reused.  The existing certificate plot
+reports the diagnostic protocol in Appendix~\ref{app:certificate-protocol}.
+
+\begingroup
+\small
 \bibliographystyle{plain}
 \bibliography{references}
+\endgroup
 }
 
 \end{document}
