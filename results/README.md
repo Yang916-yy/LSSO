@@ -23,3 +23,17 @@ The repository intentionally omits checkpoints, caches, and verbose training
 logs. Those files are large and are not needed to audit the reported numbers.
 The LRA CSV contains only results trained by this repository; published
 comparison values in the paper remain attributed to their original sources.
+
+## Historical evidence versus current source
+
+The published CUDA metadata records native contract **6**. Current source uses
+native ABI **8** and model contract **12**, including a revised mixed-precision
+policy and biased projection fusion. These source updates do not rewrite the
+CSV measurements or establish new task results. Consult each panel's metadata
+for its actual runtime and protocol; do not label historical tables as current
+source benchmarks.
+
+The September 2026 optimization measurements are exploratory operator checks.
+They do not provide new ImageNet accuracy, COCO AP or ADE20K mIoU. New formal
+panels require their own matched runs and provenance, rather than copying the
+old metrics into a new runtime description.

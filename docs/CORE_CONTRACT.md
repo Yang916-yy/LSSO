@@ -2,9 +2,10 @@
 
 The operator accepts x[B,N,D], an optional boolean valid_mask[B,N], and
 optional position_ids[N] or position_ids[B,N]. It returns y[B,N,D]. Batch size
-B and sequence length N must be positive. Public activations use `float16`, `float32`, or
-`float64`; `bfloat16` is unsupported. A sequence may be entirely masked; its
-output is zero.
+B and sequence length N must be positive. The reference accepts `float16`,
+`bfloat16`, `float32`, and `float64`; the native CUDA implementation accepts
+only `float16` and `bfloat16` public inputs. Outputs match the input dtype. A
+sequence may be entirely masked; its output is zero.
 
 With Rank-Rotary enabled, position IDs must use an integer dtype, `float32`,
 or `float64`. Integer coordinates are differenced before conversion to the
@@ -87,3 +88,21 @@ trigonometry, then rotates in FP32. Sensitive eta and solve state stay FP32.
 FP16 and BF16 public inputs are accepted by CUDA; the result matches the input
 dtype. FP32/FP64 inputs remain available on the reference path. Invalid tokens
 are zeroed before every compact statistic.
+
+## Serialized and numerical boundaries
+
+The current model `_extra_state` contract is version **12**. This is separate
+from native CUDA ABI **8** and the ImageNet runner envelope format **5**.
+Loading requires every saved operator-contract field to match, including model
+geometry and ablations. Missing or mismatched contracts fail even under
+`strict=False`; older weights need explicit validation before migration.
+
+Biased low-precision CUDA projections add FP32 bias to an FP32 accumulator
+before a single FP16/BF16 store. They use a lazily compiled Triton GEMM;
+parameter gradients retain the existing FP32 reduction boundaries. Summation
+order can change rounding, so algebraic equivalence is not a promise of
+bitwise-identical training. See [CUDA implementation details](CUDA_CONTRACT.md).
+
+The contraction statement freezes the input-conditioned frame and generator.
+It does not bound the complete input Jacobian, which also differentiates those
+quantities. Implementation benchmarks do not establish downstream accuracy.

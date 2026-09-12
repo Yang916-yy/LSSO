@@ -58,6 +58,66 @@ guide](https://mmcv.readthedocs.io/en/latest/get_started/installation.html).
 Install Apex with FusedLAMB as described in `docs/IMAGENET_DEIT3.md` for
 canonical DeiT III pretraining.
 
+## Dataset layout
+
+COCO 2017 provides both detection boxes and instance masks for Mask R-CNN.
+Download `train2017.zip`, `val2017.zip`, and
+`annotations_trainval2017.zip` from the [official COCO download page](https://cocodataset.org/#download).
+The current configs use the train and validation splits; panoptic/stuff
+annotations are not used by this Mask R-CNN recipe.
+
+For semantic segmentation, use `ADEChallengeData2016.zip`, the scene-parsing
+benchmark package derived from ADE20K, from [MIT Scene Parsing](https://sceneparsing.csail.mit.edu/).
+The `2016` in the archive name is expected. Keep its original label PNGs;
+the configured loader handles the label-zero convention.
+
+The root passed to `--data-root` must have the following contents:
+
+```text
+/datasets/coco/
+  train2017/
+  val2017/
+  annotations/
+    instances_train2017.json
+    instances_val2017.json
+
+/datasets/ADEChallengeData2016/
+  images/training/
+  images/validation/
+  annotations/training/
+  annotations/validation/
+```
+
+Keep datasets outside the Git checkout. COCO's root points directly to the
+folder containing `train2017`; ADE20K's root points to `ADEChallengeData2016`,
+not its parent folder. Match Small/Base/Large configuration to the pretrained
+backbone; the launch examples below use Base.
+
+## Pretrained checkpoint compatibility
+
+Current loading validates both ImageNet envelope format **5** and each LSSO
+layer's model contract **12**. The native extension separately requires ABI
+**8**. A valid envelope digest does not bypass a mismatched model contract.
+
+A v0.6.3 ImageNet checkpoint may contain model contract 11 and therefore cannot
+be loaded directly into current source. The repository does not yet provide an
+automatic migration command. Preserve the original file; check tensor names,
+shapes, geometry and numerical semantics before producing a migrated copy,
+then validate loading and forward/backward behavior. Do not simply overwrite
+`_extra_state` or use `strict=False` as a conversion procedure.
+
+For new downstream training, `--backbone-checkpoint` initializes the encoder,
+drops the ImageNet classifier, and allows the new pyramid/task heads to start
+from their own initialization. ImageNet optimizer state is not a downstream
+resume. `--resume` applies to an existing checkpoint of the downstream task.
+
+The latest operator optimization was tested on SM120 with biased LSSO shapes.
+The local verification environment did not contain timm, compiled MMCV,
+MMDetection or MMSegmentation; it did not execute a complete detector or
+segmenter. A matching compiled MMCV stack must be validated with the required
+Torch/CUDA version before launching a full run. Operator timings are not
+end-to-end throughput or evidence of COCO AP/ADE20K mIoU.
+
 ## Launch
 
 The CUDA extension must have been built for every participating GPU

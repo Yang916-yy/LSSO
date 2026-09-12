@@ -14,6 +14,12 @@ sequence encoder accepts FP16 and BF16 AMP under native contract 8. Existing
 training recipes still default to FP16. Historical results below used contract 6
 and have not been rerun under the new precision contract.
 
+Current model state uses contract 12 in addition to the sequence runner's own
+configuration checks. Historical contract-11 checkpoints are not automatically
+loadable under current source. No migration tool is provided; preserve the
+original and validate any explicit conversion. Keep historical metrics tied
+to their recorded runtime rather than treating them as a rerun of current main.
+
 All accuracies below are held-out test percentages. Three-seed summaries use
 the arithmetic mean and sample standard deviation (`n - 1`) over seeds 0, 1,
 and 2.

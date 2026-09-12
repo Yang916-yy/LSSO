@@ -251,9 +251,31 @@ selected Python environment against an old libtorch. The loaded artifact
 verifies both its compiled SM and native contract version before launching
 kernels.
 
-The official `lsso-cuda-runtime` wheel contains all seven files. Its generated
+The runtime packaging tool requires all seven files. A wheel built for this
+source must carry native contract 8; older released v0.6.3 wheels must not be
+mixed with current source. Its generated
 metadata is checked before loading: LSSO version, native contract, exact Torch
 version, CUDA version, and PyTorch's C++ ABI must all match. Release packaging
 removes every build-host RPATH/RUNPATH and rejects ELF artifacts requiring a
 GLIBC version above 2.31, so the published CUDA 12.8 runtime can load on
 Ubuntu 20.04 and newer x86_64 systems with the matching PyTorch runtime.
+
+## Validation and performance scope
+
+The 2026-09-12 retained update fuses biased low-precision projections. Trials
+using 32- or 128-token backward statistics did not establish reliable overall
+improvement and were withdrawn; the default backward statistic tile remains
+64 tokens. Do not infer peak-memory savings from partial-buffer sizes alone.
+
+On SM120, same-process alternating measurements of the complete biased mixer
+at `B=2,N=4096,D=768,H=12,R=48` reduced eager forward-plus-backward time from
+3.162 to 2.937 ms for FP16 and 3.084 to 2.826 ms for BF16. This excludes
+optimizer updates and first-use compilation. Small eager shapes did not
+uniformly improve. These are exploratory operator measurements, not updated
+formal results or Mask R-CNN/UperNet throughput.
+
+The publication check passed 342 tests with 6 skips. Optional integration
+packages were absent, and other GPU architectures were not executed. Existing
+formal results retain their recorded contract-6 provenance in `results/`.
+For reproducible new measurements, record source commit, bias, dtype, rank,
+shape, GPU, warmup, eager/Graph mode, and the actual live-allocation peak.

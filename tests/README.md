@@ -15,3 +15,25 @@ rather than a local experiment or benchmark.
 Use `python -m pytest -m cuda` to select all CUDA-marked checks across scopes.
 Run `python -m pytest -q` only for a release, a broad refactor, or a change
 that crosses multiple scopes.
+
+## Mixed-precision and optional checks
+
+CUDA math changes also require the relevant `tests/core` checks: projection
+fusion, FP32 bias cancellation, strided tails and gradient comparisons live
+there. Some CUDA-dependent core tests use availability guards rather than the
+`cuda` marker, so `-m cuda` alone is not the entire GPU numerical test domain.
+
+```bash
+python -m pytest -q tests/core tests/cuda
+python tools/check_repository.py
+git diff --check
+```
+
+Read skip reasons with `-rs`. Missing timm/OpenMMLab packages or a missing native
+artifact must not be reported as successful full-model validation. Test other
+SM targets on their own hardware. Benchmarks and exploratory probes belong
+outside the tracked test tree.
+
+Before the 2026-09-12 main publication, the full suite passed 342 tests with
+6 skips; only SM120 was executed. This is a dated verification record, not a
+promise that all optional stacks or architectures were exercised.

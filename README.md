@@ -14,11 +14,26 @@ certificate, not an end-to-end Lipschitz claim for the surrounding network.
 The default DYNAMIC + Rank-Rotary operator has native CUDA inference and an
 analytic first-order backward. On the measured RTX 5070 Ti long-sequence
 workloads, the complete mixer reaches up to 1.79x the forward speed and 2.30x
-the forward-backward speed of PyTorch MHA backed by Flash SDPA.
+the forward-backward speed of PyTorch MHA backed by Flash SDPA. Those published
+measurements use native contract 6; current ABI-8 optimizations have not rerun
+those formal panels. See [result provenance](results/README.md).
 
 Read the current paper: **[LSSO: Solving Contextual Adaptation with Certified
 Global Mixing](paper/main.pdf)**. The LaTeX source is in
 [`paper/main.tex`](paper/main.tex).
+
+## Documentation
+
+| Topic | Guide |
+| --- | --- |
+| Mathematics, dtypes and checkpoint contracts | [Core contract](docs/CORE_CONTRACT.md) |
+| Code ownership and execution paths | [Architecture](docs/ARCHITECTURE.md) |
+| Native build, Triton JIT and GPU validation | [CUDA contract](docs/CUDA_CONTRACT.md) |
+| ImageNet pretraining and checkpoint transfer | [DeiT III workflow](docs/IMAGENET_DEIT3.md) |
+| COCO detection/instance segmentation and ADE20K semantic segmentation | [Dense downstream protocols](docs/DOWNSTREAM_PROTOCOLS.md) |
+| GenomicBenchmarks and LRA | [Sequence experiments](docs/SEQUENCE_EXPERIMENTS.md) |
+| Supported ablations | [Ablation guide](docs/ABLATIONS.md) |
+| Test commands and historical evidence | [Tests](tests/README.md), [results](results/README.md) |
 
 ## Quick start
 

@@ -163,3 +163,32 @@ integrations.timm.create_lsso_deit3(
 It must build the current LSSO DeiT III model with a learned 2D patch position
 table and no CLS position embedding. The runner owns only data, optimizer,
 scheduler, checkpoint, and distributed-training concerns.
+
+## Current source and pretrained-weight transfer
+
+Three version numbers describe different boundaries:
+
+| Boundary | Current version | Checked by |
+| --- | ---: | --- |
+| ImageNet checkpoint envelope | 5 | `validate_checkpoint_contract`, including its digest |
+| Per-layer LSSO model state | 12 | `_extra_state` during model loading |
+| Native CUDA runtime | 8 | `cuda.load` and native ABI checks |
+
+Passing the ImageNet envelope check does not make an older per-layer model
+contract compatible. In particular, v0.6.3 model-contract-11 weights are not
+automatically accepted by current source. No checkpoint migration command is
+implemented. Preserve the original checkpoint, inspect its geometry and
+contracts, and validate an explicit migration before fine-tuning or downstream
+loading; changing only the version field is insufficient evidence.
+
+The current operator supports both FP16 and BF16 inputs, but this ImageNet
+runner's canonical recipe still requires `train.amp_dtype = 'float16'`.
+Operator capability is not a change to the published training recipe.
+The notebook's pinned released runtime must be used with matching released
+source; it must not be combined with current ABI-8 source. For current source,
+follow [the source build instructions](../README.md).
+
+Dense-task initialization uses `--backbone-checkpoint`, not an ImageNet
+optimizer resume. It drops the classifier, initializes new pyramid/task-head
+parameters, and interpolates the patch position table when needed. See
+[downstream setup and data](DOWNSTREAM_PROTOCOLS.md).
