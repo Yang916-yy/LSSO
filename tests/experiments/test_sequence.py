@@ -913,7 +913,7 @@ def test_cuda_lsso_sequence_path_receives_fp16_amp_activations() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_lsso_sequence_path_rejects_bf16_amp() -> None:
+def test_cuda_lsso_sequence_path_accepts_bf16_amp() -> None:
     cuda.load()
     encoder = SequenceEncoder(
         input_kind="tokens",
@@ -934,8 +934,8 @@ def test_cuda_lsso_sequence_path_rejects_bf16_amp() -> None:
     ).cuda()
     inputs = torch.tensor([[2, 3, 0]], device="cuda")
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        with pytest.raises(TypeError, match="FP16 AMP"):
-            encoder(inputs, inputs.ne(0))
+        outputs = encoder(inputs, inputs.ne(0))
+    assert torch.isfinite(outputs).all()
 
 
 def test_genomic_folder_protocol_uses_official_test_without_resplitting(tmp_path) -> None:

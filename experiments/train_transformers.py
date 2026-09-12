@@ -539,8 +539,8 @@ class SequenceBlock(nn.Module):
         if self.mixer_kind == "lsso":
             if normalized.device.type == "cuda" and torch.is_autocast_enabled():
                 amp_dtype = torch.get_autocast_dtype("cuda")
-                if self.implementation == "cuda" and amp_dtype != torch.float16:
-                    raise TypeError("the CUDA LSSO sequence path supports FP16 AMP only")
+                if self.implementation == "cuda" and amp_dtype not in (torch.float16, torch.bfloat16):
+                    raise TypeError("the CUDA LSSO sequence path supports FP16 or BF16 AMP")
                 normalized = normalized.to(dtype=amp_dtype)
             mixed = self.mixer(  # type: ignore[operator]
                 normalized,
@@ -674,8 +674,8 @@ class SequenceEncoder(nn.Module):
         )[None]
         if inputs.device.type == "cuda" and torch.is_autocast_enabled():
             amp_dtype = torch.get_autocast_dtype("cuda")
-            if self._cuda_lsso and amp_dtype != torch.float16:
-                raise TypeError("the CUDA LSSO sequence path supports FP16 AMP only")
+            if self._cuda_lsso and amp_dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("the CUDA LSSO sequence path supports FP16 or BF16 AMP")
             x = x.to(dtype=amp_dtype)
         x = self.embedding_dropout(x)
         x = torch.where(valid_mask[:, :, None], x, torch.zeros_like(x))
