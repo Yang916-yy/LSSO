@@ -14,7 +14,6 @@ from lsso.ball.reference import (
     qr_soft_frame,
     tensor_core_linear,
     tensor_core_matmul,
-    tf32_fp32_linear,
 )
 
 
@@ -76,8 +75,8 @@ def test_tensor_core_matmul_cuda_has_fp32_output_and_vjp() -> None:
     output = tensor_core_matmul(left, right)
     gradients = torch.autograd.grad((output * upstream).sum(), (left, right))
 
-    left_batches = left.detach().to(dtype=torch.float16).reshape(-1, 4, 5)
-    right_batches = right.detach().to(dtype=torch.float16).expand(
+    left_batches = left.detach().to(dtype=torch.bfloat16).reshape(-1, 4, 5)
+    right_batches = right.detach().to(dtype=torch.bfloat16).expand(
         2,
         -1,
         -1,
@@ -88,7 +87,7 @@ def test_tensor_core_matmul_cuda_has_fp32_output_and_vjp() -> None:
         right_batches,
         out_dtype=torch.float32,
     ).reshape(2, 3, 4, 6)
-    upstream_batches = upstream.to(dtype=torch.float16).reshape(-1, 4, 6)
+    upstream_batches = upstream.to(dtype=torch.bfloat16).reshape(-1, 4, 6)
     expected_left_gradient = torch.bmm(
         upstream_batches,
         right_batches.mT,
@@ -108,8 +107,8 @@ def test_tensor_core_matmul_cuda_has_fp32_output_and_vjp() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("input_dtype", (torch.float16, torch.float32))
-def test_tensor_core_linear_cuda_uses_flattened_tc16_vjp(
+@pytest.mark.parametrize("input_dtype", (torch.float16, torch.bfloat16, torch.float32))
+def test_tensor_core_linear_cuda_uses_flattened_bf16_vjp(
     input_dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(12)
@@ -128,22 +127,22 @@ def test_tensor_core_linear_cuda_uses_flattened_tc16_vjp(
     actual = tensor_core_linear(value, weight, bias)
     gradients = torch.autograd.grad((actual * upstream).sum(), (value, weight, bias))
 
-    value_tc16 = value.detach().to(dtype=torch.float16).reshape(-1, 5)
-    weight_tc16 = weight.detach().to(dtype=torch.float16)
-    gradient_tc16 = upstream.to(dtype=torch.float16).reshape(-1, 7)
+    value_bf16 = value.detach().to(dtype=torch.bfloat16).reshape(-1, 5)
+    weight_bf16 = weight.detach().to(dtype=torch.bfloat16)
+    gradient_bf16 = upstream.to(dtype=torch.bfloat16).reshape(-1, 7)
     expected = torch.mm(
-        value_tc16,
-        weight_tc16.mT,
+        value_bf16,
+        weight_bf16.mT,
         out_dtype=torch.float32,
     ).reshape_as(actual) + bias.detach()
     expected_value_gradient = torch.mm(
-        gradient_tc16,
-        weight_tc16,
+        gradient_bf16,
+        weight_bf16,
         out_dtype=torch.float32,
     ).reshape_as(value).to(dtype=input_dtype)
     expected_weight_gradient = torch.mm(
-        gradient_tc16.mT,
-        value_tc16,
+        gradient_bf16.mT,
+        value_bf16,
         out_dtype=torch.float32,
     )
     expected_bias_gradient = upstream.sum(dim=(0, 1))
@@ -163,60 +162,29 @@ def test_tensor_core_linear_cuda_uses_flattened_tc16_vjp(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("input_dtype", (torch.float16, torch.float32))
-def test_tf32_fp32_linear_matches_tf32_oracle_and_restores_policy(
-    input_dtype: torch.dtype,
+@pytest.mark.parametrize("shape", ((5,), (2, 3, 5)))
+@pytest.mark.parametrize("with_bias", (False, True))
+def test_tensor_core_linear_final_cast_preserves_fp32_input_vjp(
+    shape: tuple[int, ...],
+    with_bias: bool,
 ) -> None:
-    torch.manual_seed(101)
-    value = (
-        40.0 * torch.randn(2, 3, 13, device="cuda", dtype=input_dtype)
-    ).requires_grad_()
-    weight = (40.0 * torch.randn(11, 13, device="cuda")).requires_grad_()
-    bias = (40.0 * torch.randn(11, device="cuda")).requires_grad_()
-    upstream = torch.randn(2, 3, 11, device="cuda")
-    oracle_value = value.detach().float().requires_grad_()
-    oracle_weight = weight.detach().clone().requires_grad_()
-    oracle_bias = bias.detach().clone().requires_grad_()
+    torch.manual_seed(103)
+    value = torch.randn(*shape, device="cuda", requires_grad=True)
+    weight = torch.randn(7, 5, device="cuda", requires_grad=True)
+    bias = torch.randn(7, device="cuda", requires_grad=True) if with_bias else None
+    inputs = (value, weight) if bias is None else (value, weight, bias)
+    actual = tensor_core_linear(value, weight, bias, output_dtype=torch.float16)
+    upstream = torch.randn_like(actual)
+    gradients = torch.autograd.grad(actual, inputs, upstream)
 
-    matmul = torch.backends.cuda.matmul
-    previous = matmul.fp32_precision
-    matmul.fp32_precision = "ieee"
-    try:
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-            enabled=input_dtype is torch.float16,
-        ):
-            actual = tf32_fp32_linear(value, weight, bias)
-        actual_gradients = torch.autograd.grad(
-            (actual * upstream).sum(),
-            (value, weight, bias),
-        )
-        assert matmul.fp32_precision == "ieee"
-        matmul.fp32_precision = "tf32"
-
-        with torch.autocast(device_type="cuda", enabled=False):
-            expected = functional.linear(oracle_value, oracle_weight, oracle_bias)
-        expected_gradients = torch.autograd.grad(
-            (expected * upstream).sum(),
-            (oracle_value, oracle_weight, oracle_bias),
-        )
-    finally:
-        matmul.fp32_precision = previous
-
-    assert actual.dtype is torch.float32
+    # Reproduce the original FP32-output projection and external cast.
+    expected = tensor_core_linear(value, weight, bias).half()
+    expected_gradients = torch.autograd.grad(expected, inputs, upstream)
+    assert actual.dtype is torch.float16
+    assert gradients[0].dtype is torch.float32
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
-    expected_input_gradient = expected_gradients[0].to(dtype=input_dtype)
-    for actual_gradient, expected_gradient in zip(
-        actual_gradients,
-        (expected_input_gradient, *expected_gradients[1:]),
-    ):
-        torch.testing.assert_close(
-            actual_gradient,
-            expected_gradient,
-            rtol=2e-6,
-            atol=2e-6,
-        )
+    for actual_gradient, expected_gradient in zip(gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-6, atol=1e-6)
 
 
 def test_accretive_generator_matches_its_parameterization() -> None:
@@ -559,3 +527,88 @@ def test_reference_rejects_invalid_shapes() -> None:
             content,
             torch.tensor(0.9),
         )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("amp_dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("with_bias", (False, True))
+def test_bf16_linear_retains_wide_range_and_fp32_accumulation(amp_dtype, with_bias) -> None:
+    # Both products and their sum exceed FP16 range. Ambient FP16 AMP must
+    # neither recast the operands nor truncate the FP32 accumulated result.
+    value = torch.full((2, 16), 131072.0, device="cuda", requires_grad=True)
+    weight = torch.full((3, 16), 2.0, device="cuda", requires_grad=True)
+    bias = torch.full((3,), 262144.0, device="cuda", requires_grad=True) if with_bias else None
+    previous = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    with torch.autocast("cuda", dtype=amp_dtype):
+        output = tensor_core_linear(value, weight, bias)
+    assert torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction == previous
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, torch.full_like(output, 4456448.0 if with_bias else 4194304.0), rtol=0, atol=0)
+    output.sum().backward()
+    torch.testing.assert_close(value.grad, torch.full_like(value, 6.0), rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, torch.full_like(weight, 262144.0), rtol=0, atol=0)
+
+    if bias is not None:
+        torch.testing.assert_close(bias.grad, torch.full_like(bias, 2.0), rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_linear_direct_bf16_store_keeps_fp32_accumulation() -> None:
+    value = torch.full((2, 256), 32768.0, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.ones(3, 256, device="cuda", requires_grad=True)
+    output = tensor_core_linear(value, weight, output_dtype=torch.bfloat16)
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(output, torch.full_like(output, 8388608.0), rtol=0, atol=0)
+    output.sum().backward()
+    torch.testing.assert_close(value.grad, torch.full_like(value, 3.0), rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, torch.full_like(weight, 65536.0), rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_linear_fp16_output_does_not_round_through_bf16() -> None:
+    value = torch.ones(1, 2, device="cuda", dtype=torch.bfloat16)
+    weight = torch.tensor([[1.0, 1.0 / 512]], device="cuda")
+    output = tensor_core_linear(value, weight, output_dtype=torch.float16)
+    torch.testing.assert_close(output, torch.full_like(output, 1.0 + 1.0 / 512), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_biased_linear_fused_store_preserves_fp32_bias(dtype) -> None:
+    # Rounding this bias to BF16 before addition would erase the entire result.
+    value = torch.ones(3, 1, device="cuda", dtype=dtype, requires_grad=True)
+    weight = torch.ones(1, 1, device="cuda", requires_grad=True)
+    bias = torch.tensor([-1.0 + 2.0**-9], device="cuda", requires_grad=True)
+    output = tensor_core_linear(value, weight, bias, output_dtype=dtype)
+    torch.testing.assert_close(output, torch.full_like(output, 2.0**-9), rtol=0, atol=0)
+    output.float().sum().backward()
+    torch.testing.assert_close(value.grad, torch.ones_like(value), rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, torch.full_like(weight, 3), rtol=0, atol=0)
+    torch.testing.assert_close(bias.grad, torch.full_like(bias, 3), rtol=0, atol=0)
+    with torch.no_grad():
+        torch.testing.assert_close(
+            tensor_core_linear(value, weight, bias, output_dtype=dtype),
+            output, rtol=0, atol=0,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_biased_linear_fused_store_handles_strides_and_tails(dtype) -> None:
+    torch.manual_seed(123)
+    value = torch.randn(2, 67, 70, device="cuda", dtype=dtype)[..., ::2].requires_grad_()
+    weight = torch.randn(35, 51, device="cuda").T.requires_grad_()
+    bias = torch.randn(102, device="cuda")[::2].requires_grad_()
+    output = tensor_core_linear(value, weight, bias, output_dtype=dtype)
+    expected = tensor_core_linear(value, weight, bias).to(dtype)
+    # Different FP32 reduction groupings can straddle one output rounding bin.
+    torch.testing.assert_close(output, expected, rtol=torch.finfo(dtype).eps, atol=0)
+    upstream = torch.randn_like(output)
+    inputs = (value, weight, bias)
+    actual_grad = torch.autograd.grad(output, inputs, upstream)
+    expected_grad = torch.autograd.grad(expected, inputs, upstream)
+    for actual, reference in zip(actual_grad, expected_grad):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)

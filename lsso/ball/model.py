@@ -15,15 +15,14 @@ from .reference import (
     rank_rotary,
     tensor_core_linear,
     tensor_core_matmul,
-    tf32_fp32_linear,
 )
 
 
-_CONTRACT_VERSION = 11
+_CONTRACT_VERSION = 12
 _ETA_INIT = 0.9
 _ETA_INIT_RAW = math.atanh(_ETA_INIT)
 _SUPPORTED_ACTIVATION_DTYPES = frozenset(
-    (torch.float16, torch.float32, torch.float64)
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 )
 
 
@@ -292,10 +291,10 @@ class LSSO(nn.Module):
             )
         if x.device.type != "cuda":
             raise ValueError("implementation='cuda' requires x to be a CUDA tensor")
-        if x.dtype not in (torch.float16, torch.float32):
+        if x.dtype not in (torch.float16, torch.bfloat16):
             raise TypeError(
                 "implementation='cuda' supports x with dtype torch.float16 or "
-                "torch.float32; "
+                "torch.bfloat16; "
                 f"got {x.dtype}"
             )
 
@@ -368,13 +367,15 @@ class LSSO(nn.Module):
                 mask.sum(dim=-1).to(dtype=torch.float32).clamp_min(1.0).contiguous()
             )
 
-        # The native mixer consumes the FP32 packed coordinates directly.
+        # The native mixer consumes wide-range BF16 packed coordinates directly.
         if all_valid:
             safe_x = x
         else:
             assert mask is not None
             safe_x = torch.where(mask[:, :, None], x, torch.zeros_like(x))
-        projected = tf32_fp32_linear(safe_x, self.w_bc.weight, self.w_bc.bias)
+        projected = tensor_core_linear(
+            safe_x, self.w_bc.weight, self.w_bc.bias, output_dtype=torch.bfloat16
+        )
         if not all_valid:
             assert mask is not None
             projected = torch.where(
@@ -395,11 +396,13 @@ class LSSO(nn.Module):
             centered_positions,
             valid_counts,
         )
-        output = tensor_core_linear(mixed, self.w_o.weight, self.w_o.bias)
+        output = tensor_core_linear(
+            mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype
+        )
         if not all_valid:
             assert mask is not None
             output = torch.where(mask[:, :, None], output, torch.zeros_like(output))
-        return output.to(dtype=x.dtype)
+        return output
 
     def _reference_compact_problem(
         self,
@@ -435,10 +438,11 @@ class LSSO(nn.Module):
             if all_valid
             else torch.where(mask[:, :, None], x, torch.zeros_like(x))
         )
-        projected = tf32_fp32_linear(
+        projected = tensor_core_linear(
             safe_x,
             self.w_bc.weight,
             self.w_bc.bias,
+            output_dtype=torch.float64 if x.dtype == torch.float64 else torch.bfloat16,
         )
         relation, content = projected.split(
             (config.num_heads * config.rank, config.dim), dim=-1
@@ -528,7 +532,7 @@ class LSSO(nn.Module):
         if x.dtype not in _SUPPORTED_ACTIVATION_DTYPES:
             raise TypeError(
                 f"LSSO does not support x with dtype {x.dtype}; use "
-                "torch.float16, torch.float32, or torch.float64"
+                "torch.float16, torch.bfloat16, torch.float32, or torch.float64"
             )
         if x.shape[0] == 0:
             raise ValueError("batch size must be positive")
@@ -567,11 +571,14 @@ class LSSO(nn.Module):
                 eta,
             )
 
+        if x.dtype != torch.float64:
+            output = output.to(torch.bfloat16)
         output = output.transpose(1, 2).contiguous().view(
             batch, length, config.dim
         )
-        output = tensor_core_linear(output, self.w_o.weight, self.w_o.bias)
-        output = output.to(dtype=x.dtype)
+        output = tensor_core_linear(
+            output, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype
+        )
         if mask is None:
             return output
         assert mask is not None

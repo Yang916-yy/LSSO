@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 import math
 
 import torch
@@ -16,6 +17,86 @@ def _calculation_dtype(value: torch.Tensor) -> torch.dtype:
     return torch.float64 if value.dtype == torch.float64 else torch.float32
 
 
+@lru_cache(maxsize=1)
+def _biased_gemm_kernel():
+    # CUDA PyTorch supplies Triton; keep CPU-only imports independent of it.
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def kernel(
+        X, W, B, Y,
+        M, N, K: tl.constexpr,
+        XM: tl.constexpr, XK: tl.constexpr,
+        WK: tl.constexpr, WN: tl.constexpr, BS: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    ):
+        rows = tl.program_id(0) * BM + tl.arange(0, BM)
+        columns = tl.program_id(1) * BN + tl.arange(0, BN)
+        inner = tl.arange(0, BK)
+        accumulator = tl.full((BM, BN), 0, tl.float32)
+        for start in range(tl.cdiv(K, BK)):
+            indices = start * BK + inner
+            left = tl.load(
+                X + rows[:, None] * XM + indices[None, :] * XK,
+                (rows[:, None] < M) & (indices[None, :] < K), 0,
+            )
+            right = tl.load(
+                W + columns[None, :] * WN + indices[:, None] * WK,
+                (columns[None, :] < N) & (indices[:, None] < K), 0,
+            )
+            accumulator = tl.dot(left, right, accumulator)
+        bias = tl.load(B + columns * BS, columns < N, 0)
+        tl.store(
+            Y + rows[:, None] * N + columns[None, :],
+            accumulator + bias[None, :],
+            (rows[:, None] < M) & (columns[None, :] < N),
+        )
+    return kernel
+
+
+def _biased_gemm(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    # AB + bias: FP32 accumulation/addition, then one output rounding.
+    # Blocked GEMM follows Triton's official matrix-multiplication tutorial:
+    # https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
+    rows, inner = left.shape
+    columns = right.shape[1]
+    output = torch.empty((rows, columns), device=left.device, dtype=output_dtype)
+    if rows == 0 or columns == 0:
+        return output
+    _biased_gemm_kernel()[((rows + 63) // 64, (columns + 63) // 64)](
+        left, right, bias, output, rows, columns, inner,
+        *left.stride(), *right.stride(), bias.stride(0),
+        64, 64, 32, num_warps=4,
+    )
+    return output
+
+
+def _wide_gemm(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor | None = None,
+    *, output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """BF16 operands with FP32 accumulation, independent of ambient AMP policy."""
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        with torch.autocast(device_type="cuda", enabled=False):
+            if bias is not None:
+                if output_dtype in (torch.float16, torch.bfloat16):
+                    return _biased_gemm(left, right, bias, output_dtype)
+                return torch.ops.aten.addmm.dtype(bias, left, right, torch.float32)
+            operation = torch.bmm if left.ndim == 3 else torch.mm
+            if output_dtype == torch.bfloat16 and bias is None:
+                return operation(left, right)
+            return operation(left, right, out_dtype=torch.float32)
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
+
+
 def _tensor_core_batches(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -24,17 +105,17 @@ def _tensor_core_batches(
 
     batch_shape = torch.broadcast_shapes(left.shape[:-2], right.shape[:-2])
     rows, inner, columns = left.shape[-2], left.shape[-1], right.shape[-1]
-    left_batches = left.to(dtype=torch.float16).expand(
+    left_batches = left.to(dtype=torch.bfloat16).expand(
         batch_shape + (rows, inner)
     ).reshape(-1, rows, inner)
-    right_batches = right.to(dtype=torch.float16).expand(
+    right_batches = right.to(dtype=torch.bfloat16).expand(
         batch_shape + (inner, columns)
     ).reshape(-1, inner, columns)
     return left_batches, right_batches, batch_shape
 
 
 class _TensorCoreBmm(torch.autograd.Function):
-    """FP16 Tensor Core BMM with an FP32 result and first-order VJP."""
+    """BF16 Tensor Core BMM with an FP32 result and first-order VJP."""
 
     @staticmethod
     def forward(
@@ -48,10 +129,9 @@ class _TensorCoreBmm(torch.autograd.Function):
         ctx.rows = left.shape[-2]
         ctx.inner = left.shape[-1]
         ctx.columns = right.shape[-1]
-        return torch.bmm(
+        return _wide_gemm(
             left_batches,
             right_batches,
-            out_dtype=torch.float32,
         ).reshape(batch_shape + (ctx.rows, ctx.columns))
 
     @staticmethod
@@ -62,7 +142,7 @@ class _TensorCoreBmm(torch.autograd.Function):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         left, right = ctx.saved_tensors
         left_batches, right_batches, _batch_shape = _tensor_core_batches(left, right)
-        grad_batches = grad_output.to(dtype=torch.float16).reshape(
+        grad_batches = grad_output.to(dtype=torch.bfloat16).reshape(
             -1,
             ctx.rows,
             ctx.columns,
@@ -70,19 +150,17 @@ class _TensorCoreBmm(torch.autograd.Function):
 
         grad_left = None
         if ctx.needs_input_grad[0]:
-            grad_left = torch.bmm(
+            grad_left = _wide_gemm(
                 grad_batches,
                 right_batches.mT,
-                out_dtype=torch.float32,
             ).reshape(ctx.batch_shape + (ctx.rows, ctx.inner))
             grad_left = grad_left.sum_to_size(*left.shape).to(dtype=left.dtype)
 
         grad_right = None
         if ctx.needs_input_grad[1]:
-            grad_right = torch.bmm(
+            grad_right = _wide_gemm(
                 left_batches.mT,
                 grad_batches,
-                out_dtype=torch.float32,
             ).reshape(ctx.batch_shape + (ctx.inner, ctx.columns))
             grad_right = grad_right.sum_to_size(*right.shape).to(dtype=right.dtype)
 
@@ -90,76 +168,83 @@ class _TensorCoreBmm(torch.autograd.Function):
 
 
 class _TensorCoreLinear(torch.autograd.Function):
-    """Flattened FP16 Tensor Core linear map with an FP32 first-order VJP."""
+    """BF16 Tensor Core linear map with FP32 accumulation and dtype-aware stores."""
 
     @staticmethod
     def forward(
         ctx: torch.autograd.function.FunctionCtx,
         value: torch.Tensor,
         weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_dtype: torch.dtype | None,
     ) -> torch.Tensor:
-        value_fp16 = value.to(dtype=torch.float16)
-        weight_fp16 = weight.to(dtype=torch.float16)
-        ctx.save_for_backward(value_fp16, weight_fp16)
+        value_bf16 = value.to(dtype=torch.bfloat16)
+        weight_bf16 = weight.to(dtype=torch.bfloat16)
+        ctx.save_for_backward(value_bf16, weight_bf16)
         ctx.value_shape = value.shape
         ctx.value_dtype = value.dtype
         ctx.weight_dtype = weight.dtype
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        ctx.bias_device = None if bias is None else bias.device
+        ctx.has_bias = bias is not None
 
-        flat_value = value_fp16.reshape(-1, value.shape[-1])
-        return torch.mm(
+        flat_value = value_bf16.reshape(-1, value.shape[-1])
+        output = _wide_gemm(
             flat_value,
-            weight_fp16.mT,
-            out_dtype=torch.float32,
+            weight_bf16.mT,
+            None if bias is None else bias.to(device=value.device, dtype=torch.float32),
+            output_dtype=(
+                output_dtype
+                if output_dtype in (torch.float16, torch.bfloat16)
+                and (bias is not None or output_dtype == torch.bfloat16)
+                else torch.float32
+            ),
         ).reshape(value.shape[:-1] + (weight.shape[0],))
+        return output if output_dtype is None else output.to(dtype=output_dtype)
 
     @staticmethod
     @once_differentiable
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
         value, weight = ctx.saved_tensors
         flat_value = value.reshape(-1, value.shape[-1])
-        flat_gradient = grad_output.to(dtype=torch.float16).reshape(
+        flat_gradient = grad_output.to(dtype=torch.bfloat16).reshape(
             -1,
             weight.shape[0],
         )
 
         grad_value = None
         if ctx.needs_input_grad[0]:
-            grad_value = torch.mm(
+            grad_value = _wide_gemm(
                 flat_gradient,
                 weight,
-                out_dtype=torch.float32,
+                output_dtype=(
+                    torch.bfloat16 if ctx.value_dtype == torch.bfloat16 else torch.float32
+                ),
             ).reshape(ctx.value_shape)
             grad_value = grad_value.to(dtype=ctx.value_dtype)
 
         grad_weight = None
         if ctx.needs_input_grad[1]:
-            grad_weight = torch.mm(
+            grad_weight = _wide_gemm(
                 flat_gradient.mT,
                 flat_value,
-                out_dtype=torch.float32,
             ).to(dtype=ctx.weight_dtype)
 
-        return grad_value, grad_weight
+        grad_bias = None
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            # Preserve the original FP32 bias-reduction boundary without
+            # materializing a full FP32 copy of a half-precision upstream VJP.
+            dimensions = tuple(range(grad_output.ndim - 1))
+            grad_bias = (
+                grad_output.sum(dim=dimensions, dtype=torch.float32)
+                if dimensions
+                else grad_output.to(dtype=torch.float32)
+            ).to(device=ctx.bias_device, dtype=ctx.bias_dtype)
 
-
-@contextmanager
-def _tf32_fp32_matmul(device: torch.device):
-    """Temporarily enable TF32 CUDA matmuls for one FP32 projection VJP."""
-
-    if device.type != "cuda":
-        yield
-        return
-
-    matmul = torch.backends.cuda.matmul
-    previous = matmul.fp32_precision
-    matmul.fp32_precision = "tf32"
-    try:
-        yield
-    finally:
-        matmul.fp32_precision = previous
+        return grad_value, grad_weight, grad_bias, None
 
 
 @contextmanager
@@ -177,57 +262,6 @@ def _ieee_fp32_matmul(device: torch.device):
         yield
     finally:
         matmul.fp32_precision = previous
-
-
-class _TF32FP32Linear(torch.autograd.Function):
-    """TF32 FP32-operand linear projection with a first-order TF32 VJP."""
-
-    @staticmethod
-    def forward(
-        ctx: torch.autograd.function.FunctionCtx,
-        value: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        value_fp32 = value.to(dtype=torch.float32)
-        weight_fp32 = weight.to(dtype=torch.float32)
-        bias_fp32 = None if bias is None else bias.to(dtype=torch.float32)
-        ctx.save_for_backward(value_fp32, weight_fp32)
-        ctx.value_shape = value.shape
-        ctx.value_dtype = value.dtype
-        ctx.weight_dtype = weight.dtype
-        ctx.bias_dtype = None if bias is None else bias.dtype
-        ctx.has_bias = bias is not None
-        with torch.autocast(device_type=value.device.type, enabled=False):
-            with _tf32_fp32_matmul(value.device):
-                return functional.linear(value_fp32, weight_fp32, bias_fp32)
-
-    @staticmethod
-    @once_differentiable
-    def backward(
-        ctx: torch.autograd.function.FunctionCtx,
-        grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        value, weight = ctx.saved_tensors
-        flat_value = value.reshape(-1, value.shape[-1])
-        flat_grad = grad_output.to(dtype=torch.float32).reshape(
-            -1, weight.shape[0]
-        )
-
-        grad_value = None
-        grad_weight = None
-        grad_bias = None
-        with torch.autocast(device_type=value.device.type, enabled=False):
-            with _tf32_fp32_matmul(value.device):
-                if ctx.needs_input_grad[0]:
-                    grad_value = torch.mm(flat_grad, weight).reshape(ctx.value_shape)
-                    grad_value = grad_value.to(dtype=ctx.value_dtype)
-                if ctx.needs_input_grad[1]:
-                    grad_weight = torch.mm(flat_grad.mT, flat_value)
-                    grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
-                if ctx.has_bias and ctx.needs_input_grad[2]:
-                    grad_bias = flat_grad.sum(dim=0).to(dtype=ctx.bias_dtype)
-        return grad_value, grad_weight, grad_bias
 
 
 class _FP32FactorGram(torch.autograd.Function):
@@ -266,9 +300,9 @@ class _FP32FactorGram(torch.autograd.Function):
 
 
 def tensor_core_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    """Multiply matrices under the canonical TC16/FP32 numerical contract.
+    """Multiply matrices under the canonical BF16-multiplicand/FP32-accumulation contract.
 
-    CUDA production inputs use FP16 multiplicands with FP32 accumulation. FP64
+    CUDA production inputs use BF16 multiplicands with FP32 accumulation. FP64
     inputs deliberately bypass that reduction so the same mathematical code
     remains the test oracle. CPU evaluation remains FP32 or FP64 because it has
     no Tensor Core execution target.
@@ -295,7 +329,7 @@ def tensor_core_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
 
 
 def _fp32_factor_gram(factor: torch.Tensor) -> torch.Tensor:
-    """Evaluate the accretive F F^T term without the TC16 rounding boundary.
+    """Evaluate the accretive F F^T term without the BF16/FP32 rounding boundary.
 
     This is algebraically the same factor Gram as the reference definition.
     The complete CUDA operator uses FP32 FMA here because the compact factor is
@@ -314,8 +348,14 @@ def tensor_core_linear(
     value: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
+    *,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Apply an FP32-output linear projection under the TC16 contract."""
+    """Apply a BF16/FP32 projection, with FP32 accumulation/bias and an optional final cast.
+
+    The cast belongs to this projection's autograd boundary: its input VJP
+    still uses the input dtype, avoiding an upstream half-to-float-to-half copy.
+    """
 
     if value.ndim < 1:
         raise ValueError("tensor_core_linear requires a feature dimension")
@@ -344,58 +384,28 @@ def tensor_core_linear(
         # Flattening leading dimensions is exactly vec(X) W^T.  Unlike the
         # broadcast BMM primitive, its weight VJP is one GEMM rather than a
         # per-batch gradient tensor followed by a reduction.
-        output = _TensorCoreLinear.apply(value, weight)
+        needs_backward = torch.is_grad_enabled() and (
+            value.requires_grad
+            or weight.requires_grad
+            or (bias is not None and bias.requires_grad)
+        )
+        if needs_backward:
+            return _TensorCoreLinear.apply(value, weight, bias, output_dtype)
+        # Low-precision biased outputs fuse the FP32 bias and final cast;
+        # other outputs retain the established GEMM conversion boundary.
+        direct_dtype = (
+            output_dtype
+            if output_dtype in (torch.float16, torch.bfloat16)
+            and (bias is not None or output_dtype == torch.bfloat16)
+            else None
+        )
+        output = _TensorCoreLinear.apply(value, weight, bias, direct_dtype)
+        bias = None
     else:
         output = tensor_core_matmul(value, weight.mT)
     if bias is not None:
         output = output + bias.to(device=output.device, dtype=output.dtype)
-    return output
-
-
-def tf32_fp32_linear(
-    value: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Apply a TF32 CUDA projection with FP32 operands, output, and VJP."""
-
-    if value.ndim < 1:
-        raise ValueError("tf32_fp32_linear requires a feature dimension")
-    if weight.ndim != 2:
-        raise ValueError("tf32_fp32_linear weight must have shape [out, in]")
-    if value.shape[-1] != weight.shape[-1]:
-        raise ValueError(
-            "tf32_fp32_linear input and weight features must agree, got "
-            f"{value.shape[-1]} and {weight.shape[-1]}"
-        )
-    if bias is not None and bias.shape != (weight.shape[0],):
-        raise ValueError(
-            "tf32_fp32_linear bias must have shape "
-            f"[{weight.shape[0]}], got {tuple(bias.shape)}"
-        )
-    if value.device != weight.device:
-        raise ValueError("tf32_fp32_linear value and weight must share a device")
-    if bias is not None and bias.device != value.device:
-        raise ValueError("tf32_fp32_linear bias must share value.device")
-
-    calculation_dtype = (
-        torch.float64
-        if value.dtype == torch.float64 or weight.dtype == torch.float64
-        else torch.float32
-    )
-    bias_value = (
-        None
-        if bias is None
-        else bias.to(device=value.device, dtype=calculation_dtype)
-    )
-    if calculation_dtype == torch.float64 or value.device.type != "cuda":
-        with torch.autocast(device_type=value.device.type, enabled=False):
-            return functional.linear(
-                value.to(dtype=calculation_dtype),
-                weight.to(dtype=calculation_dtype),
-                bias_value,
-            )
-    return _TF32FP32Linear.apply(value, weight, bias)
+    return output if output_dtype is None else output.to(dtype=output_dtype)
 
 
 def qr_soft_frame(relation: torch.Tensor) -> torch.Tensor:
@@ -696,8 +706,15 @@ def rank_rotary(relation: torch.Tensor, positions: torch.Tensor) -> torch.Tensor
         -torch.arange(half, device=relation.device, dtype=relation.dtype) / half
     )
     angles = positions[:, :, None] * inv_freq[None, None, :]
-    cos = angles.cos().view(batch, 1, length, half)
-    sin = angles.sin().view(batch, 1, length, half)
+    cos = angles.cos()
+    sin = angles.sin()
+    if relation.dtype != torch.float64:
+        # Phases are bounded; compute angles/trigonometry in FP32, then store
+        # their FP16 values. Rotation arithmetic itself remains FP32.
+        cos = cos.to(torch.float16).to(relation.dtype)
+        sin = sin.to(torch.float16).to(relation.dtype)
+    cos = cos.view(batch, 1, length, half)
+    sin = sin.view(batch, 1, length, half)
 
     even = relation[..., 0::2]
     odd = relation[..., 1::2]
